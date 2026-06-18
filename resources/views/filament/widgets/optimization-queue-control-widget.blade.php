@@ -11,6 +11,12 @@
         <div class="flex flex-wrap gap-3">
             {{ $this->clearOptimizationQueueAction }}
             {{ $this->runPendingOptimizationsAction }}
+            {{ $this->processOptimizationQueueAction }}
+            {{ $this->retryFailedOptimizationsAction }}
+            {{ $this->reconcileImportsAction }}
+            {{ $this->refreshAssetStatusesAction }}
+            {{ $this->refetchMissingMp4sAction }}
+            {{ $this->syncTelegramImportsAction }}
         </div>
 
         <x-filament-actions::modals />
