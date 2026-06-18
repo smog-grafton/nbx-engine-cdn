@@ -38,6 +38,36 @@ Artisan::command('cdn:token {name} {--abilities=*} {--expires-days=}', function 
     $this->line($plainToken);
 })->purpose('Issue a server-to-server CDN API token');
 
+Artisan::command('cdn:contabo-check {--write : Write and delete a small probe file}', function () {
+    $disk = 'contabo';
+    $config = config("filesystems.disks.{$disk}", []);
+    $masked = static fn ($value): string => $value ? substr((string) $value, 0, 4) . '…' . substr((string) $value, -4) : '(empty)';
+
+    $this->line('Resolved Contabo disk config:');
+    $this->line('  bucket: ' . (($config['bucket'] ?? null) ?: '(empty)'));
+    $this->line('  region: ' . (($config['region'] ?? null) ?: '(empty)'));
+    $this->line('  endpoint: ' . (($config['endpoint'] ?? null) ?: '(empty)'));
+    $this->line('  public url: ' . (($config['url'] ?? null) ?: '(empty)'));
+    $this->line('  path style: ' . json_encode((bool) ($config['use_path_style_endpoint'] ?? false)));
+    $this->line('  key: ' . $masked($config['key'] ?? null));
+    $this->line('  secret: ' . $masked($config['secret'] ?? null));
+
+    if (! $this->option('write')) {
+        $this->warn('Read-only check only. Run with --write to verify S3 write/delete.');
+        return;
+    }
+
+    $path = 'nbx-health/' . now()->format('YmdHis') . '-' . bin2hex(random_bytes(4)) . '.txt';
+    Storage::disk($disk)->put($path, 'nbx contabo check ' . now()->toIso8601String(), ['visibility' => 'public']);
+    $exists = Storage::disk($disk)->exists($path);
+    $url = Storage::disk($disk)->url($path);
+    Storage::disk($disk)->delete($path);
+
+    $exists
+        ? $this->info("Write/delete OK. Probe URL was: {$url}")
+        : $this->error('Probe write did not appear on disk.');
+})->purpose('Show resolved CDN Contabo S3 config and optionally test write/delete');
+
 Artisan::command('cdn:reconcile {--minutes=30}', function (MediaSourceService $mediaSourceService) {
     $minutes = max(1, (int) $this->option('minutes'));
 
