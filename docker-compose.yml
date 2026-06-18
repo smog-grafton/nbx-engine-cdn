@@ -1,0 +1,15 @@
+services:
+  app:
+    build: .
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    env_file:
+      - .env
+    volumes:
+      - cdn-storage:/var/www/html/storage
+      - cdn-cache:/var/www/html/bootstrap/cache
+    restart: unless-stopped
+
+volumes:
+  cdn-storage:
+  cdn-cache:

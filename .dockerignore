@@ -1,0 +1,13 @@
+.git
+.env
+vendor
+node_modules
+storage/logs/*
+storage/framework/cache/*
+storage/framework/sessions/*
+storage/framework/views/*
+storage/app/nbx/tmp/*
+storage/app/nbx/work/*
+storage/app/nbx/output/*
+bootstrap/cache/*
+Archive*.zip
