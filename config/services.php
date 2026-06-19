@@ -35,4 +35,17 @@ return [
         ],
     ],
 
+    'contabo_api' => [
+        'base_url' => env('CONTABO_API_BASE_URL', 'https://api.contabo.com'),
+        'auth_url' => env('CONTABO_AUTH_URL', 'https://auth.contabo.com/auth/realms/contabo/protocol/openid-connect/token'),
+        'client_id' => env('CONTABO_API_CLIENT_ID'),
+        'client_secret' => env('CONTABO_API_CLIENT_SECRET'),
+        'username' => env('CONTABO_API_USERNAME'),
+        'password' => env('CONTABO_API_PASSWORD'),
+        'user_id' => env('CONTABO_API_USER_ID'),
+        'object_storage_id' => env('CONTABO_API_OBJECT_STORAGE_ID'),
+        'timeout' => (int) env('CONTABO_API_TIMEOUT', 30),
+        'connect_timeout' => (int) env('CONTABO_API_CONNECT_TIMEOUT', 10),
+    ],
+
 ];

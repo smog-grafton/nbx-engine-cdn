@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\Storage;
 use App\Models\MediaApiToken;
 use App\Models\MediaAsset;
 use App\Models\MediaSource;
+use App\Services\ContaboStorageCredentialService;
 use App\Services\MediaSourceService;
 use Illuminate\Support\Carbon;
 
@@ -40,6 +41,8 @@ Artisan::command('cdn:token {name} {--abilities=*} {--expires-days=}', function 
 
 Artisan::command('cdn:contabo-check {--write : Write and delete a small probe file}', function () {
     $disk = 'contabo';
+    $resolver = app(ContaboStorageCredentialService::class);
+    $resolved = $resolver->ensureRuntimeDiskCredentials();
     $config = config("filesystems.disks.{$disk}", []);
     $masked = static fn ($value): string => $value ? substr((string) $value, 0, 4) . '…' . substr((string) $value, -4) : '(empty)';
 
@@ -51,6 +54,12 @@ Artisan::command('cdn:contabo-check {--write : Write and delete a small probe fi
     $this->line('  path style: ' . json_encode((bool) ($config['use_path_style_endpoint'] ?? false)));
     $this->line('  key: ' . $masked($config['key'] ?? null));
     $this->line('  secret: ' . $masked($config['secret'] ?? null));
+    $this->line('  credentials: ' . ($resolved ? 'ready' : 'missing'));
+
+    if (! $resolved) {
+        $this->error($resolver->configurationError());
+        return;
+    }
 
     if (! $this->option('write')) {
         $this->warn('Read-only check only. Run with --write to verify S3 write/delete.');

@@ -6,6 +6,7 @@ use App\Models\MediaAsset;
 use App\Models\MediaSource;
 use App\Support\SafeRemoteMediaUrl;
 use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 
@@ -145,6 +146,13 @@ class NbxEngineService
             return $this->refreshOutputMetadata($source);
         }
 
+        if ($targetDisk === 'contabo') {
+            $contaboCredentials = app(ContaboStorageCredentialService::class);
+            if (! $contaboCredentials->ensureRuntimeDiskCredentials()) {
+                return $this->failFinalization($source, $contaboCredentials->configurationError(), $metadata, $nbx, $target, $currentDisk);
+            }
+        }
+
         $paths = array_values(array_unique(array_filter([
             $source->storage_path,
             $source->original_storage_path,
@@ -154,20 +162,35 @@ class NbxEngineService
             ...$this->hlsDirectoryFiles($source, $currentDisk),
         ])));
 
-        foreach ($paths as $path) {
-            if (! is_string($path) || $path === '' || ! Storage::disk($currentDisk)->exists($path)) {
-                continue;
-            }
+        try {
+            foreach ($paths as $path) {
+                if (! is_string($path) || $path === '' || ! Storage::disk($currentDisk)->exists($path)) {
+                    continue;
+                }
 
-            $stream = Storage::disk($currentDisk)->readStream($path);
-            if (! is_resource($stream)) {
-                continue;
+                $stream = Storage::disk($currentDisk)->readStream($path);
+                if (! is_resource($stream)) {
+                    throw new \RuntimeException("Could not open {$path} from {$currentDisk} before final storage upload.");
+                }
+                try {
+                    $stored = Storage::disk($targetDisk)->put($path, $stream, ['visibility' => 'public']);
+                } finally {
+                    fclose($stream);
+                }
+
+                if (! $stored || ! Storage::disk($targetDisk)->exists($path)) {
+                    throw new \RuntimeException("Could not store {$path} on {$targetDisk}.");
+                }
             }
-            try {
-                Storage::disk($targetDisk)->put($path, $stream, ['visibility' => 'public']);
-            } finally {
-                fclose($stream);
-            }
+        } catch (\Throwable $exception) {
+            Log::error('NBX final storage upload failed', [
+                'source_id' => $source->id,
+                'target_disk' => $targetDisk,
+                'current_disk' => $currentDisk,
+                'error' => $exception->getMessage(),
+            ]);
+
+            return $this->failFinalization($source, $exception->getMessage(), $metadata, $nbx, $target, $currentDisk);
         }
 
         $metadata['nbx'] = array_merge($nbx, [
@@ -183,6 +206,31 @@ class NbxEngineService
         ]);
 
         return $this->refreshOutputMetadata($source->fresh() ?? $source);
+    }
+
+    private function failFinalization(MediaSource $source, string $message, array $metadata, array $nbx, string $target, string $currentDisk): MediaSource
+    {
+        $metadata['nbx'] = array_merge($nbx, [
+            'status' => 'failed',
+            'storage_target' => $target,
+            'work_storage_disk' => $currentDisk,
+            'finalization_error' => $message,
+            'failed_at' => now()->toIso8601String(),
+        ]);
+
+        $source->update([
+            'optimize_status' => 'failed',
+            'optimize_error' => 'Final storage upload failed: ' . $message,
+            'source_metadata' => $metadata,
+        ]);
+
+        $fresh = $source->fresh() ?? $source;
+        app(NbxWebhookDispatcher::class)->dispatch($fresh, 'job.failed', [
+            'stage' => 'final_storage',
+            'message' => $message,
+        ]);
+
+        return $fresh;
     }
 
     public function refreshOutputMetadata(MediaSource $source): MediaSource

@@ -5,6 +5,7 @@ namespace App\Filament\Resources\MediaAssetResource\RelationManagers;
 use App\Jobs\FetchWorkerHlsArtifactJob;
 use App\Models\MediaSource;
 use App\Services\MediaSourceService;
+use App\Services\NbxEngineService;
 use App\Services\TelegramImportDispatchService;
 use App\Support\MediaUrl;
 use Filament\Forms;
@@ -100,6 +101,49 @@ class MediaSourcesRelationManager extends RelationManager
                 ->default(true)
                 ->helperText('When enabled, after fetch or upload the file is transcoded to H.264 MP4 (smaller size, faststart) before playback and HLS. Recommended for large MKV/AVI files.')
                 ->visible(fn (Forms\Get $get): bool => in_array($get('source_type'), ['remote_fetch', 'upload'], true)),
+            Forms\Components\Section::make('NBX Engine processing')
+                ->description('These match the portal NBX options. Work files stay local for FFmpeg, then final outputs move to Contabo unless Local is selected.')
+                ->schema([
+                    Forms\Components\Select::make('storage_target')
+                        ->label('Final storage')
+                        ->default((string) config('nbx.default_storage', 'contabo'))
+                        ->options(fn (): array => (bool) config('nbx.allow_local_storage', true)
+                            ? ['contabo' => 'Contabo Object Storage', 'local' => 'Local public disk']
+                            : ['contabo' => 'Contabo Object Storage'])
+                        ->required(),
+                    Forms\Components\Toggle::make('faststart')
+                        ->label('Faststart MP4')
+                        ->default((bool) config('nbx.default_faststart', true))
+                        ->inline(false),
+                    Forms\Components\Toggle::make('hls_480p')
+                        ->label('Generate 480p HLS')
+                        ->default((bool) config('nbx.default_hls_480', true))
+                        ->inline(false)
+                        ->helperText('Default playback quality. NBX still probes the file and will not upscale low-profile videos.'),
+                    Forms\Components\Toggle::make('hls_720p')
+                        ->label('Generate 720p HLS')
+                        ->default((bool) config('nbx.default_hls_720', false))
+                        ->inline(false)
+                        ->helperText('Use selectively for monthly/Wi-Fi/hot movies only.'),
+                    Forms\Components\Toggle::make('hls_1080p')
+                        ->label('Generate 1080p HLS')
+                        ->default((bool) config('nbx.default_hls_1080', false))
+                        ->disabled(fn (): bool => ! (bool) config('nbx.allow_1080p', false))
+                        ->dehydrated()
+                        ->inline(false)
+                        ->helperText('Disabled by Narabox policy unless NBX_ALLOW_1080P=true.'),
+                    Forms\Components\Toggle::make('allow_downloads')
+                        ->label('Allow MP4 download URL')
+                        ->default(true)
+                        ->inline(false),
+                    Forms\Components\Toggle::make('allow_hls_streaming')
+                        ->label('Allow HLS streaming URL')
+                        ->default(true)
+                        ->inline(false),
+                ])
+                ->columns(2)
+                ->collapsible()
+                ->visible(fn (Forms\Get $get): bool => in_array($get('source_type'), ['remote_fetch', 'upload', 'url'], true)),
             Forms\Components\Actions::make([
                 Forms\Components\Actions\Action::make('start_remote_import')
                     ->label('Start Import Now')
@@ -127,6 +171,8 @@ class MediaSourcesRelationManager extends RelationManager
                                 'source_type' => 'remote_fetch',
                                 'source_url' => $sourceUrl,
                                 'is_active' => $isActive,
+                                'compress_enabled' => (bool) ($get('compress_enabled') ?? true),
+                                'source_metadata' => $this->mergeNbxMetadata($record, $this->nbxProcessingPayloadFromGet($get, 'remote_fetch')),
                             ]);
                             if ($importMode === 'now') {
                                 $service->importRemoteNow($record);
@@ -169,6 +215,7 @@ class MediaSourcesRelationManager extends RelationManager
                             'status' => 'pending',
                             'is_active' => $isActive,
                             'compress_enabled' => (bool) ($get('compress_enabled') ?? true),
+                            'source_metadata' => app(NbxEngineService::class)->initialMetadata($this->nbxProcessingPayloadFromGet($get, 'remote_fetch'), 'remote_fetch'),
                         ]);
 
                         if ($importMode === 'now') {
@@ -425,6 +472,8 @@ class MediaSourcesRelationManager extends RelationManager
                                 $existing->update([
                                     'source_url' => $sourceUrl ?? $existing->source_url,
                                     'is_active' => (bool) ($data['is_active'] ?? $existing->is_active),
+                                    'compress_enabled' => (bool) ($data['compress_enabled'] ?? $existing->compress_enabled),
+                                    'source_metadata' => $this->mergeNbxMetadata($existing, $this->nbxProcessingPayload($data, 'remote_fetch')),
                                 ]);
 
                                 return $existing->fresh();
@@ -433,6 +482,10 @@ class MediaSourcesRelationManager extends RelationManager
 
                         if ($sourceType === 'upload') {
                             $source = $service->attachStoredUpload($asset, (string) $data['upload_file']);
+                            $source->update([
+                                'compress_enabled' => (bool) ($data['compress_enabled'] ?? true),
+                                'source_metadata' => $this->mergeNbxMetadata($source, $this->nbxProcessingPayload($data, 'upload')),
+                            ]);
                             Notification::make()
                                 ->success()
                                 ->title('Upload import started')
@@ -448,6 +501,7 @@ class MediaSourcesRelationManager extends RelationManager
                             'status' => in_array($sourceType, ['url', 'embed'], true) ? 'ready' : 'pending',
                             'is_active' => (bool) ($data['is_active'] ?? true),
                             'compress_enabled' => (bool) ($data['compress_enabled'] ?? true),
+                            'source_metadata' => app(NbxEngineService::class)->initialMetadata($this->nbxProcessingPayload($data, $sourceType), $sourceType),
                         ]);
 
                         if ($sourceType === 'remote_fetch') {
@@ -525,6 +579,18 @@ class MediaSourcesRelationManager extends RelationManager
                             $data['source_type'] = 'telegram';
                             $data['source_url'] = $metadata['telegram_url'] ?? $data['source_url'] ?? null;
                         }
+                        $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
+                        $requested = is_array($nbx['requested'] ?? null) ? $nbx['requested'] : [];
+                        $hls = is_array($requested['hls'] ?? null) ? $requested['hls'] : [];
+
+                        $data['storage_target'] = $nbx['storage_target'] ?? config('nbx.default_storage', 'contabo');
+                        $data['faststart'] = (bool) ($requested['faststart'] ?? config('nbx.default_faststart', true));
+                        $data['hls_480p'] = (bool) ($hls['480p'] ?? config('nbx.default_hls_480', true));
+                        $data['hls_720p'] = (bool) ($hls['720p'] ?? config('nbx.default_hls_720', false));
+                        $data['hls_1080p'] = (bool) ($hls['1080p'] ?? config('nbx.default_hls_1080', false));
+                        $data['allow_downloads'] = (bool) ($requested['allow_downloads'] ?? true);
+                        $data['allow_hls_streaming'] = (bool) ($requested['allow_hls_streaming'] ?? true);
+
                         return $data;
                     })
                     ->using(function (MediaSource $record, array $data): MediaSource {
@@ -563,7 +629,13 @@ class MediaSourcesRelationManager extends RelationManager
                         }
 
                         if ($sourceType === 'upload' && ! empty($data['upload_file'])) {
-                            return $service->replaceStoredUpload($record, (string) $data['upload_file']);
+                            $source = $service->replaceStoredUpload($record, (string) $data['upload_file']);
+                            $source->update([
+                                'compress_enabled' => (bool) ($data['compress_enabled'] ?? $source->compress_enabled),
+                                'source_metadata' => $this->mergeNbxMetadata($source, $this->nbxProcessingPayload($data, 'upload')),
+                            ]);
+
+                            return $source->fresh();
                         }
 
                         $updates = [
@@ -577,6 +649,7 @@ class MediaSourcesRelationManager extends RelationManager
                         if (array_key_exists('hls_worker_artifact_url', $data)) {
                             $updates['hls_worker_artifact_url'] = trim((string) ($data['hls_worker_artifact_url'] ?? '')) ?: null;
                         }
+                        $updates['source_metadata'] = $this->mergeNbxMetadata($record, $this->nbxProcessingPayload($data, $sourceType));
                         $record->update($updates);
 
                         if ($sourceType === 'remote_fetch' && ! empty($record->source_url)) {
@@ -664,10 +737,19 @@ class MediaSourcesRelationManager extends RelationManager
                             ->default(true)
                             ->inline(false)
                             ->helperText('Recommended for large MKV/AVI uploads. Uses H.264 CRF compression + faststart and may delete the original source file when enabled in env.'),
+                        Forms\Components\Toggle::make('hls_480p')
+                            ->label('Generate 480p HLS')
+                            ->default(true)
+                            ->inline(false),
+                        Forms\Components\Toggle::make('hls_720p')
+                            ->label('Generate 720p HLS')
+                            ->default(false)
+                            ->inline(false),
                     ])
                     ->action(function (MediaSource $record, array $data): void {
                         $record->update([
                             'compress_enabled' => (bool) ($data['compress_enabled'] ?? true),
+                            'source_metadata' => $this->mergeNbxMetadata($record, $this->nbxProcessingPayload($data, (string) $record->source_type)),
                         ]);
                         $queued = app(MediaSourceService::class)->queuePlaybackProcessing($record);
                         app(MediaSourceService::class)->refreshAssetStatus($record->asset);
@@ -694,10 +776,19 @@ class MediaSourcesRelationManager extends RelationManager
                             ->default(true)
                             ->inline(false)
                             ->helperText('Keep enabled to reduce storage usage and generate a smaller _play MP4 before HLS.'),
+                        Forms\Components\Toggle::make('hls_480p')
+                            ->label('Generate 480p HLS')
+                            ->default(true)
+                            ->inline(false),
+                        Forms\Components\Toggle::make('hls_720p')
+                            ->label('Generate 720p HLS')
+                            ->default(false)
+                            ->inline(false),
                     ])
                     ->action(function (MediaSource $record, array $data): void {
                         $record->update([
                             'compress_enabled' => (bool) ($data['compress_enabled'] ?? true),
+                            'source_metadata' => $this->mergeNbxMetadata($record, $this->nbxProcessingPayload($data, (string) $record->source_type)),
                         ]);
                         $queued = app(MediaSourceService::class)->queuePlaybackProcessing($record);
                         app(MediaSourceService::class)->refreshAssetStatus($record->asset);
@@ -858,5 +949,42 @@ class MediaSourcesRelationManager extends RelationManager
         }
 
         return MediaUrl::normalize($trimmed) ?? $trimmed;
+    }
+
+    private function nbxProcessingPayload(array $data, string $inputType): array
+    {
+        return [
+            'storage_target' => (string) ($data['storage_target'] ?? config('nbx.default_storage', 'contabo')),
+            'faststart' => (bool) ($data['faststart'] ?? config('nbx.default_faststart', true)),
+            'compress_enabled' => (bool) ($data['compress_enabled'] ?? false),
+            'hls_480p' => (bool) ($data['hls_480p'] ?? config('nbx.default_hls_480', true)),
+            'hls_720p' => (bool) ($data['hls_720p'] ?? config('nbx.default_hls_720', false)),
+            'hls_1080p' => (bool) ($data['hls_1080p'] ?? config('nbx.default_hls_1080', false)),
+            'allow_downloads' => (bool) ($data['allow_downloads'] ?? true),
+            'allow_hls_streaming' => (bool) ($data['allow_hls_streaming'] ?? true),
+            'input_type' => $inputType,
+        ];
+    }
+
+    private function nbxProcessingPayloadFromGet(Forms\Get $get, string $inputType): array
+    {
+        return $this->nbxProcessingPayload([
+            'storage_target' => $get('storage_target'),
+            'faststart' => $get('faststart'),
+            'compress_enabled' => $get('compress_enabled'),
+            'hls_480p' => $get('hls_480p'),
+            'hls_720p' => $get('hls_720p'),
+            'hls_1080p' => $get('hls_1080p'),
+            'allow_downloads' => $get('allow_downloads'),
+            'allow_hls_streaming' => $get('allow_hls_streaming'),
+        ], $inputType);
+    }
+
+    private function mergeNbxMetadata(MediaSource $source, array $payload): array
+    {
+        $metadata = (array) ($source->source_metadata ?? []);
+        $generated = app(NbxEngineService::class)->initialMetadata($payload, (string) ($payload['input_type'] ?? $source->source_type));
+
+        return array_replace_recursive($metadata, $generated);
     }
 }

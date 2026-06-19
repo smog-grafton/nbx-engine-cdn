@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Services\ContaboStorageCredentialService;
 use App\Services\MediaSourceService;
 use App\Services\MediaBinaryDetector;
 use App\Services\NbxEngineService;
@@ -237,8 +238,11 @@ class NbxEngineController extends Controller
         return $this->success($nbx->discoveryPayload($source, $mediaSourceService));
     }
 
-    public function diagnostics(MediaBinaryDetector $binaries): JsonResponse
+    public function diagnostics(MediaBinaryDetector $binaries, ContaboStorageCredentialService $contabo): JsonResponse
     {
+        $contaboReady = $contabo->ensureRuntimeDiskCredentials();
+        $contaboConfig = config('filesystems.disks.contabo', []);
+
         return $this->success([
             'binaries' => $binaries->diagnostics(),
             'docker_expected_paths' => [
@@ -247,6 +251,20 @@ class NbxEngineController extends Controller
             ],
             'hls_enabled' => (bool) config('cdn.enable_hls', true),
             'default_hls_profiles' => (array) config('cdn.hls_profiles', []),
+            'nbx_defaults' => [
+                'storage' => (string) config('nbx.default_storage', 'contabo'),
+                'faststart' => (bool) config('nbx.default_faststart', true),
+                'hls_480p' => (bool) config('nbx.default_hls_480', true),
+                'hls_720p' => (bool) config('nbx.default_hls_720', false),
+                'hls_1080p' => (bool) config('nbx.default_hls_1080', false),
+            ],
+            'contabo' => [
+                'ready' => $contaboReady,
+                'bucket' => $contaboConfig['bucket'] ?? null,
+                'endpoint' => $contaboConfig['endpoint'] ?? null,
+                'public_url' => $contaboConfig['url'] ?? null,
+                'error' => $contaboReady ? null : $contabo->configurationError(),
+            ],
         ]);
     }
 
