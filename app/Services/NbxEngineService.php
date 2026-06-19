@@ -96,6 +96,7 @@ class NbxEngineService
             fclose($stream);
         }
 
+        $source = $this->publishAvailableArtifacts($source->fresh() ?? $source, ['original']);
         $source = $this->markNbxStatus($source->fresh(), 'uploading');
         app(NbxWebhookDispatcher::class)->dispatch($source, 'job.created');
 
@@ -138,7 +139,7 @@ class NbxEngineService
         $targetDisk = $target === 'contabo' ? 'contabo' : ($target === 'local' ? 'public' : $target);
         $currentDisk = $source->storage_disk ?: (string) config('cdn.disk', 'public');
 
-        if ($targetDisk === '' || $targetDisk === $currentDisk || $source->status !== 'ready') {
+        if ($targetDisk === '' || $source->status !== 'ready') {
             return $this->refreshOutputMetadata($source);
         }
 
@@ -146,41 +147,91 @@ class NbxEngineService
             return $this->refreshOutputMetadata($source);
         }
 
-        if ($targetDisk === 'contabo') {
-            $contaboCredentials = app(ContaboStorageCredentialService::class);
-            if (! $contaboCredentials->ensureRuntimeDiskCredentials()) {
-                return $this->failFinalization($source, $contaboCredentials->configurationError(), $metadata, $nbx, $target, $currentDisk);
-            }
+        if ($targetDisk !== 'contabo') {
+            return $this->refreshOutputMetadata($source);
         }
 
-        $paths = array_values(array_unique(array_filter([
-            $source->storage_path,
-            $source->original_storage_path,
-            $source->optimized_path,
-            $source->hls_master_path,
-            ...$this->qualityPaths($source),
-            ...$this->hlsDirectoryFiles($source, $currentDisk),
-        ])));
+        $source = $this->publishAvailableArtifacts($source, ['original', 'faststart', 'hls']);
+
+        if (! (bool) config('nbx.keep_local_work_files', false)) {
+            $this->cleanupLocalWorkFiles($source, $currentDisk);
+        }
+
+        return $this->refreshOutputMetadata($source->fresh() ?? $source);
+    }
+
+    /**
+     * @param array<int, string> $roles
+     */
+    public function publishAvailableArtifacts(MediaSource $source, array $roles = ['original', 'faststart', 'hls']): MediaSource
+    {
+        $source = $source->fresh() ?? $source;
+        $metadata = (array) ($source->source_metadata ?? []);
+        $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
+        $target = (string) ($nbx['storage_target'] ?? config('nbx.default_storage', 'contabo'));
+        $targetDisk = $target === 'contabo' ? 'contabo' : ($target === 'local' ? 'public' : $target);
+        $currentDisk = $source->storage_disk ?: (string) config('cdn.disk', 'public');
+
+        if ($source->status !== 'ready' || $targetDisk !== 'contabo') {
+            return $this->refreshOutputMetadata($source);
+        }
+
+        $contaboCredentials = app(ContaboStorageCredentialService::class);
+        if (! $contaboCredentials->ensureRuntimeDiskCredentials()) {
+            return $this->failFinalization($source, $contaboCredentials->configurationError(), $metadata, $nbx, $target, $currentDisk);
+        }
+
+        $artifacts = is_array($nbx['final_artifacts'] ?? null) ? $nbx['final_artifacts'] : [];
+        $roles = array_values(array_unique($roles));
+        $qualities = is_array($source->qualities_json) ? $source->qualities_json : [];
 
         try {
-            foreach ($paths as $path) {
-                if (! is_string($path) || $path === '' || ! Storage::disk($currentDisk)->exists($path)) {
-                    continue;
+            if (in_array('original', $roles, true)) {
+                $originalPath = $this->firstExistingPath($currentDisk, [
+                    $source->original_storage_path,
+                    $source->storage_path,
+                ]);
+
+                if ($originalPath) {
+                    $artifacts['original'] = $this->copyFinalArtifact($currentDisk, $originalPath, 'contabo', $this->finalObjectKey($source, 'original', $originalPath), 'original');
+                }
+            }
+
+            if (in_array('faststart', $roles, true)) {
+                $faststartPath = $this->firstExistingPath($currentDisk, [
+                    $source->optimized_path,
+                    $source->storage_path,
+                ]);
+
+                if ($faststartPath) {
+                    $artifacts['faststart'] = $this->copyFinalArtifact($currentDisk, $faststartPath, 'contabo', $this->finalObjectKey($source, 'faststart', $faststartPath), 'faststart');
+                }
+            }
+
+            if (in_array('hls', $roles, true) && $source->hls_master_path && Storage::disk($currentDisk)->exists((string) $source->hls_master_path)) {
+                $hlsBase = dirname((string) $source->hls_master_path);
+                $hlsFiles = $this->hlsDirectoryFiles($source, $currentDisk);
+                foreach ($hlsFiles as $path) {
+                    $relative = ltrim(substr($path, strlen($hlsBase)), '/');
+                    $artifact = $this->copyFinalArtifact($currentDisk, $path, 'contabo', $this->finalObjectKey($source, 'hls/' . $relative, $path), str_ends_with($path, '.m3u8') ? 'hls' : 'hls_segment');
+
+                    if ($path === $source->hls_master_path) {
+                        $artifacts['hls_master'] = $artifact;
+                    }
+
+                    foreach ($qualities as $index => $quality) {
+                        if (! is_array($quality) || ($quality['path'] ?? null) !== $path) {
+                            continue;
+                        }
+
+                        $qualities[$index]['source_path'] = $path;
+                        $qualities[$index]['disk'] = 'contabo';
+                        $qualities[$index]['key'] = $artifact['key'];
+                        $qualities[$index]['url'] = $artifact['url'];
+                    }
                 }
 
-                $stream = Storage::disk($currentDisk)->readStream($path);
-                if (! is_resource($stream)) {
-                    throw new \RuntimeException("Could not open {$path} from {$currentDisk} before final storage upload.");
-                }
-                try {
-                    $stored = Storage::disk($targetDisk)->put($path, $stream, ['visibility' => 'public']);
-                } finally {
-                    fclose($stream);
-                }
-
-                if (! $stored || ! Storage::disk($targetDisk)->exists($path)) {
-                    throw new \RuntimeException("Could not store {$path} on {$targetDisk}.");
-                }
+                $artifacts['qualities'] = $qualities;
             }
         } catch (\Throwable $exception) {
             Log::error('NBX final storage upload failed', [
@@ -193,19 +244,19 @@ class NbxEngineService
             return $this->failFinalization($source, $exception->getMessage(), $metadata, $nbx, $target, $currentDisk);
         }
 
-        $metadata['nbx'] = array_merge($nbx, [
+        $nbx = array_merge($nbx, [
             'storage_target' => $target,
             'work_storage_disk' => $currentDisk,
-            'final_storage_disk' => $targetDisk,
-            'finalized_at' => now()->toIso8601String(),
+            'final_storage_disk' => 'contabo',
+            'final_artifacts' => $artifacts,
+            'published_at' => now()->toIso8601String(),
         ]);
+        $metadata['nbx'] = $nbx;
+        $metadata['provider'] = 'nbx_engine';
 
-        $source->update([
-            'storage_disk' => $targetDisk,
-            'source_metadata' => $metadata,
-        ]);
+        $source->update(['source_metadata' => $metadata]);
 
-        return $this->refreshOutputMetadata($source->fresh() ?? $source);
+        return $source->fresh() ?? $source;
     }
 
     private function failFinalization(MediaSource $source, string $message, array $metadata, array $nbx, string $target, string $currentDisk): MediaSource
@@ -294,6 +345,7 @@ class NbxEngineService
             'failure_reason' => $source->failure_reason ?: $source->optimize_error,
             'storage_disk' => $source->storage_disk,
             'storage_target' => $nbx['storage_target'] ?? null,
+            'default_storage' => (string) config('nbx.default_storage', 'contabo'),
             'original_url' => $mediaSourceService->buildPublicUrl($source),
             'faststart_mp4_url' => $playback['mp4_play_url'] ?? null,
             'download_mp4_url' => $this->mp4OnlyUrl($playback['download_url'] ?? null),
@@ -302,6 +354,9 @@ class NbxEngineService
             'hls_720p_url' => $qualityUrl('720p'),
             'hls_1080p_url' => $qualityUrl('1080p'),
             'qualities' => $qualities,
+            'sources' => $this->sourceList($source, $nbx, $playback),
+            'local_work_path' => $source->storage_disk === 'contabo' ? null : $source->storage_path,
+            'local_public_url' => ($nbx['storage_target'] ?? null) === 'local' ? $mediaSourceService->buildPublicUrl($source) : null,
             'file_size_bytes' => $source->file_size_bytes,
             'duration_seconds' => $source->duration_seconds ?: ($probe['duration_seconds'] ?? null),
             'width' => $probe['width'] ?? null,
@@ -429,6 +484,124 @@ class NbxEngineService
         }
 
         return $paths;
+    }
+
+    private function firstExistingPath(string $disk, array $paths): ?string
+    {
+        foreach ($paths as $path) {
+            if (is_string($path) && $path !== '' && Storage::disk($disk)->exists($path)) {
+                return $path;
+            }
+        }
+
+        return null;
+    }
+
+    private function copyFinalArtifact(string $sourceDisk, string $sourcePath, string $targetDisk, string $targetPath, string $role): array
+    {
+        $stream = Storage::disk($sourceDisk)->readStream($sourcePath);
+        if (! is_resource($stream)) {
+            throw new \RuntimeException("Could not open {$sourcePath} from {$sourceDisk} before final storage upload.");
+        }
+
+        try {
+            $stored = Storage::disk($targetDisk)->put($targetPath, $stream, ['visibility' => 'public']);
+        } finally {
+            fclose($stream);
+        }
+
+        if (! $stored || ! Storage::disk($targetDisk)->exists($targetPath)) {
+            throw new \RuntimeException("Could not store {$targetPath} on {$targetDisk}.");
+        }
+
+        return [
+            'role' => $role,
+            'disk' => $targetDisk,
+            'key' => $targetPath,
+            'source_path' => $sourcePath,
+            'url' => Storage::disk($targetDisk)->url($targetPath),
+            'published_at' => now()->toIso8601String(),
+        ];
+    }
+
+    private function finalObjectKey(MediaSource $source, string $role, string $sourcePath): string
+    {
+        $prefix = trim((string) config('services.contabo_object_storage.path_prefix', 'videos'), '/');
+        $job = $source->external_job_id ?: ('source-' . $source->id);
+        $safeJob = Str::slug($job) ?: ('source-' . $source->id);
+        $filename = basename($sourcePath);
+
+        if (str_starts_with($role, 'hls/')) {
+            return trim($prefix . '/nbx/' . $safeJob . '/' . $role, '/');
+        }
+
+        return trim($prefix . '/nbx/' . $safeJob . '/' . trim($role, '/') . '/' . $filename, '/');
+    }
+
+    private function cleanupLocalWorkFiles(MediaSource $source, string $disk): void
+    {
+        if ($disk === 'contabo') {
+            return;
+        }
+
+        $paths = array_values(array_unique(array_filter([
+            $source->storage_path,
+            $source->original_storage_path,
+            $source->optimized_path,
+            $source->hls_master_path,
+            ...$this->qualityPaths($source),
+            ...$this->hlsDirectoryFiles($source, $disk),
+        ])));
+
+        foreach ($paths as $path) {
+            if (is_string($path) && $path !== '') {
+                Storage::disk($disk)->delete($path);
+            }
+        }
+    }
+
+    private function sourceList(MediaSource $source, array $nbx, array $playback): array
+    {
+        $artifacts = is_array($nbx['final_artifacts'] ?? null) ? $nbx['final_artifacts'] : [];
+        $sources = [];
+
+        foreach (['original' => 'source', 'faststart' => '480p', 'hls_master' => 'auto'] as $role => $quality) {
+            $artifact = is_array($artifacts[$role] ?? null) ? $artifacts[$role] : [];
+            if (! is_string($artifact['url'] ?? null) || $artifact['url'] === '') {
+                continue;
+            }
+
+            $isHls = $role === 'hls_master';
+            $sources[] = [
+                'type' => $isHls ? 'hls' : 'mp4',
+                'role' => $role === 'hls_master' ? 'hls' : $role,
+                'quality' => $quality,
+                'disk' => $artifact['disk'] ?? 'contabo',
+                'key' => $artifact['key'] ?? null,
+                'url' => $artifact['url'],
+                'is_downloadable' => ! $isHls,
+                'is_streamable' => true,
+            ];
+        }
+
+        foreach ((array) ($artifacts['qualities'] ?? []) as $quality) {
+            if (! is_array($quality) || ! is_string($quality['url'] ?? null) || $quality['url'] === '') {
+                continue;
+            }
+
+            $sources[] = [
+                'type' => 'hls',
+                'role' => 'hls',
+                'quality' => strtolower((string) ($quality['id'] ?? $quality['label'] ?? 'unknown')),
+                'disk' => $quality['disk'] ?? 'contabo',
+                'key' => $quality['key'] ?? null,
+                'url' => $quality['url'],
+                'is_downloadable' => false,
+                'is_streamable' => true,
+            ];
+        }
+
+        return $sources;
     }
 
     /**

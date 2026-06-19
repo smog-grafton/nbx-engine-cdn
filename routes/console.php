@@ -9,6 +9,7 @@ use App\Models\MediaApiToken;
 use App\Models\MediaAsset;
 use App\Models\MediaSource;
 use App\Services\ContaboStorageCredentialService;
+use App\Services\MediaBinaryDetector;
 use App\Services\MediaSourceService;
 use Illuminate\Support\Carbon;
 
@@ -76,6 +77,39 @@ Artisan::command('cdn:contabo-check {--write : Write and delete a small probe fi
         ? $this->info("Write/delete OK. Probe URL was: {$url}")
         : $this->error('Probe write did not appear on disk.');
 })->purpose('Show resolved CDN Contabo S3 config and optionally test write/delete');
+
+Artisan::command('nbx:health', function () {
+    $contabo = app(ContaboStorageCredentialService::class);
+    $binaries = app(MediaBinaryDetector::class)->diagnostics();
+    $contaboReady = $contabo->ensureRuntimeDiskCredentials();
+    $localFinals = MediaSource::query()
+        ->where('source_metadata->provider', 'nbx_engine')
+        ->where('source_metadata->nbx->storage_target', 'contabo')
+        ->where(function ($query): void {
+            $query->whereNull('source_metadata->nbx->final_artifacts->original->url')
+                ->whereNull('source_metadata->nbx->final_artifacts->faststart->url')
+                ->where('status', 'ready');
+        })
+        ->count();
+
+    $this->line('NBX Engine health');
+    $this->line('  default storage: ' . config('nbx.default_storage'));
+    $this->line('  work storage: ' . config('nbx.work_storage'));
+    $this->line('  keep local work files: ' . json_encode((bool) config('nbx.keep_local_work_files', false)));
+    $this->line('  Contabo writable/configured: ' . ($contaboReady ? 'yes' : 'no'));
+    if (! $contaboReady) {
+        $this->warn('  Contabo error: ' . $contabo->configurationError());
+    }
+    $this->line('  FFmpeg: ' . (($binaries['ffmpeg']['path'] ?? null) ?: 'missing'));
+    $this->line('  FFprobe: ' . (($binaries['ffprobe']['path'] ?? null) ?: 'missing'));
+    $this->line('  final URLs expected: ' . (config('nbx.default_storage') === 'contabo' ? 'Contabo Object Storage' : 'configured local/public disk'));
+
+    if ((string) config('nbx.default_storage') === 'contabo' && $localFinals > 0) {
+        $this->warn("  warning: {$localFinals} ready NBX Contabo source(s) have no final Contabo artifact URL yet.");
+    } else {
+        $this->info('  final URL policy: OK');
+    }
+})->purpose('Show NBX Engine storage, FFmpeg, and final URL health');
 
 Artisan::command('cdn:reconcile {--minutes=30}', function (MediaSourceService $mediaSourceService) {
     $minutes = max(1, (int) $this->option('minutes'));

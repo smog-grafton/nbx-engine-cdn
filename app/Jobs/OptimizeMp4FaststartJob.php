@@ -123,6 +123,7 @@ class OptimizeMp4FaststartJob implements ShouldQueue, ShouldBeUnique
                 'optimized_at' => now(),
                 'playback_type' => 'mp4',
             ]);
+            app(NbxEngineService::class)->publishAvailableArtifacts($source->fresh() ?? $source, ['faststart']);
             return;
         }
 
@@ -182,6 +183,7 @@ class OptimizeMp4FaststartJob implements ShouldQueue, ShouldBeUnique
         }
 
         $source->update($updates);
+        $source = app(NbxEngineService::class)->publishAvailableArtifacts($source->fresh() ?? $source, ['faststart']);
         $source = app(NbxEngineService::class)->refreshOutputMetadata($source->fresh() ?? $source);
         app(\App\Services\NbxWebhookDispatcher::class)->dispatch($source, 'job.faststart.completed', [
             'compressed' => $shouldCompress,

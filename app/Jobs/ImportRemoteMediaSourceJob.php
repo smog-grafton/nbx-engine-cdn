@@ -306,6 +306,7 @@ class ImportRemoteMediaSourceJob implements ShouldQueue, ShouldBeUnique
                 'source_metadata' => $metadata,
             ]);
 
+            $source = app(NbxEngineService::class)->publishAvailableArtifacts($source->fresh() ?? $source, ['original']);
             app(NbxEngineService::class)->markNbxStatus($source->fresh() ?? $source, 'faststarting');
             $mediaSourceService->queuePlaybackProcessing($source->fresh());
         } catch (\Throwable $throwable) {

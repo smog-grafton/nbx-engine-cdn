@@ -29,6 +29,11 @@ class MediaSourceService
             return null;
         }
 
+        if ($this->shouldUseNbxFinalArtifacts($source)) {
+            return $this->nbxArtifactUrl($source, 'original')
+                ?: $this->nbxArtifactUrl($source, 'faststart');
+        }
+
         if ($source->source_type === 'url') {
             return MediaUrl::normalize($source->source_url) ?? $source->source_url;
         }
@@ -62,6 +67,11 @@ class MediaSourceService
             return null;
         }
 
+        if ($this->shouldUseNbxFinalArtifacts($source)) {
+            return $this->nbxArtifactUrl($source, 'faststart')
+                ?: $this->nbxArtifactUrl($source, 'original');
+        }
+
         $disk = $source->storage_disk ?: $this->storageDisk();
         $preferredPath = $source->optimized_path && Storage::disk($disk)->exists($source->optimized_path)
             ? $source->optimized_path
@@ -84,6 +94,11 @@ class MediaSourceService
             return null;
         }
 
+        if ($this->shouldUseNbxFinalArtifacts($source)) {
+            return $this->mp4OnlyUrl($this->nbxArtifactUrl($source, 'faststart'))
+                ?: $this->mp4OnlyUrl($this->nbxArtifactUrl($source, 'original'));
+        }
+
         $disk = $source->storage_disk ?: $this->storageDisk();
 
         if ($url = $this->buildDirectStorageUrl($disk, (string) $source->storage_path)) {
@@ -102,6 +117,10 @@ class MediaSourceService
     {
         if ($source->status !== 'ready' || ! $source->is_active || ! $source->hls_master_path) {
             return null;
+        }
+
+        if ($this->shouldUseNbxFinalArtifacts($source)) {
+            return $this->nbxArtifactUrl($source, 'hls_master');
         }
 
         $disk = $source->storage_disk ?: $this->storageDisk();
@@ -126,6 +145,10 @@ class MediaSourceService
             return null;
         }
 
+        if ($this->shouldUseNbxFinalArtifacts($source)) {
+            return $this->nbxHlsVariantUrl($source, $variantPath);
+        }
+
         $disk = $source->storage_disk ?: $this->storageDisk();
 
         if ($url = $this->buildDirectStorageUrl($disk, $variantPath)) {
@@ -145,10 +168,22 @@ class MediaSourceService
     public function buildPlaybackManifest(MediaSource $source): array
     {
         $disk = $source->storage_disk ?: $this->storageDisk();
-        $hlsReady = $source->hls_master_path && Storage::disk($disk)->exists((string) $source->hls_master_path);
+        $usesFinalArtifacts = $this->shouldUseNbxFinalArtifacts($source);
+        $hlsReady = $source->hls_master_path && (
+            ($usesFinalArtifacts && $this->nbxArtifactUrl($source, 'hls_master') !== null)
+            || Storage::disk($disk)->exists((string) $source->hls_master_path)
+        );
         $playbackType = $source->playback_type === 'hls' && $hlsReady ? 'hls' : 'mp4';
         $qualities = [];
         $qualityRows = is_array($source->qualities_json) ? $source->qualities_json : [];
+        if ($usesFinalArtifacts) {
+            $metadata = (array) ($source->source_metadata ?? []);
+            $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
+            $artifacts = is_array($nbx['final_artifacts'] ?? null) ? $nbx['final_artifacts'] : [];
+            if (is_array($artifacts['qualities'] ?? null) && $artifacts['qualities'] !== []) {
+                $qualityRows = $artifacts['qualities'];
+            }
+        }
         if ($qualityRows === [] && $hlsReady) {
             $qualityRows = $this->parseHlsQualities($source);
         }
@@ -988,6 +1023,58 @@ class MediaSourceService
         } catch (\Throwable) {
             return null;
         }
+    }
+
+    private function shouldUseNbxFinalArtifacts(MediaSource $source): bool
+    {
+        $metadata = (array) ($source->source_metadata ?? []);
+        $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
+
+        return ($metadata['provider'] ?? null) === 'nbx_engine'
+            && (string) ($nbx['storage_target'] ?? config('nbx.default_storage', 'contabo')) === 'contabo';
+    }
+
+    private function nbxArtifactUrl(MediaSource $source, string $role): ?string
+    {
+        $metadata = (array) ($source->source_metadata ?? []);
+        $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
+        $artifacts = is_array($nbx['final_artifacts'] ?? null) ? $nbx['final_artifacts'] : [];
+        $artifact = is_array($artifacts[$role] ?? null) ? $artifacts[$role] : [];
+        $url = $artifact['url'] ?? null;
+
+        return is_string($url) && trim($url) !== '' ? trim($url) : null;
+    }
+
+    private function nbxHlsVariantUrl(MediaSource $source, string $variantPath): ?string
+    {
+        $metadata = (array) ($source->source_metadata ?? []);
+        $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
+        $artifacts = is_array($nbx['final_artifacts'] ?? null) ? $nbx['final_artifacts'] : [];
+        $qualities = is_array($artifacts['qualities'] ?? null) ? $artifacts['qualities'] : [];
+
+        foreach ($qualities as $quality) {
+            if (! is_array($quality)) {
+                continue;
+            }
+
+            if (($quality['source_path'] ?? null) === $variantPath || ($quality['path'] ?? null) === $variantPath) {
+                $url = $quality['url'] ?? null;
+                return is_string($url) && trim($url) !== '' ? trim($url) : null;
+            }
+        }
+
+        return null;
+    }
+
+    private function mp4OnlyUrl(?string $url): ?string
+    {
+        if (! is_string($url) || trim($url) === '') {
+            return null;
+        }
+
+        $path = strtolower((string) parse_url($url, PHP_URL_PATH));
+
+        return str_ends_with($path, '.m3u8') ? null : $url;
     }
 
     private function absoluteRoute(string $name, array $parameters): string

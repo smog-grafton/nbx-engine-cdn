@@ -14,6 +14,8 @@ return [
     'work_storage' => (string) env('NBX_WORK_STORAGE', env('FILESYSTEM_DISK', 'public')),
     'allow_local_storage' => (bool) env('NBX_ALLOW_LOCAL_STORAGE', true),
     'allow_1080p' => (bool) env('NBX_ALLOW_1080P', false),
+    'keep_local_work_files' => (bool) env('NBX_KEEP_LOCAL_WORK_FILES', false),
+    'local_work_retention_hours' => (int) env('NBX_LOCAL_WORK_RETENTION_HOURS', 24),
 
     'default_faststart' => (bool) env('NBX_DEFAULT_FASTSTART', true),
     'default_hls_480' => (bool) env('NBX_DEFAULT_HLS_480', true),

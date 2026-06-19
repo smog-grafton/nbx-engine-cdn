@@ -48,4 +48,8 @@ return [
         'connect_timeout' => (int) env('CONTABO_API_CONNECT_TIMEOUT', 10),
     ],
 
+    'contabo_object_storage' => [
+        'path_prefix' => env('CONTABO_OBJECT_STORAGE_PATH_PREFIX', 'videos'),
+    ],
+
 ];
