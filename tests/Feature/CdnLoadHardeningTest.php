@@ -228,4 +228,59 @@ SH
         $this->assertTrue((bool) $source->is_faststart);
         $this->assertTrue(Storage::disk('public')->exists((string) $source->optimized_path));
     }
+
+    public function test_nbx_contabo_manifest_does_not_check_missing_local_hls_path_or_return_local_urls(): void
+    {
+        config()->set('app.url', 'https://nbx.naraboxtv.com');
+        config()->set('nbx.default_storage', 'contabo');
+        config()->set('filesystems.disks.contabo.url', 'https://usc1.contabostorage.com/account:nbx');
+
+        $asset = MediaAsset::query()->create([
+            'type' => 'movie',
+            'title' => 'NBX Contabo Missing HLS',
+            'status' => 'ready',
+            'visibility' => 'public',
+        ]);
+
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'remote_fetch',
+            'storage_disk' => 'contabo',
+            'storage_path' => 'media/'.$asset->id.'/5/original.mp4',
+            'optimized_path' => 'media/'.$asset->id.'/5/original_play.mp4',
+            'hls_master_path' => 'media/'.$asset->id.'/5/hls/master.m3u8',
+            'status' => 'ready',
+            'is_active' => true,
+            'playback_type' => 'hls',
+            'source_metadata' => [
+                'provider' => 'nbx_engine',
+                'nbx' => [
+                    'storage_target' => 'contabo',
+                    'requested' => [
+                        'hls' => ['480p' => true],
+                    ],
+                    'final_artifacts' => [
+                        'original' => [
+                            'disk' => 'contabo',
+                            'key' => 'videos/nbx/job/original/original.mp4',
+                            'url' => 'https://usc1.contabostorage.com/account:nbx/videos/nbx/job/original/original.mp4',
+                        ],
+                        'faststart' => [
+                            'disk' => 'contabo',
+                            'key' => 'videos/nbx/job/faststart/original_play.mp4',
+                            'url' => 'https://usc1.contabostorage.com/account:nbx/videos/nbx/job/faststart/original_play.mp4',
+                        ],
+                    ],
+                ],
+            ],
+        ]);
+
+        $manifest = app(MediaSourceService::class)->buildPlaybackManifest($source);
+
+        $this->assertSame('mp4', $manifest['type']);
+        $this->assertNull($manifest['hls_master_url']);
+        $this->assertSame('https://usc1.contabostorage.com/account:nbx/videos/nbx/job/faststart/original_play.mp4', $manifest['mp4_play_url']);
+        $this->assertSame('https://usc1.contabostorage.com/account:nbx/videos/nbx/job/faststart/original_play.mp4', $manifest['download_url']);
+        $this->assertStringNotContainsString('nbx.naraboxtv.com/media/', (string) $manifest['mp4_play_url']);
+    }
 }

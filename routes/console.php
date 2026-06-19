@@ -91,6 +91,19 @@ Artisan::command('nbx:health', function () {
                 ->where('status', 'ready');
         })
         ->count();
+    $badLocalUrls = MediaSource::query()
+        ->where('source_metadata->provider', 'nbx_engine')
+        ->where('source_metadata->nbx->storage_target', 'contabo')
+        ->latest('id')
+        ->limit(200)
+        ->get(['source_metadata'])
+        ->filter(function (MediaSource $source): bool {
+            $metadata = (array) ($source->source_metadata ?? []);
+            $encoded = json_encode($metadata['nbx']['final_artifacts'] ?? $metadata['nbx']['outputs'] ?? []);
+
+            return is_string($encoded) && str_contains($encoded, '/media/');
+        })
+        ->count();
 
     $this->line('NBX Engine health');
     $this->line('  default storage: ' . config('nbx.default_storage'));
@@ -106,6 +119,8 @@ Artisan::command('nbx:health', function () {
 
     if ((string) config('nbx.default_storage') === 'contabo' && $localFinals > 0) {
         $this->warn("  warning: {$localFinals} ready NBX Contabo source(s) have no final Contabo artifact URL yet.");
+    } elseif ((string) config('nbx.default_storage') === 'contabo' && $badLocalUrls > 0) {
+        $this->warn("  warning: {$badLocalUrls} recent NBX Contabo source(s) still contain local /media URLs in final metadata.");
     } else {
         $this->info('  final URL policy: OK');
     }

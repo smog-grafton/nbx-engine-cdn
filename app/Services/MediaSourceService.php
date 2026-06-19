@@ -73,7 +73,7 @@ class MediaSourceService
         }
 
         $disk = $source->storage_disk ?: $this->storageDisk();
-        $preferredPath = $source->optimized_path && Storage::disk($disk)->exists($source->optimized_path)
+        $preferredPath = $source->optimized_path && $this->safeExists($disk, $source->optimized_path)
             ? $source->optimized_path
             : $source->storage_path;
 
@@ -169,10 +169,9 @@ class MediaSourceService
     {
         $disk = $source->storage_disk ?: $this->storageDisk();
         $usesFinalArtifacts = $this->shouldUseNbxFinalArtifacts($source);
-        $hlsReady = $source->hls_master_path && (
-            ($usesFinalArtifacts && $this->nbxArtifactUrl($source, 'hls_master') !== null)
-            || Storage::disk($disk)->exists((string) $source->hls_master_path)
-        );
+        $hlsReady = $source->hls_master_path && ($usesFinalArtifacts
+            ? $this->nbxArtifactUrl($source, 'hls_master') !== null
+            : $this->safeExists($disk, (string) $source->hls_master_path));
         $playbackType = $source->playback_type === 'hls' && $hlsReady ? 'hls' : 'mp4';
         $qualities = [];
         $qualityRows = is_array($source->qualities_json) ? $source->qualities_json : [];
@@ -240,7 +239,7 @@ class MediaSourceService
         }
 
         $disk = $source->storage_disk ?: $this->storageDisk();
-        if (! Storage::disk($disk)->exists((string) $source->hls_master_path)) {
+        if (! $this->safeExists($disk, (string) $source->hls_master_path)) {
             return [];
         }
 
@@ -1075,6 +1074,21 @@ class MediaSourceService
         $path = strtolower((string) parse_url($url, PHP_URL_PATH));
 
         return str_ends_with($path, '.m3u8') ? null : $url;
+    }
+
+    private function safeExists(string $disk, ?string $path): bool
+    {
+        if (! is_string($path) || trim($path) === '') {
+            return false;
+        }
+
+        try {
+            return Storage::disk($disk)->exists($path);
+        } catch (\Throwable $throwable) {
+            report($throwable);
+
+            return false;
+        }
     }
 
     private function absoluteRoute(string $name, array $parameters): string

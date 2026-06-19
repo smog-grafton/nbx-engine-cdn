@@ -558,10 +558,28 @@ class MediaSourcesRelationManager extends RelationManager
                         Forms\Components\TextInput::make('copy_hls_master_url')
                             ->label('HLS Master URL')
                             ->readOnly()
+                            ->helperText('HLS is streaming-only. If blank, the master playlist is not available yet.')
                             ->suffixAction(
                                 Forms\Components\Actions\Action::make('copy_hls_master_url_btn')
                                     ->icon('heroicon-o-clipboard-document')
-                                    ->action(fn (Forms\Get $get) => Notification::make()->success()->title('Copied HLS URL')->body((string) $get('copy_hls_master_url'))->send())
+                                    ->action(function (Forms\Get $get): void {
+                                        $url = trim((string) $get('copy_hls_master_url'));
+                                        if ($url === '') {
+                                            Notification::make()
+                                                ->warning()
+                                                ->title('HLS is not ready yet')
+                                                ->body('HLS master playlist is not available yet.')
+                                                ->send();
+
+                                            return;
+                                        }
+
+                                        Notification::make()
+                                            ->success()
+                                            ->title('Copied HLS URL')
+                                            ->body($url)
+                                            ->send();
+                                    })
                             ),
                         Forms\Components\TextInput::make('copy_mp4_play_url')
                             ->label('MP4 Playback URL')

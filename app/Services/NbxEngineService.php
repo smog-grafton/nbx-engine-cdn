@@ -208,7 +208,7 @@ class NbxEngineService
                 }
             }
 
-            if (in_array('hls', $roles, true) && $source->hls_master_path && Storage::disk($currentDisk)->exists((string) $source->hls_master_path)) {
+            if (in_array('hls', $roles, true) && $source->hls_master_path && $this->safeExists($currentDisk, (string) $source->hls_master_path)) {
                 $hlsBase = dirname((string) $source->hls_master_path);
                 $hlsFiles = $this->hlsDirectoryFiles($source, $currentDisk);
                 foreach ($hlsFiles as $path) {
@@ -291,12 +291,14 @@ class NbxEngineService
         $metadata = (array) ($source->source_metadata ?? []);
         $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
         $probe = is_array($metadata['probe'] ?? null) ? $metadata['probe'] : [];
+        $hlsUrl = $playback['hls_master_url'] ?? null;
+        $mp4Url = $playback['mp4_play_url'] ?? $playback['download_url'] ?? $mediaSourceService->buildPublicUrl($source);
 
         $metadata['provider'] = 'nbx_engine';
         $metadata['nbx'] = array_merge($nbx, [
             'status' => $source->status === 'failed'
                 ? 'failed'
-                : ($source->playback_type === 'hls' ? 'completed' : ($source->is_faststart ? 'partially_completed' : ($nbx['status'] ?? 'pending'))),
+                : ($hlsUrl ? 'completed' : ($mp4Url ? 'partially_completed' : ($nbx['status'] ?? 'pending'))),
             'job_id' => $source->external_job_id,
             'outputs' => [
                 'original_url' => $mediaSourceService->buildPublicUrl($source),
@@ -355,6 +357,7 @@ class NbxEngineService
             'hls_1080p_url' => $qualityUrl('1080p'),
             'qualities' => $qualities,
             'sources' => $this->sourceList($source, $nbx, $playback),
+            'unavailable' => $this->unavailableOutputs($nbx, $playback),
             'local_work_path' => $source->storage_disk === 'contabo' ? null : $source->storage_path,
             'local_public_url' => ($nbx['storage_target'] ?? null) === 'local' ? $mediaSourceService->buildPublicUrl($source) : null,
             'file_size_bytes' => $source->file_size_bytes,
@@ -489,7 +492,7 @@ class NbxEngineService
     private function firstExistingPath(string $disk, array $paths): ?string
     {
         foreach ($paths as $path) {
-            if (is_string($path) && $path !== '' && Storage::disk($disk)->exists($path)) {
+            if (is_string($path) && $path !== '' && $this->safeExists($disk, $path)) {
                 return $path;
             }
         }
@@ -604,6 +607,38 @@ class NbxEngineService
         return $sources;
     }
 
+    private function unavailableOutputs(array $nbx, array $playback): array
+    {
+        $unavailable = [];
+        $requested = is_array($nbx['requested']['hls'] ?? null) ? $nbx['requested']['hls'] : [];
+        $skipped = is_array($nbx['skipped_profiles'] ?? null) ? $nbx['skipped_profiles'] : [];
+
+        foreach ($requested as $quality => $enabled) {
+            if (! $enabled) {
+                continue;
+            }
+
+            $quality = strtolower((string) $quality);
+            $available = false;
+            foreach ((array) ($playback['qualities'] ?? []) as $row) {
+                if (is_array($row) && strtolower((string) ($row['id'] ?? '')) === $quality && ! empty($row['url'])) {
+                    $available = true;
+                    break;
+                }
+            }
+
+            if (! $available) {
+                $unavailable[] = [
+                    'role' => 'hls',
+                    'quality' => $quality,
+                    'reason' => $skipped[$quality] ?? $skipped[strtoupper($quality)] ?? 'HLS playlist not generated yet',
+                ];
+            }
+        }
+
+        return $unavailable;
+    }
+
     /**
      * @return array<int, string>
      */
@@ -632,5 +667,20 @@ class NbxEngineService
         }
 
         return $url;
+    }
+
+    private function safeExists(string $disk, ?string $path): bool
+    {
+        if (! is_string($path) || trim($path) === '') {
+            return false;
+        }
+
+        try {
+            return Storage::disk($disk)->exists($path);
+        } catch (\Throwable $throwable) {
+            report($throwable);
+
+            return false;
+        }
     }
 }
