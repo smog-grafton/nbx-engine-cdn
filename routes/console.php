@@ -111,6 +111,39 @@ Artisan::command('nbx:health', function () {
     }
 })->purpose('Show NBX Engine storage, FFmpeg, and final URL health');
 
+Artisan::command('nbx:publish-final-artifacts {--limit=50 : Maximum ready NBX sources to publish}', function () {
+    $limit = max(1, (int) $this->option('limit'));
+    $service = app(\App\Services\NbxEngineService::class);
+    $published = 0;
+    $failed = 0;
+
+    MediaSource::query()
+        ->where('status', 'ready')
+        ->where('source_metadata->provider', 'nbx_engine')
+        ->where('source_metadata->nbx->storage_target', 'contabo')
+        ->where(function ($query): void {
+            $query->whereNull('source_metadata->nbx->final_artifacts->original->url')
+                ->orWhereNull('source_metadata->nbx->final_artifacts->faststart->url');
+        })
+        ->latest('id')
+        ->limit($limit)
+        ->get()
+        ->each(function (MediaSource $source) use ($service, &$published, &$failed): void {
+            try {
+                $service->finalizeStorageIfNeeded($source);
+                $published++;
+            } catch (\Throwable $exception) {
+                $failed++;
+                $this->warn('Failed publishing source #' . $source->id . ': ' . $exception->getMessage());
+            }
+        });
+
+    $this->info("Published {$published} ready NBX source(s) to final storage.");
+    if ($failed > 0) {
+        $this->warn("Failed {$failed} source(s).");
+    }
+})->purpose('Publish existing ready NBX work files to final Contabo storage');
+
 Artisan::command('cdn:reconcile {--minutes=30}', function (MediaSourceService $mediaSourceService) {
     $minutes = max(1, (int) $this->option('minutes'));
 
@@ -513,6 +546,10 @@ Artisan::command('media:reset-worker-failed-to-pending {--limit=50}', function (
 Schedule::call(function (): void {
     Artisan::call('cdn:reconcile', ['--minutes' => 30]);
 })->name('cdn:reconcile')->withoutOverlapping()->everyTenMinutes();
+
+Schedule::call(function (): void {
+    Artisan::call('nbx:publish-final-artifacts', ['--limit' => 25]);
+})->name('nbx:publish-final-artifacts')->withoutOverlapping()->everyFiveMinutes();
 
 Artisan::command('telegram-imports:sync {--limit=20}', function () {
     $limit = max(1, (int) $this->option('limit'));
