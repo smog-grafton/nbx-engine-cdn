@@ -5,6 +5,7 @@ namespace App\Jobs;
 use App\Models\MediaSource;
 use App\Services\MediaBinaryDetector;
 use App\Services\NbxEngineService;
+use App\Services\MediaSourceService;
 use App\Services\VideoProbeService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
@@ -59,7 +60,7 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
     public function handle(): void
     {
         $source = MediaSource::find($this->sourceId);
-        if (! $source || $source->status !== 'ready' || ! $source->storage_path) {
+        if (! $source || $source->status !== 'ready') {
             return;
         }
 
@@ -80,9 +81,10 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
             return;
         }
 
+        $source = app(MediaSourceService::class)->ensureLocalWorkFileForProcessing($source) ?: $source;
         $disk = $source->storage_disk ?: (string) config('cdn.disk', 'public');
         $inputPath = $source->optimized_path ?: $source->storage_path;
-        if (! Storage::disk($disk)->exists($inputPath)) {
+        if (! $inputPath || ! Storage::disk($disk)->exists($inputPath)) {
             $source->update([
                 'playback_type' => 'mp4',
                 'hls_master_path' => null,

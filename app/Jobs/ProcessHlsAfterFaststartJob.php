@@ -72,9 +72,10 @@ class ProcessHlsAfterFaststartJob implements ShouldQueue, ShouldBeUnique
         $enableHls = (bool) config('cdn.enable_hls', true);
 
         // Verify the input file we'll use for HLS actually exists before dispatching.
+        $source = $mediaSourceService->ensureLocalWorkFileForProcessing($source) ?: $source;
         $disk = $source->storage_disk ?: (string) config('cdn.disk', 'public');
         $inputPath = $source->optimized_path ?: $source->storage_path;
-        if ($inputPath && ! Storage::disk($disk)->exists($inputPath)) {
+        if (! $inputPath || ! Storage::disk($disk)->exists($inputPath)) {
             Log::warning('ProcessHlsAfterFaststartJob: input file missing, cannot generate HLS', [
                 'source_id'    => $source->id,
                 'asset_id'     => $source->media_asset_id,

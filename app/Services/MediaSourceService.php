@@ -23,6 +23,146 @@ class MediaSourceService
         return (string) config('cdn.disk', 'public');
     }
 
+    public function ensureLocalWorkFileForProcessing(MediaSource $source): ?MediaSource
+    {
+        $source = $source->fresh() ?? $source;
+        $disk = $source->storage_disk ?: $this->storageDisk();
+
+        if ($source->storage_path && $this->safeExists($disk, (string) $source->storage_path)) {
+            return $source;
+        }
+
+        $metadata = (array) ($source->source_metadata ?? []);
+        $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
+        $artifacts = is_array($nbx['final_artifacts'] ?? null) ? $nbx['final_artifacts'] : [];
+        $originalArtifact = is_array($artifacts['original'] ?? null) ? $artifacts['original'] : [];
+
+        $candidates = [
+            [
+                'disk' => $source->original_storage_path ? $disk : null,
+                'key' => $source->original_storage_path,
+                'label' => 'original_storage_path',
+            ],
+            [
+                'disk' => $originalArtifact['disk'] ?? null,
+                'key' => $originalArtifact['key'] ?? null,
+                'label' => 'nbx_final_original',
+            ],
+            [
+                'disk' => $metadata['object_disk'] ?? null,
+                'key' => $metadata['object_key'] ?? null,
+                'label' => 'submitted_object',
+            ],
+        ];
+
+        $workDisk = (string) config('nbx.work_storage', config('cdn.disk', 'public'));
+        $fileName = $this->sanitizeFileName((string) basename((string) ($source->storage_path ?: $source->original_storage_path ?: ($originalArtifact['key'] ?? 'source.mp4'))));
+        $workPath = sprintf('media/%s/%d/restored/%s', $source->media_asset_id, $source->id, $fileName ?: 'source.mp4');
+
+        foreach ($candidates as $candidate) {
+            $candidateDisk = is_string($candidate['disk'] ?? null) ? (string) $candidate['disk'] : '';
+            $candidateKey = is_string($candidate['key'] ?? null) ? (string) $candidate['key'] : '';
+            if ($candidateDisk === '' || $candidateKey === '' || ! $this->safeExists($candidateDisk, $candidateKey)) {
+                continue;
+            }
+
+            $stream = Storage::disk($candidateDisk)->readStream($candidateKey);
+            if (! is_resource($stream)) {
+                continue;
+            }
+
+            try {
+                Storage::disk($workDisk)->makeDirectory(dirname($workPath));
+                Storage::disk($workDisk)->put($workPath, $stream);
+            } finally {
+                fclose($stream);
+            }
+
+            if (! $this->safeExists($workDisk, $workPath)) {
+                continue;
+            }
+
+            $metadata['nbx'] = array_merge($nbx, [
+                'restored_work_file' => [
+                    'from' => $candidate['label'],
+                    'source_disk' => $candidateDisk,
+                    'source_key' => $candidateKey,
+                    'work_disk' => $workDisk,
+                    'work_path' => $workPath,
+                    'restored_at' => now()->toIso8601String(),
+                ],
+            ]);
+
+            $source->update([
+                'storage_disk' => $workDisk,
+                'storage_path' => $workPath,
+                'original_storage_path' => $source->original_storage_path ?: $workPath,
+                'source_metadata' => $metadata,
+            ]);
+
+            Log::info('Restored NBX processing input from durable storage', [
+                'source_id' => $source->id,
+                'asset_id' => $source->media_asset_id,
+                'from' => $candidate['label'],
+                'source_disk' => $candidateDisk,
+                'source_key' => $candidateKey,
+                'work_disk' => $workDisk,
+                'work_path' => $workPath,
+            ]);
+
+            return $source->fresh() ?? $source;
+        }
+
+        $remoteUrl = null;
+        foreach ([$originalArtifact['url'] ?? null, $metadata['object_url'] ?? null, $source->source_url] as $url) {
+            if (is_string($url) && preg_match('~^https?://~i', $url) === 1) {
+                $remoteUrl = $url;
+                break;
+            }
+        }
+
+        if ($remoteUrl) {
+            try {
+                Storage::disk($workDisk)->makeDirectory(dirname($workPath));
+                $absolutePath = Storage::disk($workDisk)->path($workPath);
+                $response = Http::timeout((int) config('cdn.remote_fetch_timeout', 21600))
+                    ->connectTimeout((int) config('cdn.remote_fetch_connect_timeout', 30))
+                    ->sink($absolutePath)
+                    ->get($remoteUrl);
+
+                if ($response->successful() && is_file($absolutePath) && filesize($absolutePath) > 0) {
+                    $metadata['nbx'] = array_merge($nbx, [
+                        'restored_work_file' => [
+                            'from' => 'remote_url',
+                            'url' => $remoteUrl,
+                            'work_disk' => $workDisk,
+                            'work_path' => $workPath,
+                            'restored_at' => now()->toIso8601String(),
+                        ],
+                    ]);
+
+                    $source->update([
+                        'storage_disk' => $workDisk,
+                        'storage_path' => $workPath,
+                        'original_storage_path' => $source->original_storage_path ?: $workPath,
+                        'source_metadata' => $metadata,
+                    ]);
+
+                    return $source->fresh() ?? $source;
+                }
+            } catch (\Throwable $throwable) {
+                Log::warning('Failed restoring NBX processing input from remote URL', [
+                    'source_id' => $source->id,
+                    'asset_id' => $source->media_asset_id,
+                    'url' => $remoteUrl,
+                    'error' => $throwable->getMessage(),
+                ]);
+            }
+        }
+
+        return null;
+    }
+
     public function buildPublicUrl(MediaSource $source): ?string
     {
         if ($source->status !== 'ready' || ! $source->is_active) {
@@ -63,13 +203,17 @@ class MediaSourceService
 
     public function buildMp4PlayUrl(MediaSource $source): ?string
     {
-        if ($source->status !== 'ready' || ! $source->is_active || ! $source->storage_path) {
+        if ($source->status !== 'ready' || ! $source->is_active) {
             return null;
         }
 
         if ($this->shouldUseNbxFinalArtifacts($source)) {
             return $this->nbxArtifactUrl($source, 'faststart')
                 ?: $this->nbxArtifactUrl($source, 'original');
+        }
+
+        if (! $source->storage_path) {
+            return null;
         }
 
         $disk = $source->storage_disk ?: $this->storageDisk();
@@ -90,13 +234,17 @@ class MediaSourceService
 
     public function buildDownloadUrl(MediaSource $source): ?string
     {
-        if ($source->status !== 'ready' || ! $source->is_active || ! $source->storage_path) {
+        if ($source->status !== 'ready' || ! $source->is_active) {
             return null;
         }
 
         if ($this->shouldUseNbxFinalArtifacts($source)) {
             return $this->mp4OnlyUrl($this->nbxArtifactUrl($source, 'faststart'))
                 ?: $this->mp4OnlyUrl($this->nbxArtifactUrl($source, 'original'));
+        }
+
+        if (! $source->storage_path) {
+            return null;
         }
 
         $disk = $source->storage_disk ?: $this->storageDisk();
@@ -844,8 +992,9 @@ class MediaSourceService
                 return false;
             }
 
+            $source = $this->ensureLocalWorkFileForProcessing($source) ?: $source;
             $disk = $source->storage_disk ?: $this->storageDisk();
-            if (! Storage::disk($disk)->exists($source->storage_path)) {
+            if (! $source->storage_path || ! $this->safeExists($disk, $source->storage_path)) {
                 Log::warning('queuePlaybackProcessing: original media file missing on disk', [
                     'source_id' => $source->id,
                     'asset_id' => $source->media_asset_id,
@@ -911,10 +1060,11 @@ class MediaSourceService
             return;
         }
 
+        $source = $this->ensureLocalWorkFileForProcessing($source) ?: $source;
         $disk = $source->storage_disk ?: $this->storageDisk();
         // Use optimized_path if available, otherwise storage_path.
         $inputPath = $source->optimized_path ?: $source->storage_path;
-        if (! $inputPath || ! Storage::disk($disk)->exists($inputPath)) {
+        if (! $inputPath || ! $this->safeExists($disk, $inputPath)) {
             Log::warning('retryWorkerHlsOnly: input file missing, cannot retry HLS', [
                 'source_id' => $source->id,
                 'asset_id'  => $source->media_asset_id,

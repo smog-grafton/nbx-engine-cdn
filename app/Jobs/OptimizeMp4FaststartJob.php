@@ -5,6 +5,7 @@ namespace App\Jobs;
 use App\Models\MediaSource;
 use App\Services\MediaBinaryDetector;
 use App\Services\NbxEngineService;
+use App\Services\MediaSourceService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -57,12 +58,13 @@ class OptimizeMp4FaststartJob implements ShouldQueue, ShouldBeUnique
     public function handle(): void
     {
         $source = MediaSource::find($this->sourceId);
-        if (! $source || $source->status !== 'ready' || ! $source->storage_path) {
+        if (! $source || $source->status !== 'ready') {
             return;
         }
 
+        $source = app(MediaSourceService::class)->ensureLocalWorkFileForProcessing($source) ?: $source;
         $disk = $source->storage_disk ?: (string) config('cdn.disk', 'public');
-        if (! Storage::disk($disk)->exists($source->storage_path)) {
+        if (! $source->storage_path || ! Storage::disk($disk)->exists($source->storage_path)) {
             $source->update([
                 'optimize_status' => 'failed',
                 'optimize_error' => 'Original media file was not found for faststart optimization.',
