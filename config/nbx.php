@@ -23,8 +23,10 @@ return [
     'default_hls_720' => (bool) env('NBX_DEFAULT_HLS_720', false),
     'default_hls_1080' => (bool) env('NBX_DEFAULT_HLS_1080', false),
 
-    'max_upload_mb' => (int) env('NBX_MAX_UPLOAD_SIZE_MB', env('MAX_UPLOAD_MB', 2048)),
+    'max_upload_mb' => (int) env('NBX_MAX_UPLOAD_SIZE_MB', env('MAX_UPLOAD_MB', 20480)),
     'upload_session_ttl_minutes' => (int) env('NBX_UPLOAD_SESSION_TTL_MINUTES', 60),
+    'upload_chunk_size_mb' => (int) env('NBX_UPLOAD_CHUNK_SIZE_MB', 8),
+    'upload_session_dir' => (string) env('NBX_UPLOAD_SESSION_DIR', 'nbx/upload-sessions'),
     'allowed_upload_extensions' => array_values(array_filter(array_map(
         static fn (string $extension): string => strtolower(trim($extension)),
         explode(',', (string) env('NBX_ALLOWED_UPLOAD_EXTENSIONS', 'mp4,m4v,mov,mkv,webm,avi,mpeg,mpg,ts,m2ts'))

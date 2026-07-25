@@ -13,6 +13,11 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schedule;
 use Illuminate\Support\Facades\Storage;
 
+Schedule::command('nbx:cleanup-upload-sessions')
+    ->name('nbx:cleanup-upload-sessions')
+    ->withoutOverlapping()
+    ->hourly();
+
 Artisan::command('inspire', function () {
     $this->comment(Inspiring::quote());
 })->purpose('Display an inspiring quote');

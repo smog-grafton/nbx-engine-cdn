@@ -11,6 +11,8 @@ use App\Support\SafeRemoteMediaUrl;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\File;
+use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 
@@ -54,6 +56,7 @@ class NbxEngineController extends Controller
             'video_ref_type' => ['nullable', 'string', 'max:100'],
             'video_ref_id' => ['nullable', 'string', 'max:100'],
             'callback_url' => ['nullable', 'url', 'max:4096'],
+            'checksum_sha256' => ['nullable', 'string', 'size:64', 'regex:/^[a-f0-9]{64}$/i'],
         ]);
 
         if (($validated['input_type'] ?? null) === 'telegram') {
@@ -151,6 +154,7 @@ class NbxEngineController extends Controller
             'video_ref_type' => ['nullable', 'string', 'max:100'],
             'video_ref_id' => ['nullable', 'string', 'max:100'],
             'callback_url' => ['nullable', 'url', 'max:4096'],
+            'checksum_sha256' => ['nullable', 'string', 'size:64', 'regex:/^[a-f0-9]{64}$/i'],
         ]);
 
         if ($error = $this->uploadPolicyError($validated['filename'], $validated['mime_type'] ?? null, $validated['extension'] ?? null)) {
@@ -167,6 +171,8 @@ class NbxEngineController extends Controller
             'max_upload_size_bytes' => $maxBytes,
             'expires_at' => $expiresAt->toIso8601String(),
             'created_at' => now()->toIso8601String(),
+            'status' => 'initialized',
+            'received_chunks' => [],
         ]);
 
         Cache::put($this->uploadSessionKey($sessionId), $session, $expiresAt);
@@ -174,12 +180,23 @@ class NbxEngineController extends Controller
         $publicBaseUrl = rtrim((string) (config('nbx.public_url') ?: config('app.url')), '/');
         $completeUrl = $publicBaseUrl.'/api/v1/nbx/uploads/'.$sessionId.'/complete';
         $cancelUrl = $publicBaseUrl.'/api/v1/nbx/uploads/'.$sessionId.'/cancel';
+        $chunkSize = max(1, (int) config('nbx.upload_chunk_size_mb', 8)) * 1024 * 1024;
+        $statusUrl = $publicBaseUrl.'/api/v1/nbx/uploads/'.$sessionId;
+        $chunkCompleteUrl = $publicBaseUrl.'/api/v1/nbx/uploads/'.$sessionId.'/complete-chunks';
 
         return $this->success([
             'session_id' => $sessionId,
             'upload_url' => $completeUrl,
             'complete_url' => $completeUrl,
             'cancel_url' => $cancelUrl,
+            'upload_mode' => 'chunked',
+            'chunk_size_bytes' => $chunkSize,
+            'total_chunks' => isset($validated['size_bytes'])
+                ? (int) ceil(((int) $validated['size_bytes']) / $chunkSize)
+                : null,
+            'chunk_url_template' => $publicBaseUrl.'/api/v1/nbx/uploads/'.$sessionId.'/chunks/{index}',
+            'status_url' => $statusUrl,
+            'chunk_complete_url' => $chunkCompleteUrl,
             'method' => 'POST',
             'field' => 'file',
             'headers' => [
@@ -190,6 +207,259 @@ class NbxEngineController extends Controller
             'allowed_extensions' => $this->allowedUploadExtensions(),
             'allowed_mimes' => $this->allowedUploadMimes(),
         ], 201);
+    }
+
+    public function uploadStatus(Request $request, string $session): JsonResponse
+    {
+        $sessionData = $this->authorizedUploadSession($request, $session);
+        if (! $sessionData) {
+            return $this->error('Upload session was not found, expired, or the upload token is invalid.', 401);
+        }
+
+        return $this->success($this->uploadSessionPayload($sessionData));
+    }
+
+    public function uploadChunk(Request $request, string $session, int $chunk): JsonResponse
+    {
+        $sessionData = $this->authorizedUploadSession($request, $session);
+        if (! $sessionData) {
+            return $this->error('Upload session was not found, expired, or the upload token is invalid.', 401);
+        }
+        if (($sessionData['status'] ?? null) === 'completed') {
+            return $this->success($this->uploadSessionPayload($sessionData));
+        }
+
+        $expectedSize = (int) ($sessionData['size_bytes'] ?? 0);
+        if ($expectedSize <= 0) {
+            return $this->error('Chunked uploads require size_bytes during initialization.', 422);
+        }
+        $chunkSize = max(1, (int) config('nbx.upload_chunk_size_mb', 8)) * 1024 * 1024;
+        $totalChunks = (int) ceil($expectedSize / $chunkSize);
+        if ($chunk < 0 || $chunk >= $totalChunks) {
+            return $this->error('Chunk index is outside this upload session.', 422);
+        }
+        $expectedChunkSize = $chunk === $totalChunks - 1
+            ? $expectedSize - ($chunk * $chunkSize)
+            : $chunkSize;
+        $contentLength = (int) $request->header('Content-Length', 0);
+        if ($contentLength > $expectedChunkSize || $contentLength > $chunkSize) {
+            return $this->error('Chunk body exceeds the allowed chunk size.', 413);
+        }
+
+        $directory = $this->uploadSessionDirectory($session);
+        File::ensureDirectoryExists($directory, 0700, true);
+        $target = $directory.'/chunk-'.$chunk.'.part';
+        $temporary = $target.'.'.Str::random(8).'.tmp';
+        $input = $request->getContent(true);
+        $output = fopen($temporary, 'wb');
+        if (! is_resource($input) || ! is_resource($output)) {
+            if (is_resource($output)) {
+                fclose($output);
+            }
+            @unlink($temporary);
+
+            return $this->error('Could not open the chunk stream.', 500);
+        }
+        $hash = hash_init('sha256');
+        $written = 0;
+        try {
+            while (! feof($input)) {
+                $buffer = fread($input, 1024 * 1024);
+                if ($buffer === false) {
+                    throw new \RuntimeException('Could not read the chunk stream.');
+                }
+                if ($buffer === '') {
+                    break;
+                }
+                $length = strlen($buffer);
+                $written += $length;
+                if ($written > $expectedChunkSize) {
+                    throw new \RuntimeException('Chunk body exceeds the expected size.');
+                }
+                hash_update($hash, $buffer);
+                if (fwrite($output, $buffer) !== $length) {
+                    throw new \RuntimeException('Could not write the complete chunk.');
+                }
+            }
+        } catch (\Throwable $exception) {
+            fclose($output);
+            @unlink($temporary);
+
+            return $this->error($exception->getMessage(), 422);
+        }
+        fclose($output);
+        if ($written !== $expectedChunkSize) {
+            @unlink($temporary);
+
+            return $this->error("Chunk {$chunk} must contain exactly {$expectedChunkSize} bytes.", 422);
+        }
+        $digest = hash_final($hash);
+        $providedDigest = strtolower(trim((string) $request->header('X-Chunk-SHA256', '')));
+        if ($providedDigest !== '' && ! hash_equals($providedDigest, $digest)) {
+            @unlink($temporary);
+
+            return $this->error('Chunk checksum does not match.', 422);
+        }
+        if (is_file($target)) {
+            $existingDigest = hash_file('sha256', $target);
+            if ($existingDigest === $digest) {
+                @unlink($temporary);
+            } elseif (! rename($temporary, $target)) {
+                @unlink($temporary);
+
+                return $this->error('Could not persist the verified upload chunk.', 500);
+            }
+        } elseif (! rename($temporary, $target)) {
+            @unlink($temporary);
+
+            return $this->error('Could not persist the verified upload chunk.', 500);
+        }
+
+        $sessionData['status'] = 'uploading';
+        $sessionData['received_chunks'][(string) $chunk] = [
+            'size_bytes' => $written,
+            'sha256' => $digest,
+            'received_at' => now()->toIso8601String(),
+        ];
+        $this->putUploadSession($session, $sessionData);
+
+        return $this->success([
+            ...$this->uploadSessionPayload($sessionData),
+            'accepted_chunk' => $chunk,
+            'chunk_sha256' => $digest,
+        ], 202);
+    }
+
+    public function completeChunkedUpload(
+        Request $request,
+        string $session,
+        NbxEngineService $nbx,
+        MediaSourceService $mediaSourceService
+    ): JsonResponse {
+        $sessionData = $this->authorizedUploadSession($request, $session);
+        if (! $sessionData) {
+            return $this->error('Upload session was not found, expired, or the upload token is invalid.', 401);
+        }
+        if (($sessionData['status'] ?? null) === 'completed' && is_array($sessionData['result'] ?? null)) {
+            return $this->success($sessionData['result'], 202);
+        }
+
+        $lock = Cache::lock('nbx:upload-session-complete:'.$session, 300);
+        if (! $lock->get()) {
+            return $this->error('This upload is already being completed.', 409);
+        }
+
+        try {
+            $expectedSize = (int) ($sessionData['size_bytes'] ?? 0);
+            $chunkSize = max(1, (int) config('nbx.upload_chunk_size_mb', 8)) * 1024 * 1024;
+            $totalChunks = $expectedSize > 0 ? (int) ceil($expectedSize / $chunkSize) : 0;
+            $received = array_map('intval', array_keys((array) ($sessionData['received_chunks'] ?? [])));
+            $missing = array_values(array_diff(range(0, max(0, $totalChunks - 1)), $received));
+            if ($totalChunks < 1 || $missing !== []) {
+                return response()->json([
+                    'success' => false,
+                    'data' => ['missing_chunks' => $missing],
+                    'error' => 'Upload is incomplete.',
+                ], 422);
+            }
+
+            $directory = $this->uploadSessionDirectory($session);
+            $assembled = $directory.'/assembled-upload';
+            $output = fopen($assembled, 'wb');
+            if (! is_resource($output)) {
+                return $this->error('Could not assemble the uploaded chunks.', 500);
+            }
+            $fileHash = hash_init('sha256');
+            $assembledBytes = 0;
+            try {
+                for ($index = 0; $index < $totalChunks; $index++) {
+                    $input = fopen($directory.'/chunk-'.$index.'.part', 'rb');
+                    if (! is_resource($input)) {
+                        throw new \RuntimeException("Chunk {$index} is missing from temporary storage.");
+                    }
+                    while (! feof($input)) {
+                        $buffer = fread($input, 1024 * 1024);
+                        if ($buffer === false) {
+                            fclose($input);
+                            throw new \RuntimeException("Could not read chunk {$index}.");
+                        }
+                        if ($buffer === '') {
+                            break;
+                        }
+                        $assembledBytes += strlen($buffer);
+                        hash_update($fileHash, $buffer);
+                        $length = strlen($buffer);
+                        if (fwrite($output, $buffer) !== $length) {
+                            fclose($input);
+                            throw new \RuntimeException('Could not write the complete assembled upload.');
+                        }
+                    }
+                    fclose($input);
+                }
+            } catch (\Throwable $exception) {
+                fclose($output);
+                @unlink($assembled);
+
+                return $this->error($exception->getMessage(), 422);
+            }
+            fclose($output);
+            if ($assembledBytes !== $expectedSize) {
+                @unlink($assembled);
+
+                return $this->error('Assembled file size does not match the initialized upload.', 422);
+            }
+            $digest = hash_final($fileHash);
+            $providedDigest = strtolower(trim((string) ($request->header('X-File-SHA256') ?: ($sessionData['checksum_sha256'] ?? ''))));
+            if ($providedDigest !== '' && ! hash_equals($providedDigest, $digest)) {
+                @unlink($assembled);
+
+                return $this->error('Complete file checksum does not match.', 422);
+            }
+            $detectedMime = class_exists(\finfo::class)
+                ? ((new \finfo(FILEINFO_MIME_TYPE))->file($assembled) ?: 'application/octet-stream')
+                : 'application/octet-stream';
+            if ($error = $this->uploadPolicyError(
+                (string) $sessionData['filename'],
+                $detectedMime,
+                $sessionData['extension'] ?? null
+            )) {
+                @unlink($assembled);
+
+                return $this->error($error, 422);
+            }
+
+            $jobData = $sessionData;
+            unset(
+                $jobData['session_id'],
+                $jobData['token_hash'],
+                $jobData['max_upload_size_bytes'],
+                $jobData['expires_at'],
+                $jobData['created_at'],
+                $jobData['received_chunks'],
+                $jobData['status']
+            );
+            $filename = (string) $sessionData['filename'];
+            $uploaded = new UploadedFile(
+                $assembled,
+                $filename,
+                $detectedMime,
+                null,
+                true
+            );
+            $source = $nbx->createUploadJob($jobData, $uploaded, $mediaSourceService);
+            $result = $nbx->discoveryPayload($source, $mediaSourceService);
+            $sessionData['status'] = 'completed';
+            $sessionData['completed_at'] = now()->toIso8601String();
+            $sessionData['file_sha256'] = $digest;
+            $sessionData['result'] = $result;
+            $sessionData['received_chunks'] = [];
+            $this->putUploadSession($session, $sessionData);
+            File::deleteDirectory($directory);
+
+            return $this->success($result, 202);
+        } finally {
+            $lock->release();
+        }
     }
 
     public function completeUpload(
@@ -231,6 +501,7 @@ class NbxEngineController extends Controller
 
         $source = $nbx->createUploadJob($jobData, $file, $mediaSourceService);
         Cache::forget($this->uploadSessionKey($session));
+        File::deleteDirectory($this->uploadSessionDirectory($session));
 
         return $this->success($nbx->discoveryPayload($source, $mediaSourceService), 202);
     }
@@ -243,6 +514,7 @@ class NbxEngineController extends Controller
         }
 
         Cache::forget($this->uploadSessionKey($session));
+        File::deleteDirectory($this->uploadSessionDirectory($session));
 
         return $this->success([
             'session_id' => $session,
@@ -382,6 +654,44 @@ class NbxEngineController extends Controller
     private function uploadSessionKey(string $session): string
     {
         return 'nbx:upload-session:'.$session;
+    }
+
+    private function uploadSessionDirectory(string $session): string
+    {
+        return storage_path('app/'.trim((string) config('nbx.upload_session_dir', 'nbx/upload-sessions'), '/').'/'.$session);
+    }
+
+    private function putUploadSession(string $session, array $sessionData): void
+    {
+        $seconds = max(60, now()->diffInSeconds(
+            \Illuminate\Support\Carbon::parse((string) $sessionData['expires_at']),
+            false
+        ));
+        Cache::put($this->uploadSessionKey($session), $sessionData, $seconds);
+    }
+
+    private function uploadSessionPayload(array $sessionData): array
+    {
+        $expectedSize = (int) ($sessionData['size_bytes'] ?? 0);
+        $chunkSize = max(1, (int) config('nbx.upload_chunk_size_mb', 8)) * 1024 * 1024;
+        $totalChunks = $expectedSize > 0 ? (int) ceil($expectedSize / $chunkSize) : 0;
+        $received = array_map('intval', array_keys((array) ($sessionData['received_chunks'] ?? [])));
+        sort($received);
+
+        return [
+            'session_id' => $sessionData['session_id'],
+            'status' => $sessionData['status'] ?? 'initialized',
+            'expires_at' => $sessionData['expires_at'],
+            'size_bytes' => $expectedSize,
+            'chunk_size_bytes' => $chunkSize,
+            'total_chunks' => $totalChunks,
+            'received_chunks' => $received,
+            'missing_chunks' => $totalChunks > 0
+                ? array_values(array_diff(range(0, $totalChunks - 1), $received))
+                : [],
+            'uploaded_bytes' => array_sum(array_column((array) ($sessionData['received_chunks'] ?? []), 'size_bytes')),
+            'result' => $sessionData['status'] === 'completed' ? ($sessionData['result'] ?? null) : null,
+        ];
     }
 
     /**

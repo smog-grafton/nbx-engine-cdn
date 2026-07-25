@@ -62,6 +62,16 @@ Route::prefix('v1')
         Route::post('/nbx/uploads/{session}/cancel', [NbxEngineController::class, 'cancelUpload'])
             ->whereUuid('session')
             ->middleware('throttle:30,1');
+        Route::get('/nbx/uploads/{session}', [NbxEngineController::class, 'uploadStatus'])
+            ->whereUuid('session')
+            ->middleware('throttle:120,1');
+        Route::put('/nbx/uploads/{session}/chunks/{chunk}', [NbxEngineController::class, 'uploadChunk'])
+            ->whereUuid('session')
+            ->whereNumber('chunk')
+            ->middleware('throttle:600,1');
+        Route::post('/nbx/uploads/{session}/complete-chunks', [NbxEngineController::class, 'completeChunkedUpload'])
+            ->whereUuid('session')
+            ->middleware('throttle:30,1');
     });
 
 Route::prefix('v1/storage')
