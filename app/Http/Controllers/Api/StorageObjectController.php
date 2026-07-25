@@ -26,15 +26,21 @@ class StorageObjectController extends Controller
             'association' => ['nullable', 'in:all,portal,nbx,orphan'],
         ]);
 
-        return $this->success($browser->list(
-            (string) ($validated['prefix'] ?? ''),
-            $validated['cursor'] ?? null,
-            (int) ($validated['limit'] ?? config('nbx.storage_browser_page_size', 50)),
-            $validated['search'] ?? null,
-            $validated['role'] ?? null,
-            $validated['extension'] ?? null,
-            $validated['association'] ?? null,
-        ));
+        try {
+            return $this->success($browser->list(
+                (string) ($validated['prefix'] ?? ''),
+                $validated['cursor'] ?? null,
+                (int) ($validated['limit'] ?? config('nbx.storage_browser_page_size', 50)),
+                $validated['search'] ?? null,
+                $validated['role'] ?? null,
+                $validated['extension'] ?? null,
+                $validated['association'] ?? null,
+            ));
+        } catch (\RuntimeException $exception) {
+            report($exception);
+
+            return $this->failure($exception->getMessage(), 503);
+        }
     }
 
     public function register(Request $request, StorageReferenceService $references): JsonResponse

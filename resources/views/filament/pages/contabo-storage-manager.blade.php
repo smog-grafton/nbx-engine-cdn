@@ -1,5 +1,15 @@
 <x-filament-panels::page>
     <div class="space-y-6">
+        @if ($loadError)
+            <div role="alert" class="rounded-xl bg-danger-50 p-5 text-danger-800 ring-1 ring-danger-600/20 dark:bg-danger-950/40 dark:text-danger-200 dark:ring-danger-500/30">
+                <h2 class="font-semibold">Contabo storage is unavailable</h2>
+                <p class="mt-1 text-sm">{{ $loadError }}</p>
+                <p class="mt-2 text-xs opacity-80">
+                    Configure the S3 key pair (or Contabo API fallback), set <code>AWS_EC2_METADATA_DISABLED=true</code>, then run <code>php artisan optimize:clear</code>.
+                </p>
+            </div>
+        @endif
+
         <div class="rounded-xl bg-white p-5 shadow-sm ring-1 ring-gray-950/5 dark:bg-gray-900 dark:ring-white/10">
             <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
                 <label class="text-sm font-medium text-gray-950 dark:text-white">

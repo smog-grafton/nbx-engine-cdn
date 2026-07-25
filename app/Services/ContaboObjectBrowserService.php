@@ -4,8 +4,11 @@ namespace App\Services;
 
 use App\Models\MediaSource;
 use App\Models\StorageObjectReference;
+use Aws\Exception\AwsException;
+use Aws\Exception\CredentialsException;
 use Illuminate\Filesystem\AwsS3V3Adapter;
 use Illuminate\Support\Facades\Storage;
+use RuntimeException;
 
 class ContaboObjectBrowserService
 {
@@ -31,6 +34,22 @@ class ContaboObjectBrowserService
             return $this->listLocal($disk, $bucket, $prefix, $cursor, $limit, $search, $role, $extension, $association);
         }
 
+        if ($disk === 'contabo') {
+            $credentials = app(ContaboStorageCredentialService::class);
+            if (! $credentials->ensureRuntimeDiskCredentials()) {
+                throw new RuntimeException($credentials->configurationError());
+            }
+
+            // Runtime discovery forgets the original disk so the new credentials are
+            // applied. Always reacquire it before obtaining the S3 client.
+            $storage = Storage::disk($disk);
+            $bucket = (string) config("filesystems.disks.{$disk}.bucket", '');
+            $endpoint = (string) config("filesystems.disks.{$disk}.endpoint", '');
+            if ($bucket === '' || $endpoint === '') {
+                throw new RuntimeException('Contabo storage requires both CONTABO_BUCKET (or CONTABO_OBJECT_STORAGE_BUCKET) and CONTABO_ENDPOINT.');
+            }
+        }
+
         $params = [
             'Bucket' => $bucket,
             'Prefix' => $prefix,
@@ -39,7 +58,20 @@ class ContaboObjectBrowserService
         if ($cursor) {
             $params['ContinuationToken'] = $cursor;
         }
-        $result = $storage->getClient()->listObjectsV2($params);
+        try {
+            $result = $storage->getClient()->listObjectsV2($params);
+        } catch (CredentialsException $exception) {
+            throw new RuntimeException(
+                'Contabo S3 credentials are unavailable. Configure CONTABO_ACCESS_KEY_ID and CONTABO_SECRET_ACCESS_KEY (or their CONTABO_OBJECT_STORAGE_* aliases).',
+                previous: $exception,
+            );
+        } catch (AwsException $exception) {
+            $code = $exception->getAwsErrorCode();
+            throw new RuntimeException(
+                'Contabo object listing failed'.($code ? " ({$code})" : '').'. Verify the bucket, region, endpoint, and S3 key permissions.',
+                previous: $exception,
+            );
+        }
         $rows = [];
         foreach ((array) ($result['Contents'] ?? []) as $object) {
             $key = (string) ($object['Key'] ?? '');

@@ -6,6 +6,7 @@ use App\Models\MediaApiToken;
 use App\Models\MediaAsset;
 use App\Models\MediaSource;
 use App\Models\StorageObjectReference;
+use App\Services\ContaboObjectBrowserService;
 use App\Services\StorageDeletionService;
 use App\Services\StorageReferenceService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -55,6 +56,39 @@ class StorageManagementTest extends TestCase
         );
         Storage::disk('contabo')->assertExists('videos/direct/movie.mp4');
         $this->assertCount(1, Storage::disk('contabo')->allFiles('videos/direct'));
+    }
+
+    public function test_storage_browser_refuses_missing_s3_credentials_before_aws_metadata_lookup(): void
+    {
+        config()->set('filesystems.disks.contabo', [
+            'driver' => 's3',
+            'key' => null,
+            'secret' => null,
+            'region' => 'usc1',
+            'bucket' => 'test-bucket',
+            'endpoint' => 'https://usc1.contabostorage.com',
+            'use_path_style_endpoint' => true,
+            'throw' => false,
+        ]);
+        foreach ([
+            'client_id',
+            'client_secret',
+            'username',
+            'password',
+            'user_id',
+            'object_storage_id',
+        ] as $key) {
+            config()->set("services.contabo_api.{$key}", null);
+        }
+        Storage::forgetDisk('contabo');
+
+        try {
+            app(ContaboObjectBrowserService::class)->list('videos');
+            $this->fail('Expected missing Contabo credentials to stop the listing.');
+        } catch (\RuntimeException $exception) {
+            $this->assertStringContainsString('S3 keys are blank', $exception->getMessage());
+            $this->assertStringNotContainsString('169.254.169.254', $exception->getMessage());
+        }
     }
 
     public function test_direct_deletion_reconciles_portal_before_and_after_verified_storage_removal(): void

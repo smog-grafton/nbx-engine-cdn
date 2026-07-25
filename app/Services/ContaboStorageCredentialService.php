@@ -18,6 +18,7 @@ class ContaboStorageCredentialService
 
         if (! app(ContaboApiClientService::class)->isConfigured()) {
             $this->lastError = 'Contabo S3 keys are blank and Contabo API credentials are not configured.';
+
             return false;
         }
 
@@ -25,6 +26,7 @@ class ContaboStorageCredentialService
         if (! ($credentials['ok'] ?? false) || ! is_array($credentials['data'] ?? null)) {
             $this->lastError = (string) ($credentials['error'] ?? 'Contabo S3 credential discovery failed.');
             Log::warning('Contabo S3 credential discovery failed', ['error' => $this->lastError]);
+
             return false;
         }
 
@@ -51,9 +53,9 @@ class ContaboStorageCredentialService
         }
 
         if ($missing !== []) {
-            return 'Contabo disk is missing required values: ' . implode(', ', $missing) . '.';
+            return 'Contabo disk is missing required values: '.implode(', ', $missing).'.';
         }
 
-        return $this->lastError ?: 'Contabo disk is missing S3 credentials. Set CONTABO_OBJECT_STORAGE_ACCESS_KEY/SECRET_KEY or valid CONTABO_API_* credentials.';
+        return $this->lastError ?: 'Contabo disk is missing S3 credentials. Set CONTABO_ACCESS_KEY_ID/CONTABO_SECRET_ACCESS_KEY (or the CONTABO_OBJECT_STORAGE_* aliases), or configure valid CONTABO_API_* credentials.';
     }
 }

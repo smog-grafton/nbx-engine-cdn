@@ -47,6 +47,8 @@ class ContaboStorageManager extends Page
 
     public bool $isTruncated = false;
 
+    public ?string $loadError = null;
+
     /** @var array<int,array<string,mixed>> */
     public array $audits = [];
 
@@ -162,18 +164,30 @@ class ContaboStorageManager extends Page
 
     private function loadObjects(): void
     {
-        $result = app(ContaboObjectBrowserService::class)->list(
-            $this->prefix,
-            $this->cursor,
-            $this->limit,
-            $this->search !== '' ? $this->search : null,
-            $this->role,
-            $this->extension,
-            $this->association,
-        );
-        $this->objects = $result['objects'];
-        $this->nextCursor = $result['next_cursor'];
-        $this->isTruncated = $result['is_truncated'];
+        try {
+            $result = app(ContaboObjectBrowserService::class)->list(
+                $this->prefix,
+                $this->cursor,
+                $this->limit,
+                $this->search !== '' ? $this->search : null,
+                $this->role,
+                $this->extension,
+                $this->association,
+            );
+            $this->objects = $result['objects'];
+            $this->nextCursor = $result['next_cursor'];
+            $this->isTruncated = $result['is_truncated'];
+            $this->loadError = null;
+        } catch (\Throwable $exception) {
+            report($exception);
+            $this->objects = [];
+            $this->nextCursor = null;
+            $this->isTruncated = false;
+            $this->loadError = $exception instanceof \RuntimeException
+                ? $exception->getMessage()
+                : 'Contabo storage could not be loaded. Check the NBX logs and storage configuration.';
+        }
+
         $this->audits = StorageActionAudit::query()
             ->latest('id')
             ->limit(15)
