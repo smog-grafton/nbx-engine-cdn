@@ -7,6 +7,7 @@ use App\Jobs\FetchWorkerHlsArtifactJob;
 use App\Models\MediaAsset;
 use App\Models\MediaSource;
 use App\Services\MediaSourceService;
+use App\Services\NbxEngineService;
 use App\Support\MediaUrl;
 use App\Support\SafeRemoteMediaUrl;
 use Illuminate\Http\JsonResponse;
@@ -56,7 +57,7 @@ class MediaController extends Controller
         ]);
 
         // If no source_url, just create the asset and return (for direct upload flow)
-        if (!$sourceUrl) {
+        if (! $sourceUrl) {
             return response()->json([
                 'success' => true,
                 'data' => [
@@ -71,8 +72,8 @@ class MediaController extends Controller
 
         $creatorMeta = $validated['source_metadata'] ?? [];
         $extraMeta = array_filter([
-            'creator_ref'     => $creatorMeta['creator_ref'] ?? null,
-            'creator_type'    => $creatorMeta['creator_type'] ?? null,
+            'creator_ref' => $creatorMeta['creator_ref'] ?? null,
+            'creator_type' => $creatorMeta['creator_type'] ?? null,
             'portal_movie_id' => $creatorMeta['portal_movie_id'] ?? null,
         ]);
 
@@ -85,7 +86,7 @@ class MediaController extends Controller
         ]);
 
         // Store creator metadata if provided and column exists
-        if (!empty($extraMeta) && Schema::hasColumn('media_sources', 'source_metadata')) {
+        if (! empty($extraMeta) && Schema::hasColumn('media_sources', 'source_metadata')) {
             $existing = $source->source_metadata ?? [];
             $source->update(['source_metadata' => array_merge($existing, $extraMeta)]);
         }
@@ -155,7 +156,7 @@ class MediaController extends Controller
         $allowedExtensions = (array) config('cdn.allowed_video_extensions', ['mp4']);
 
         $validated = $request->validate([
-            'file' => ['required', 'file', 'max:' . ($maxUploadMb * 1024)],
+            'file' => ['required', 'file', 'max:'.($maxUploadMb * 1024)],
             'title' => ['nullable', 'string', 'max:255'],
             'asset_type' => ['nullable', Rule::in(['movie', 'episode', 'generic'])],
             'description' => ['nullable', 'string'],
@@ -205,7 +206,7 @@ class MediaController extends Controller
         $allowedExtensions = (array) config('cdn.allowed_video_extensions', ['mp4']);
 
         $validated = $request->validate([
-            'file' => ['required', 'file', 'max:' . ($maxUploadMb * 1024)],
+            'file' => ['required', 'file', 'max:'.($maxUploadMb * 1024)],
             'title' => ['nullable', 'string', 'max:255'],
             'original_filename' => ['nullable', 'string', 'max:255'],
             'asset_type' => ['nullable', Rule::in(['movie', 'episode', 'generic'])],
@@ -385,6 +386,65 @@ class MediaController extends Controller
         ], $source->status === 'failed' ? 422 : 201);
     }
 
+    public function telegramHandoff(
+        Request $request,
+        MediaSourceService $mediaSourceService,
+        NbxEngineService $nbx,
+    ): JsonResponse {
+        $validated = $request->validate([
+            'source_url' => ['required', 'url', 'max:4096'],
+            'original_filename' => ['required', 'string', 'max:255'],
+            'asset_id' => ['required', 'string', 'uuid'],
+            'source_id' => ['required', 'integer', 'min:1'],
+            'bytes_total' => ['nullable', 'integer', 'min:1'],
+            'metadata' => ['nullable'],
+        ]);
+
+        $source = MediaSource::with('asset')
+            ->whereKey((int) $validated['source_id'])
+            ->where('media_asset_id', (string) $validated['asset_id'])
+            ->firstOrFail();
+        $metadata = (array) ($source->source_metadata ?? []);
+        $incoming = $validated['metadata'] ?? [];
+        if (is_string($incoming) && $incoming !== '') {
+            $decoded = json_decode($incoming, true);
+            $incoming = is_array($decoded) ? $decoded : [];
+        }
+        $incoming = is_array($incoming) ? $incoming : [];
+
+        $handoffUrl = SafeRemoteMediaUrl::assertAllowed((string) $validated['source_url']);
+        $handoffHash = hash('sha256', $handoffUrl);
+        $alreadyAccepted = hash_equals((string) ($metadata['telebot_source_url_hash'] ?? ''), $handoffHash)
+            && in_array($source->status, ['pending', 'downloading', 'processing', 'ready'], true);
+        if (! $alreadyAccepted) {
+            $metadata = array_merge($metadata, $incoming, [
+                'provider' => 'nbx_engine',
+                'telegram_url' => $metadata['telegram_url'] ?? $incoming['telegram_url'] ?? null,
+                'telebot_source_url_hash' => $handoffHash,
+                'original_filename' => $validated['original_filename'],
+                'telebot_status' => 'received_by_nbx',
+                'telebot_message' => 'Teletyde handoff accepted. NBX is fetching the temporary file.',
+                'handoff_mode' => 'source_url',
+                'handoff_received_at' => now()->toIso8601String(),
+            ]);
+
+            $source->update([
+                'source_type' => 'remote_fetch',
+                'source_url' => $handoffUrl,
+                'status' => 'pending',
+                'bytes_total' => $validated['bytes_total'] ?? $source->bytes_total,
+                'failure_reason' => null,
+                'last_error' => null,
+                'source_metadata' => $metadata,
+            ]);
+            $mediaSourceService->queueRemoteImport($source->fresh(), true);
+            $source->refresh();
+            $nbx->markNbxStatus($source, 'received_by_nbx');
+        }
+
+        return $this->success($nbx->discoveryPayload($source->fresh() ?? $source, $mediaSourceService), 202);
+    }
+
     public function showAsset(string $assetId, MediaSourceService $mediaSourceService): JsonResponse
     {
         $asset = MediaAsset::with('sources')->findOrFail($assetId);
@@ -558,6 +618,7 @@ class MediaController extends Controller
                 'hls_worker_last_error' => $validated['failure_reason'] ?? null,
             ]);
             $mediaSourceService->refreshAssetStatus($source->asset);
+
             return $this->success(['updated' => true, 'optimize_status' => 'failed']);
         }
 
@@ -581,6 +642,7 @@ class MediaController extends Controller
             ]);
             FetchWorkerHlsArtifactJob::dispatch($source->id);
             $mediaSourceService->refreshAssetStatus($source->asset);
+
             return $this->success(['updated' => true, 'hls_worker_status' => 'artifact_ready', 'fetch_dispatched' => true]);
         }
 
@@ -622,14 +684,15 @@ class MediaController extends Controller
                 'source_id' => $validated['source_id'],
                 'source_status' => $source?->status,
             ]);
+
             return $this->error('Source not found or not ready.', 404);
         }
 
         $disk = $source->storage_disk ?: (string) config('cdn.disk', 'public');
         $assetId = $source->media_asset_id;
         $sourceId = $source->id;
-        $baseDir = 'media/' . $assetId . '/' . $sourceId;
-        $optimizedPath = $baseDir . '/optimized_play.mp4';
+        $baseDir = 'media/'.$assetId.'/'.$sourceId;
+        $optimizedPath = $baseDir.'/optimized_play.mp4';
 
         Storage::disk($disk)->makeDirectory($baseDir);
         $request->file('optimized')->storeAs($baseDir, 'optimized_play.mp4', ['disk' => $disk]);
@@ -638,7 +701,7 @@ class MediaController extends Controller
             return $this->error('Failed to store optimized file.', 500);
         }
 
-        $hlsDir = $baseDir . '/hls';
+        $hlsDir = $baseDir.'/hls';
         Storage::disk($disk)->deleteDirectory($hlsDir);
         Storage::disk($disk)->makeDirectory($hlsDir);
 
@@ -646,18 +709,20 @@ class MediaController extends Controller
         $zipPath = $request->file('hls_zip')->getRealPath();
         if ($zip->open($zipPath) !== true) {
             Log::warning('Worker upload: invalid HLS zip', ['source_id' => $sourceId]);
+
             return $this->error('Invalid HLS zip file.', 422);
         }
         $extractPath = Storage::disk($disk)->path($hlsDir);
         $zip->extractTo($extractPath);
         $zip->close();
 
-        $hlsMasterPath = $hlsDir . '/master.m3u8';
+        $hlsMasterPath = $hlsDir.'/master.m3u8';
         if (! Storage::disk($disk)->exists($hlsMasterPath)) {
             Log::warning('Worker upload: HLS zip missing master.m3u8 at root', [
                 'source_id' => $sourceId,
                 'extract_path' => $hlsDir,
             ]);
+
             return $this->error('HLS zip must contain master.m3u8 at root.', 422);
         }
 

@@ -1,17 +1,17 @@
 <?php
 
-use Illuminate\Foundation\Inspiring;
-use Illuminate\Support\Facades\Artisan;
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Schedule;
-use Illuminate\Support\Facades\Storage;
 use App\Models\MediaApiToken;
 use App\Models\MediaAsset;
 use App\Models\MediaSource;
 use App\Services\ContaboStorageCredentialService;
 use App\Services\MediaBinaryDetector;
 use App\Services\MediaSourceService;
+use Illuminate\Foundation\Inspiring;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schedule;
+use Illuminate\Support\Facades\Storage;
 
 Artisan::command('inspire', function () {
     $this->comment(Inspiring::quote());
@@ -35,7 +35,7 @@ Artisan::command('cdn:token {name} {--abilities=*} {--expires-days=}', function 
     [$tokenModel, $plainToken] = MediaApiToken::issue($name, $abilities, $expiresAt);
 
     $this->info('Token created successfully.');
-    $this->line('Token ID: ' . $tokenModel->id);
+    $this->line('Token ID: '.$tokenModel->id);
     $this->line('Use this bearer token (shown once):');
     $this->line($plainToken);
 })->purpose('Issue a server-to-server CDN API token');
@@ -45,30 +45,32 @@ Artisan::command('cdn:contabo-check {--write : Write and delete a small probe fi
     $resolver = app(ContaboStorageCredentialService::class);
     $resolved = $resolver->ensureRuntimeDiskCredentials();
     $config = config("filesystems.disks.{$disk}", []);
-    $masked = static fn ($value): string => $value ? substr((string) $value, 0, 4) . '…' . substr((string) $value, -4) : '(empty)';
+    $masked = static fn ($value): string => $value ? substr((string) $value, 0, 4).'…'.substr((string) $value, -4) : '(empty)';
 
     $this->line('Resolved Contabo disk config:');
-    $this->line('  bucket: ' . (($config['bucket'] ?? null) ?: '(empty)'));
-    $this->line('  region: ' . (($config['region'] ?? null) ?: '(empty)'));
-    $this->line('  endpoint: ' . (($config['endpoint'] ?? null) ?: '(empty)'));
-    $this->line('  public url: ' . (($config['url'] ?? null) ?: '(empty)'));
-    $this->line('  path style: ' . json_encode((bool) ($config['use_path_style_endpoint'] ?? false)));
-    $this->line('  key: ' . $masked($config['key'] ?? null));
-    $this->line('  secret: ' . $masked($config['secret'] ?? null));
-    $this->line('  credentials: ' . ($resolved ? 'ready' : 'missing'));
+    $this->line('  bucket: '.(($config['bucket'] ?? null) ?: '(empty)'));
+    $this->line('  region: '.(($config['region'] ?? null) ?: '(empty)'));
+    $this->line('  endpoint: '.(($config['endpoint'] ?? null) ?: '(empty)'));
+    $this->line('  public url: '.(($config['url'] ?? null) ?: '(empty)'));
+    $this->line('  path style: '.json_encode((bool) ($config['use_path_style_endpoint'] ?? false)));
+    $this->line('  key: '.$masked($config['key'] ?? null));
+    $this->line('  secret: '.$masked($config['secret'] ?? null));
+    $this->line('  credentials: '.($resolved ? 'ready' : 'missing'));
 
     if (! $resolved) {
         $this->error($resolver->configurationError());
+
         return;
     }
 
     if (! $this->option('write')) {
         $this->warn('Read-only check only. Run with --write to verify S3 write/delete.');
+
         return;
     }
 
-    $path = 'nbx-health/' . now()->format('YmdHis') . '-' . bin2hex(random_bytes(4)) . '.txt';
-    Storage::disk($disk)->put($path, 'nbx contabo check ' . now()->toIso8601String(), ['visibility' => 'public']);
+    $path = 'nbx-health/'.now()->format('YmdHis').'-'.bin2hex(random_bytes(4)).'.txt';
+    Storage::disk($disk)->put($path, 'nbx contabo check '.now()->toIso8601String(), ['visibility' => 'public']);
     $exists = Storage::disk($disk)->exists($path);
     $url = Storage::disk($disk)->url($path);
     Storage::disk($disk)->delete($path);
@@ -106,16 +108,16 @@ Artisan::command('nbx:health', function () {
         ->count();
 
     $this->line('NBX Engine health');
-    $this->line('  default storage: ' . config('nbx.default_storage'));
-    $this->line('  work storage: ' . config('nbx.work_storage'));
-    $this->line('  keep local work files: ' . json_encode((bool) config('nbx.keep_local_work_files', false)));
-    $this->line('  Contabo writable/configured: ' . ($contaboReady ? 'yes' : 'no'));
+    $this->line('  default storage: '.config('nbx.default_storage'));
+    $this->line('  work storage: '.config('nbx.work_storage'));
+    $this->line('  keep local work files: '.json_encode((bool) config('nbx.keep_local_work_files', false)));
+    $this->line('  Contabo writable/configured: '.($contaboReady ? 'yes' : 'no'));
     if (! $contaboReady) {
-        $this->warn('  Contabo error: ' . $contabo->configurationError());
+        $this->warn('  Contabo error: '.$contabo->configurationError());
     }
-    $this->line('  FFmpeg: ' . (($binaries['ffmpeg']['path'] ?? null) ?: 'missing'));
-    $this->line('  FFprobe: ' . (($binaries['ffprobe']['path'] ?? null) ?: 'missing'));
-    $this->line('  final URLs expected: ' . (config('nbx.default_storage') === 'contabo' ? 'Contabo Object Storage' : 'configured local/public disk'));
+    $this->line('  FFmpeg: '.(($binaries['ffmpeg']['path'] ?? null) ?: 'missing'));
+    $this->line('  FFprobe: '.(($binaries['ffprobe']['path'] ?? null) ?: 'missing'));
+    $this->line('  final URLs expected: '.(config('nbx.default_storage') === 'contabo' ? 'Contabo Object Storage' : 'configured local/public disk'));
 
     if ((string) config('nbx.default_storage') === 'contabo' && $localFinals > 0) {
         $this->warn("  warning: {$localFinals} ready NBX Contabo source(s) have no final Contabo artifact URL yet.");
@@ -149,7 +151,7 @@ Artisan::command('nbx:publish-final-artifacts {--limit=50 : Maximum ready NBX so
                 $published++;
             } catch (\Throwable $exception) {
                 $failed++;
-                $this->warn('Failed publishing source #' . $source->id . ': ' . $exception->getMessage());
+                $this->warn('Failed publishing source #'.$source->id.': '.$exception->getMessage());
             }
         });
 
@@ -158,6 +160,71 @@ Artisan::command('nbx:publish-final-artifacts {--limit=50 : Maximum ready NBX so
         $this->warn("Failed {$failed} source(s).");
     }
 })->purpose('Publish existing ready NBX work files to final Contabo storage');
+
+Artisan::command('nbx:reconcile-artifacts {--limit=200} {--apply : Persist corrections after object-size verification}', function () {
+    $limit = max(1, (int) $this->option('limit'));
+    $apply = (bool) $this->option('apply');
+    $storage = app(\App\Services\VerifiedObjectStorageService::class);
+    $nbxService = app(\App\Services\NbxEngineService::class);
+    $checked = 0;
+    $healthy = 0;
+    $mismatched = 0;
+
+    MediaSource::query()
+        ->where('source_metadata->provider', 'nbx_engine')
+        ->latest('id')
+        ->limit($limit)
+        ->get()
+        ->each(function (MediaSource $source) use ($storage, $nbxService, $apply, &$checked, &$healthy, &$mismatched): void {
+            $checked++;
+            $metadata = (array) ($source->source_metadata ?? []);
+            $artifact = (array) ($metadata['nbx']['final_artifacts']['faststart'] ?? []);
+            $verified = ! empty($artifact['disk'])
+                && ! empty($artifact['key'])
+                && $storage->verify((string) $artifact['disk'], (string) $artifact['key'], (int) ($artifact['bytes'] ?? 0));
+
+            if ($verified && $source->status === 'failed') {
+                $mismatched++;
+                $this->warn("Source #{$source->id}: verified optimized object exists, but status is failed.");
+                if ($apply) {
+                    $source->update([
+                        'status' => 'ready',
+                        'is_active' => true,
+                        'failure_reason' => null,
+                        'last_error' => null,
+                        'optimize_status' => 'ready',
+                        'optimize_error' => null,
+                    ]);
+                    $nbxService->refreshOutputMetadata($source->fresh());
+                }
+
+                return;
+            }
+
+            if (! $verified && $source->status === 'ready' && ! empty($artifact)) {
+                $mismatched++;
+                $this->warn("Source #{$source->id}: ready status points at a missing or wrong-size optimized object.");
+                if ($apply) {
+                    $source->update([
+                        'status' => 'failed',
+                        'is_active' => false,
+                        'failure_reason' => 'Artifact reconciliation failed: optimized object is missing or has the wrong byte size.',
+                        'last_error' => 'Optimized object verification failed.',
+                    ]);
+                    $nbxService->markNbxStatus($source->fresh(), 'failed', 'Optimized object verification failed.');
+                }
+
+                return;
+            }
+
+            $healthy++;
+        });
+
+    $this->info("Checked {$checked}; healthy {$healthy}; mismatched {$mismatched}.");
+    if (! $apply && $mismatched > 0) {
+        $this->comment('Dry run only. Re-run with --apply to persist these evidence-based corrections.');
+    }
+})->purpose('Reconcile NBX database status with verified final object existence and byte size');
 
 Artisan::command('cdn:reconcile {--minutes=30}', function (MediaSourceService $mediaSourceService) {
     $minutes = max(1, (int) $this->option('minutes'));
@@ -183,6 +250,7 @@ Artisan::command('cdn:reconcile {--minutes=30}', function (MediaSourceService $m
                 ]);
                 $mediaSourceService->refreshAssetStatus($source->asset);
                 $restoredReady++;
+
                 continue;
             }
         }
@@ -216,7 +284,7 @@ Artisan::command('media:retry-failed-optimizations {--limit=5} {--stale-minutes=
         ->where(function ($q) use ($maxRetries): void {
             // Cap infinite retries: skip sources that have already been retried too many times.
             $q->whereNull('optimize_retry_count')
-              ->orWhere('optimize_retry_count', '<', $maxRetries);
+                ->orWhere('optimize_retry_count', '<', $maxRetries);
         })
         ->limit($limit)
         ->get();
@@ -239,6 +307,7 @@ Artisan::command('media:retry-failed-optimizations {--limit=5} {--stale-minutes=
             // Only re-dispatch the HLS/worker step – skip compression entirely.
             $mediaSourceService->retryWorkerHlsOnly($source);
             $skippedWorkerOnly++;
+
             continue;
         }
 
@@ -253,6 +322,7 @@ Artisan::command('media:retry-failed-optimizations {--limit=5} {--stale-minutes=
                 $source->update(['storage_path' => $origPath]);
             } else {
                 $skippedMissing++;
+
                 continue;
             }
         }
@@ -286,7 +356,7 @@ Artisan::command('media:queue-pending-for-worker {--limit=0 : Max sources to que
     }
 
     $workerEnabled = (bool) config('cdn.laravel_worker_enabled', false);
-    $this->info("Queued {$queued} media source(s) for playback processing." . ($workerEnabled ? ' (Laravel worker is enabled – jobs sent to worker.)' : ' (Laravel worker disabled – jobs on local optimization queue.)'));
+    $this->info("Queued {$queued} media source(s) for playback processing.".($workerEnabled ? ' (Laravel worker is enabled – jobs sent to worker.)' : ' (Laravel worker disabled – jobs on local optimization queue.)'));
 })->purpose('Queue all pending/failed optimization sources; when CDN_LARAVEL_WORKER_ENABLED=true they are sent to the worker');
 
 Artisan::command('media:refresh-asset-statuses {--importing-only : Only refresh assets currently marked as importing}', function (MediaSourceService $mediaSourceService) {
@@ -332,6 +402,7 @@ Artisan::command('media:clear-optimization-queue', function () {
 
     if ($driver !== 'database') {
         $this->warn("Queue driver is '{$driver}'. Clear optimization jobs manually (e.g. Redis: flush the optimization list).");
+
         return;
     }
 
@@ -352,9 +423,9 @@ Artisan::command('media:refetch-missing-mp4s {--limit=0 : Max sources to process
 
     $query = MediaSource::with('asset')
         ->whereIn('status', ['ready', 'failed'])
-        ->where(function ($q) use ($disk): void {
+        ->where(function ($q): void {
             $q->whereNull('storage_path')
-              ->orWhereRaw('1=1'); // We filter by file existence in the loop
+                ->orWhereRaw('1=1'); // We filter by file existence in the loop
         });
 
     if ($sourceIdMin !== null) {
@@ -385,6 +456,7 @@ Artisan::command('media:refetch-missing-mp4s {--limit=0 : Max sources to process
 
         if ($storageExists || $originalExists || $optimExists) {
             $skippedIntact++;
+
             continue;
         }
 
@@ -462,30 +534,30 @@ Artisan::command('media:audit-deleted-originals {--csv : Output CSV}', function 
         ->get(['id', 'media_asset_id', 'storage_path', 'original_storage_path', 'optimized_path', 'is_faststart', 'optimize_status', 'hls_worker_status']);
 
     $missing = [];
-    $intact  = [];
+    $intact = [];
 
     foreach ($sources as $source) {
         /** @var MediaSource $source */
-        $storagePath  = $source->storage_path;
+        $storagePath = $source->storage_path;
         $originalPath = $source->original_storage_path;
-        $optimPath    = $source->optimized_path;
+        $optimPath = $source->optimized_path;
 
-        $storageExists  = $storagePath && Storage::disk($source->storage_disk ?: $disk)->exists($storagePath);
+        $storageExists = $storagePath && Storage::disk($source->storage_disk ?: $disk)->exists($storagePath);
         $originalExists = $originalPath && Storage::disk($source->storage_disk ?: $disk)->exists($originalPath);
-        $optimExists    = $optimPath && Storage::disk($source->storage_disk ?: $disk)->exists($optimPath);
+        $optimExists = $optimPath && Storage::disk($source->storage_disk ?: $disk)->exists($optimPath);
 
         $row = [
-            'source_id'      => $source->id,
-            'asset_id'       => $source->media_asset_id,
-            'storage_path'   => $storagePath,
+            'source_id' => $source->id,
+            'asset_id' => $source->media_asset_id,
+            'storage_path' => $storagePath,
             'storage_exists' => $storageExists ? 'yes' : 'NO',
-            'original_path'  => $originalPath,
+            'original_path' => $originalPath,
             'original_exists' => $originalExists ? 'yes' : ($originalPath ? 'NO' : 'not-set'),
             'optimized_path' => $optimPath,
             'optimized_exists' => $optimExists ? 'yes' : ($optimPath ? 'NO' : 'not-set'),
-            'is_faststart'   => $source->is_faststart ? 'yes' : 'no',
+            'is_faststart' => $source->is_faststart ? 'yes' : 'no',
             'optimize_status' => $source->optimize_status,
-            'worker_status'  => $source->hls_worker_status,
+            'worker_status' => $source->hls_worker_status,
         ];
 
         if (! $storageExists) {
@@ -495,8 +567,8 @@ Artisan::command('media:audit-deleted-originals {--csv : Output CSV}', function 
         }
     }
 
-    $total   = count($sources);
-    $nMiss   = count($missing);
+    $total = count($sources);
+    $nMiss = count($missing);
     $nIntact = count($intact);
 
     $this->info("Total sources: {$total} | Intact: {$nIntact} | Missing storage_path file: {$nMiss}");
@@ -518,7 +590,7 @@ Artisan::command('media:audit-deleted-originals {--csv : Output CSV}', function 
 
 Artisan::command('media:reset-worker-failed-to-pending {--limit=50}', function (MediaSourceService $mediaSourceService) {
     $limit = max(1, (int) $this->option('limit'));
-    $disk  = (string) config('cdn.disk', 'public');
+    $disk = (string) config('cdn.disk', 'public');
 
     // Find sources where the worker HLS step failed but faststart already succeeded.
     // Reset them so the retry scheduler picks them up for HLS-only retry (not full re-compression).
@@ -526,14 +598,14 @@ Artisan::command('media:reset-worker-failed-to-pending {--limit=50}', function (
         ->where('optimize_status', 'failed')
         ->where('is_faststart', true)
         ->whereNotNull('optimized_path')
-        ->where(function ($q) use ($disk): void {
+        ->where(function ($q): void {
             // Only pick those whose optimized_path still exists – we can retry HLS from it.
-            $q->whereRaw("1=1"); // All; file existence checked in loop below.
+            $q->whereRaw('1=1'); // All; file existence checked in loop below.
         })
         ->limit($limit)
         ->get();
 
-    $reset   = 0;
+    $reset = 0;
     $skipped = 0;
 
     foreach ($sources as $source) {
@@ -541,13 +613,14 @@ Artisan::command('media:reset-worker-failed-to-pending {--limit=50}', function (
         $inputPath = $source->optimized_path ?: $source->storage_path;
         if (! $inputPath || ! Storage::disk($source->storage_disk ?: $disk)->exists($inputPath)) {
             $skipped++;
+
             continue;
         }
 
         // Increment retry count but do NOT restart from compression.
         $source->update([
-            'optimize_status'  => 'failed', // keep failed so scheduler picks it up
-            'optimize_error'   => 'Reset for HLS-only retry after worker failure.',
+            'optimize_status' => 'failed', // keep failed so scheduler picks it up
+            'optimize_error' => 'Reset for HLS-only retry after worker failure.',
             'hls_worker_status' => null,
             'hls_worker_last_error' => null,
             'optimize_retry_count' => 0, // reset counter so scheduler will try again
@@ -591,6 +664,7 @@ Artisan::command('telegram-imports:sync {--limit=20}', function () {
             if ($service->dispatch($source)) {
                 $dispatched++;
             }
+
             continue;
         }
 
@@ -600,7 +674,7 @@ Artisan::command('telegram-imports:sync {--limit=20}', function () {
         } catch (\Throwable $exception) {
             $source->update([
                 'source_metadata' => array_merge($metadata, [
-                    'telebot_message' => 'Could not refresh Telebot status: ' . $exception->getMessage(),
+                    'telebot_message' => 'Could not refresh Telebot status: '.$exception->getMessage(),
                 ]),
             ]);
         }

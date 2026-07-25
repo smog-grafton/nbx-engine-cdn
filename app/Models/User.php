@@ -23,6 +23,7 @@ class User extends Authenticatable implements FilamentUser
         'name',
         'email',
         'password',
+        'storage_permissions',
     ];
 
     /**
@@ -45,11 +46,19 @@ class User extends Authenticatable implements FilamentUser
         return [
             'email_verified_at' => 'datetime',
             'password' => 'hashed',
+            'storage_permissions' => 'array',
         ];
     }
 
     public function canAccessPanel(Panel $panel): bool
     {
         return true;
+    }
+
+    public function canManageStorage(string $ability): bool
+    {
+        $permissions = $this->storage_permissions ?? [];
+
+        return in_array('*', $permissions, true) || in_array($ability, $permissions, true);
     }
 }

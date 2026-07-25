@@ -4,7 +4,7 @@ When the telebot shows **httpx.ReadError** during “Upload to CDN”, the TCP c
 
 ## 1. Check if any telegram intake reached the CDN (database)
 
-On the **CDN server** (where `cdn.naraboxtv.com` and the DB run), use the database name from your `.env` (`DB_DATABASE` – e.g. `naraboxt_cdn` in production, or `naraboxtv-cdn` locally):
+On the **NBX server** (where `nbx.naraboxtv.com` and the DB run), use the database name from your `.env` (`DB_DATABASE` – e.g. `naraboxt_cdn` in production, or `naraboxtv-cdn` locally):
 
 ```bash
 # List tables (use your actual DB name)

@@ -6,9 +6,7 @@ use App\Models\MediaSource;
 
 class TelegramImportDispatchService
 {
-    public function __construct(private readonly TelebotClientService $telebot)
-    {
-    }
+    public function __construct(private readonly TelebotClientService $telebot) {}
 
     public function dispatch(MediaSource $source): bool
     {
@@ -20,6 +18,7 @@ class TelegramImportDispatchService
                 'telebot_status' => 'failed',
                 'telebot_message' => 'Telegram URL is missing.',
             ]);
+
             return false;
         }
 
@@ -28,8 +27,9 @@ class TelegramImportDispatchService
         } catch (\Throwable $exception) {
             $this->mergeMetadata($source, [
                 'telebot_status' => 'waiting_for_capacity',
-                'telebot_message' => 'Telebot is unreachable: ' . $exception->getMessage(),
+                'telebot_message' => 'Telebot is unreachable: '.$exception->getMessage(),
             ]);
+
             return false;
         }
 
@@ -39,13 +39,14 @@ class TelegramImportDispatchService
                 'telebot_message' => 'Waiting for a free Telebot slot.',
                 'telebot_capacity' => $capacity,
             ]);
+
             return false;
         }
 
         $asset = $source->asset;
         $telebotMetadata = array_merge($metadata, [
             'source' => 'telegram',
-            'handoff_mode' => 'stream',
+            'handoff_mode' => 'source_url',
             'cdn_asset_id' => (string) $source->media_asset_id,
             'cdn_source_id' => $source->id,
             'asset_type' => $asset?->type,
@@ -57,8 +58,9 @@ class TelegramImportDispatchService
         } catch (\Throwable $exception) {
             $this->mergeMetadata($source, [
                 'telebot_status' => 'waiting_for_capacity',
-                'telebot_message' => 'Telebot dispatch failed: ' . $exception->getMessage(),
+                'telebot_message' => 'Telebot dispatch failed: '.$exception->getMessage(),
             ]);
+
             return false;
         }
 
@@ -118,6 +120,13 @@ class TelegramImportDispatchService
         }
 
         $source->update($updates);
+        if ($telebotStatus === 'failed') {
+            app(NbxEngineService::class)->markNbxStatus(
+                $source->fresh() ?? $source,
+                'failed',
+                (string) ($updates['failure_reason'] ?? 'Telebot import failed.'),
+            );
+        }
 
         return $status;
     }

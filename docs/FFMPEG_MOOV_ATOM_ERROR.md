@@ -24,7 +24,7 @@ So the **source file** at the path (e.g. `storage/app/public/media/{asset_id}/{s
 
 1. **Check the file on the CDN server**
    - Path from the log, e.g.
-     `/home/naraboxt/domains/cdn.naraboxtv.com/public_html/storage/app/public/media/019ce689-94c4-7086-8a6e-c1a2572a85e8/315/MY_DEAD_FRIEND_ZOE__VJ_TONNY_2025_naraboxtv_com.mp4`
+     `/var/www/html/storage/app/public/media/<asset-id>/<source-id>/movie.mp4`
    - `ls -la` to see size; try playing it or run:
      ```bash
      ffprobe -v error -show_format "/path/to/file.mp4"

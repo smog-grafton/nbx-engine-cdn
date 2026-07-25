@@ -1,8 +1,9 @@
 <?php
 
-use App\Http\Controllers\Api\MediaController;
 use App\Http\Controllers\Api\IngestController;
+use App\Http\Controllers\Api\MediaController;
 use App\Http\Controllers\Api\NbxEngineController;
+use App\Http\Controllers\Api\StorageObjectController;
 use Illuminate\Support\Facades\Route;
 
 Route::prefix('v1')
@@ -16,6 +17,8 @@ Route::prefix('v1')
             ->middleware('throttle:10,1');
         Route::post('/media/telegram-stream-intake', [MediaController::class, 'telegramStreamIntake'])
             ->middleware('throttle:10,1');
+        Route::post('/media/telegram-handoff', [MediaController::class, 'telegramHandoff'])
+            ->middleware('throttle:20,1');
         Route::get('/media/{assetId}', [MediaController::class, 'showAsset'])
             ->whereUuid('assetId');
         Route::get('/media/{assetId}/playback', [MediaController::class, 'playback'])
@@ -39,6 +42,12 @@ Route::prefix('v1')
             ->middleware('throttle:20,1');
         Route::get('/nbx/jobs/{jobId}', [NbxEngineController::class, 'show'])
             ->where('jobId', '[A-Za-z0-9:_\\-]+');
+        Route::post('/nbx/jobs/{jobId}/actions', [NbxEngineController::class, 'action'])
+            ->where('jobId', '[A-Za-z0-9:_\\-]+')
+            ->middleware('throttle:20,1');
+        Route::delete('/nbx/jobs/{jobId}/original', [NbxEngineController::class, 'destroyOriginal'])
+            ->where('jobId', '[A-Za-z0-9:_\\-]+')
+            ->middleware('throttle:20,1');
         Route::get('/nbx/discover', [NbxEngineController::class, 'discover'])
             ->middleware('throttle:60,1');
         Route::get('/nbx/diagnostics/binaries', [NbxEngineController::class, 'diagnostics'])
@@ -53,6 +62,25 @@ Route::prefix('v1')
         Route::post('/nbx/uploads/{session}/cancel', [NbxEngineController::class, 'cancelUpload'])
             ->whereUuid('session')
             ->middleware('throttle:30,1');
+    });
+
+Route::prefix('v1/storage')
+    ->group(function (): void {
+        Route::get('/objects', [StorageObjectController::class, 'index'])
+            ->middleware(['cdn.token:storage.view', 'throttle:60,1']);
+        Route::get('/audits', [StorageObjectController::class, 'audits'])
+            ->middleware(['cdn.token:storage.view', 'throttle:60,1']);
+        Route::post('/references', [StorageObjectController::class, 'register'])
+            ->middleware(['cdn.token:storage.manage.direct', 'throttle:60,1']);
+        Route::delete('/sources/{source}/artifacts/{role}', [StorageObjectController::class, 'destroyArtifact'])
+            ->whereNumber('source')
+            ->whereIn('role', ['original', 'faststart', 'hls', 'asset'])
+            ->middleware(['cdn.token', 'throttle:20,1']);
+        Route::delete('/references/{reference}', [StorageObjectController::class, 'destroyReference'])
+            ->whereNumber('reference')
+            ->middleware(['cdn.token:storage.manage.direct', 'throttle:20,1']);
+        Route::delete('/objects/orphan', [StorageObjectController::class, 'destroyOrphan'])
+            ->middleware(['cdn.token:storage.delete.orphan', 'throttle:20,1']);
     });
 
 Route::post('/ingest/asset-source-upload', [IngestController::class, 'assetSourceUpload'])

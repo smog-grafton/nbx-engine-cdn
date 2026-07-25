@@ -42,6 +42,8 @@ class MediaSource extends Model
         'hls_worker_external_id',
         'hls_worker_quality_status',
         'external_job_id',
+        'idempotency_key',
+        'processing_revision',
         'progress_percent',
         'bytes_downloaded',
         'bytes_total',
@@ -57,6 +59,7 @@ class MediaSource extends Model
         return [
             'file_size_bytes' => 'integer',
             'duration_seconds' => 'integer',
+            'processing_revision' => 'integer',
             'progress_percent' => 'integer',
             'bytes_downloaded' => 'integer',
             'bytes_total' => 'integer',
@@ -78,4 +81,3 @@ class MediaSource extends Model
         return $this->belongsTo(MediaAsset::class, 'media_asset_id');
     }
 }
-

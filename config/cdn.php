@@ -61,6 +61,6 @@ return [
 
     'allowed_video_extensions' => array_values(array_filter(array_map(
         static fn (string $item): string => strtolower(trim($item)),
-        explode(',', (string) env('ALLOWED_VIDEO_EXTENSIONS', 'mp4,mkv,webm,avi,mov,m4v'))
+        explode(',', (string) env('ALLOWED_VIDEO_EXTENSIONS', 'mp4,m4v,mov,mkv,webm,avi,mpeg,mpg,ts,m2ts'))
     ))),
 ];

@@ -2,6 +2,13 @@
 
 The CDN accepts large video uploads (e.g. from the telebot). **PHP** rejects the request **before** Laravel sees it if the body exceeds `post_max_size` or the file exceeds `upload_max_filesize`.
 
+For Telegram imports, the production path should use
+`CDN_HANDOFF_MODE=source_url` and `/api/v1/media/telegram-handoff`.
+Teletyde sends a short-lived download URL as JSON and NBX fetches the file
+itself. This avoids the reverse-proxy/PHP request-body limit that caused the
+413 on the roughly 413 MB file. Keep the limits below for manual/direct
+multipart uploads; they are not a substitute for source-URL handoff.
+
 ## Symptom
 
 - Telebot uploads a ~700 MB (or 2 GB) file to `POST /api/v1/media/telegram-intake`.

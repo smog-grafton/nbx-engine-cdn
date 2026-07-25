@@ -58,6 +58,10 @@ class VideoProbeService
             'container' => isset($format['format_name']) ? (string) $format['format_name'] : null,
             'video_codec' => is_array($video) ? (string) ($video['codec_name'] ?? '') ?: null : null,
             'audio_codec' => is_array($audio) ? (string) ($audio['codec_name'] ?? '') ?: null : null,
+            'pixel_format' => is_array($video) ? (string) ($video['pix_fmt'] ?? '') ?: null : null,
+            'audio_channels' => is_array($audio) && isset($audio['channels']) ? (int) $audio['channels'] : null,
+            'has_video' => $video !== null,
+            'has_audio' => $audio !== null,
             'width' => is_array($video) && isset($video['width']) ? (int) $video['width'] : null,
             'height' => is_array($video) && isset($video['height']) ? (int) $video['height'] : null,
             'duration' => isset($format['duration']) ? (float) $format['duration'] : null,
@@ -76,6 +80,7 @@ class VideoProbeService
 
         if (str_contains($value, '/')) {
             [$numerator, $denominator] = array_map('floatval', explode('/', $value, 2));
+
             return $denominator > 0 ? round($numerator / $denominator, 3) : null;
         }
 

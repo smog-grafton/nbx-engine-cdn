@@ -9,6 +9,7 @@ return [
     'webhook_retry_times' => (int) env('NBX_WEBHOOK_RETRY_TIMES', 3),
     'webhook_retry_sleep_ms' => (int) env('NBX_WEBHOOK_RETRY_SLEEP_MS', 1500),
     'webhook_timeout' => (int) env('NBX_WEBHOOK_TIMEOUT', 20),
+    'portal_storage_callback_url' => (string) env('NBX_PORTAL_STORAGE_CALLBACK_URL', ''),
 
     'default_storage' => (string) env('NBX_DEFAULT_STORAGE', 'contabo'),
     'work_storage' => (string) env('NBX_WORK_STORAGE', env('FILESYSTEM_DISK', 'public')),
@@ -18,7 +19,7 @@ return [
     'local_work_retention_hours' => (int) env('NBX_LOCAL_WORK_RETENTION_HOURS', 24),
 
     'default_faststart' => (bool) env('NBX_DEFAULT_FASTSTART', true),
-    'default_hls_480' => (bool) env('NBX_DEFAULT_HLS_480', true),
+    'default_hls_480' => (bool) env('NBX_DEFAULT_HLS_480', false),
     'default_hls_720' => (bool) env('NBX_DEFAULT_HLS_720', false),
     'default_hls_1080' => (bool) env('NBX_DEFAULT_HLS_1080', false),
 
@@ -26,7 +27,7 @@ return [
     'upload_session_ttl_minutes' => (int) env('NBX_UPLOAD_SESSION_TTL_MINUTES', 60),
     'allowed_upload_extensions' => array_values(array_filter(array_map(
         static fn (string $extension): string => strtolower(trim($extension)),
-        explode(',', (string) env('NBX_ALLOWED_UPLOAD_EXTENSIONS', 'mp4,m4v,mov,mkv,webm,avi,mpeg,mpg,ts'))
+        explode(',', (string) env('NBX_ALLOWED_UPLOAD_EXTENSIONS', 'mp4,m4v,mov,mkv,webm,avi,mpeg,mpg,ts,m2ts'))
     ))),
     'allowed_upload_mimes' => array_values(array_filter(array_map(
         static fn (string $mime): string => strtolower(trim($mime)),
@@ -35,6 +36,10 @@ return [
     'temp_dir' => (string) env('NBX_TEMP_DIR', storage_path('app/nbx/tmp')),
     'work_dir' => (string) env('NBX_WORK_DIR', storage_path('app/nbx/work')),
     'output_dir' => (string) env('NBX_OUTPUT_DIR', storage_path('app/nbx/output')),
+    'multipart_threshold_mb' => (int) env('NBX_MULTIPART_THRESHOLD_MB', 64),
+    'multipart_part_size_mb' => (int) env('NBX_MULTIPART_PART_SIZE_MB', 32),
+    'multipart_concurrency' => (int) env('NBX_MULTIPART_CONCURRENCY', 2),
+    'storage_browser_page_size' => (int) env('NBX_STORAGE_BROWSER_PAGE_SIZE', 50),
 
     'ssrf' => [
         'blocked_hosts' => array_values(array_filter(array_map(

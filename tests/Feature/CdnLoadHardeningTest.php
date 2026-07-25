@@ -199,6 +199,16 @@ SH
         );
         @chmod($fakeFfmpeg, 0755);
         config()->set('cdn.ffmpeg_binary', $fakeFfmpeg);
+        $fakeFfprobe = storage_path('framework/testing/fake-ffprobe.sh');
+        file_put_contents($fakeFfprobe, <<<'SH'
+#!/bin/sh
+cat <<'JSON'
+{"streams":[{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p","width":1280,"height":720},{"codec_type":"audio","codec_name":"aac","channels":2}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"60.0","size":"16"}}
+JSON
+SH
+        );
+        @chmod($fakeFfprobe, 0755);
+        config()->set('cdn.ffprobe_binary', $fakeFfprobe);
 
         $asset = MediaAsset::query()->create([
             'type' => 'movie',
@@ -218,12 +228,12 @@ SH
             'compress_enabled' => false,
         ]);
 
-        Storage::disk('public')->put((string) $source->storage_path, 'm4v-video-bytes');
+        Storage::disk('public')->put((string) $source->storage_path, 'xxxxmoovxxxxmdat');
 
         (new OptimizeMp4FaststartJob($source->id))->handle();
         $source->refresh();
 
-        $this->assertSame('ready', $source->optimize_status);
+        $this->assertSame('ready', $source->optimize_status, (string) $source->optimize_error);
         $this->assertSame('media/'.$asset->id.'/12/original_play.mp4', $source->optimized_path);
         $this->assertTrue((bool) $source->is_faststart);
         $this->assertTrue(Storage::disk('public')->exists((string) $source->optimized_path));
@@ -264,11 +274,13 @@ SH
                             'disk' => 'contabo',
                             'key' => 'videos/nbx/job/original/original.mp4',
                             'url' => 'https://usc1.contabostorage.com/account:nbx/videos/nbx/job/original/original.mp4',
+                            'verified' => true,
                         ],
                         'faststart' => [
                             'disk' => 'contabo',
                             'key' => 'videos/nbx/job/faststart/original_play.mp4',
                             'url' => 'https://usc1.contabostorage.com/account:nbx/videos/nbx/job/faststart/original_play.mp4',
+                            'verified' => true,
                         ],
                     ],
                 ],

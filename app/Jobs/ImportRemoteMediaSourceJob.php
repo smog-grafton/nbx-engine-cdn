@@ -6,7 +6,6 @@ use App\Models\MediaSource;
 use App\Services\MediaSourceService;
 use App\Services\NbxEngineService;
 use App\Services\VideoProbeService;
-use App\Support\MediaUrl;
 use App\Support\SafeRemoteMediaUrl;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
@@ -19,7 +18,7 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 
-class ImportRemoteMediaSourceJob implements ShouldQueue, ShouldBeUnique
+class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
 {
     use Dispatchable;
     use InteractsWithQueue;
@@ -41,13 +40,13 @@ class ImportRemoteMediaSourceJob implements ShouldQueue, ShouldBeUnique
 
     public function uniqueId(): string
     {
-        return 'remote-import:' . $this->sourceId;
+        return 'remote-import:'.$this->sourceId;
     }
 
     public function middleware(): array
     {
         return [
-            (new WithoutOverlapping('remote-import:' . $this->sourceId))
+            (new WithoutOverlapping('remote-import:'.$this->sourceId))
                 ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 14400)))
                 ->dontRelease(),
         ];
@@ -69,6 +68,7 @@ class ImportRemoteMediaSourceJob implements ShouldQueue, ShouldBeUnique
                 'completed_at' => now(),
             ]);
             $mediaSourceService->refreshAssetStatus($source->asset);
+
             return;
         }
 
@@ -84,6 +84,7 @@ class ImportRemoteMediaSourceJob implements ShouldQueue, ShouldBeUnique
             ]);
             app(NbxEngineService::class)->markNbxStatus($source->fresh() ?? $source, 'failed', $urlError->getMessage());
             $mediaSourceService->refreshAssetStatus($source->asset);
+
             return;
         }
         if ($sourceUrl !== '' && $sourceUrl !== (string) $source->source_url) {
@@ -267,14 +268,14 @@ class ImportRemoteMediaSourceJob implements ShouldQueue, ShouldBeUnique
             }
             $preferredExtension = $this->extensionFromMimeType($mimeType);
             $currentExtension = strtolower((string) pathinfo($storagePath, PATHINFO_EXTENSION));
-            $knownVideoExtensions = ['mp4', 'm4v', 'mov', 'mkv', 'webm', 'avi', 'mpeg', 'mpg', 'ts'];
+            $knownVideoExtensions = ['mp4', 'm4v', 'mov', 'mkv', 'webm', 'avi', 'mpeg', 'mpg', 'ts', 'm2ts'];
 
             if (
                 is_string($preferredExtension) &&
                 $preferredExtension !== '' &&
                 ! in_array($currentExtension, $knownVideoExtensions, true)
             ) {
-                $newStoragePath = preg_replace('/\.[A-Za-z0-9]+$/', '', $storagePath) . '.' . $preferredExtension;
+                $newStoragePath = preg_replace('/\.[A-Za-z0-9]+$/', '', $storagePath).'.'.$preferredExtension;
                 if ($newStoragePath !== $storagePath) {
                     Storage::disk($workDisk)->move($storagePath, $newStoragePath);
                     $storagePath = $newStoragePath;
@@ -288,8 +289,13 @@ class ImportRemoteMediaSourceJob implements ShouldQueue, ShouldBeUnique
             if ($probe !== []) {
                 $metadata['probe'] = $probe;
             }
+            $isTelegramHandoff = ($metadata['nbx']['input_type'] ?? null) === 'telegram';
+            unset($metadata['telebot_source_url']);
 
             $source->update([
+                'source_url' => $isTelegramHandoff
+                    ? ($metadata['telegram_url'] ?? $source->source_url)
+                    : $source->source_url,
                 'storage_path' => $storagePath,
                 'mime_type' => $mimeType,
                 'file_size_bytes' => $size > 0 ? $size : null,
@@ -306,8 +312,15 @@ class ImportRemoteMediaSourceJob implements ShouldQueue, ShouldBeUnique
                 'source_metadata' => $metadata,
             ]);
 
-            $source = app(NbxEngineService::class)->publishAvailableArtifacts($source->fresh() ?? $source, ['original']);
-            app(NbxEngineService::class)->markNbxStatus($source->fresh() ?? $source, 'faststarting');
+            $nbx = app(NbxEngineService::class);
+            $source = $source->fresh() ?? $source;
+            if ($nbx->shouldRetainOriginal($source)) {
+                $source = $nbx->publishAvailableArtifacts($source, ['original']);
+                if ($source->status !== 'ready') {
+                    return;
+                }
+            }
+            $nbx->markNbxStatus($source->fresh() ?? $source, 'faststarting');
             $mediaSourceService->queuePlaybackProcessing($source->fresh());
         } catch (\Throwable $throwable) {
             Log::error('CDN remote import failed', [
@@ -374,7 +387,8 @@ class ImportRemoteMediaSourceJob implements ShouldQueue, ShouldBeUnique
 
         if (is_string($pathCandidate) && $pathCandidate !== '') {
             $base = pathinfo($pathCandidate, PATHINFO_FILENAME) ?: sprintf('source-%d', $sourceId);
-            return $this->applyBrandingToFilename($base . '.' . $fallbackExtension);
+
+            return $this->applyBrandingToFilename($base.'.'.$fallbackExtension);
         }
 
         return $fallbackName;
@@ -407,8 +421,8 @@ class ImportRemoteMediaSourceJob implements ShouldQueue, ShouldBeUnique
         }
 
         return $extension !== ''
-            ? ($normalizedBase . '_' . $suffix . '.' . $extension)
-            : ($normalizedBase . '_' . $suffix);
+            ? ($normalizedBase.'_'.$suffix.'.'.$extension)
+            : ($normalizedBase.'_'.$suffix);
     }
 
     private function extensionFromMimeType(?string $mimeType): ?string
@@ -542,6 +556,7 @@ class ImportRemoteMediaSourceJob implements ShouldQueue, ShouldBeUnique
 
         try {
             $this->requestPythonWorkerFallback($source, $filename, $contentType, $contentLength);
+
             return;
         } catch (\Throwable $workerThrowable) {
             $workerAttempted = true;
@@ -555,11 +570,12 @@ class ImportRemoteMediaSourceJob implements ShouldQueue, ShouldBeUnique
 
         try {
             $this->requestPortalProxy($source, $filename, $contentType, $contentLength);
+
             return;
         } catch (\Throwable $portalThrowable) {
             $combined = $portalThrowable->getMessage();
             if ($workerAttempted && is_string($workerError) && $workerError !== '') {
-                $combined .= ' | python_worker_error=' . $workerError;
+                $combined .= ' | python_worker_error='.$workerError;
             }
             throw new \RuntimeException($combined, 0, $triggerError);
         }
@@ -591,7 +607,7 @@ class ImportRemoteMediaSourceJob implements ShouldQueue, ShouldBeUnique
         if (! $response->successful()) {
             $body = $response->json();
             $error = is_array($body) ? ($body['error'] ?? null) : null;
-            throw new \RuntimeException((string) ($error ?: ('Python worker request failed with status ' . $response->status())));
+            throw new \RuntimeException((string) ($error ?: ('Python worker request failed with status '.$response->status())));
         }
     }
 
@@ -620,7 +636,7 @@ class ImportRemoteMediaSourceJob implements ShouldQueue, ShouldBeUnique
         if (! $response->successful()) {
             $body = $response->json();
             $error = is_array($body) ? ($body['error'] ?? null) : null;
-            throw new \RuntimeException((string) ($error ?: ('Portal proxy request failed with status ' . $response->status())));
+            throw new \RuntimeException((string) ($error ?: ('Portal proxy request failed with status '.$response->status())));
         }
     }
 

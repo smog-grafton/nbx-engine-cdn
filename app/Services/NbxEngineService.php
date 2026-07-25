@@ -15,6 +15,11 @@ class NbxEngineService
     public function createRemoteJob(array $data, MediaSourceService $mediaSourceService): MediaSource
     {
         $sourceUrl = SafeRemoteMediaUrl::assertAllowed((string) ($data['source_url'] ?? ''));
+        if ($existing = $this->findByIdempotencyKey($data['idempotency_key'] ?? null)) {
+            return $existing;
+        }
+
+        $inputType = ($data['input_type'] ?? null) === 'object_storage' ? 'object_storage' : 'remote_fetch';
         $asset = MediaAsset::create([
             'type' => (string) ($data['asset_type'] ?? 'generic'),
             'title' => (string) ($data['title'] ?? basename((string) parse_url($sourceUrl, PHP_URL_PATH)) ?: 'NBX Media'),
@@ -30,7 +35,9 @@ class NbxEngineService
             'status' => 'pending',
             'is_active' => true,
             'compress_enabled' => (bool) ($data['compress_enabled'] ?? false),
-            'source_metadata' => $this->initialMetadata($data, 'remote_fetch'),
+            'idempotency_key' => $this->normalizedIdempotencyKey($data['idempotency_key'] ?? null),
+            'processing_revision' => max(1, (int) ($data['processing_revision'] ?? 1)),
+            'source_metadata' => $this->initialMetadata($data, $inputType),
         ]);
 
         $importMode = in_array(($data['import_mode'] ?? 'queue'), ['now', 'queue'], true)
@@ -49,8 +56,60 @@ class NbxEngineService
         return $source;
     }
 
+    public function createTelegramJob(array $data): MediaSource
+    {
+        $telegramUrl = trim((string) ($data['telegram_url'] ?? $data['source_url'] ?? ''));
+        if (! preg_match('~^https://t\.me/~i', $telegramUrl)) {
+            throw new \RuntimeException('A valid https://t.me/ Telegram message URL is required.');
+        }
+        if ($existing = $this->findByIdempotencyKey($data['idempotency_key'] ?? null)) {
+            return $existing;
+        }
+
+        $asset = MediaAsset::create([
+            'type' => (string) ($data['asset_type'] ?? 'generic'),
+            'title' => (string) ($data['title'] ?? 'Telegram media'),
+            'description' => $data['description'] ?? null,
+            'status' => 'importing',
+            'visibility' => (string) ($data['visibility'] ?? 'public'),
+        ]);
+        $metadata = $this->initialMetadata($data, 'telegram');
+        $metadata['source'] = 'telegram';
+        $metadata['telegram_url'] = $telegramUrl;
+        $metadata['handoff_mode'] = 'source_url';
+        $metadata['telebot_status'] = 'waiting_for_capacity';
+        $metadata['telebot_message'] = 'Waiting to dispatch to Teletyde.';
+
+        $source = MediaSource::create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'remote_fetch',
+            'source_url' => $telegramUrl,
+            'storage_disk' => (string) config('nbx.work_storage', config('cdn.disk', 'public')),
+            'status' => 'pending',
+            'external_job_id' => (string) Str::uuid(),
+            'idempotency_key' => $this->normalizedIdempotencyKey($data['idempotency_key'] ?? null),
+            'processing_revision' => max(1, (int) ($data['processing_revision'] ?? 1)),
+            'compress_enabled' => (bool) ($data['compress_enabled'] ?? false),
+            'is_active' => true,
+            'source_metadata' => $metadata,
+        ]);
+
+        $dispatched = app(TelegramImportDispatchService::class)->dispatch($source);
+        $source = $this->markNbxStatus(
+            $source->fresh() ?? $source,
+            $dispatched ? 'telegram_fetching' : 'waiting_for_capacity',
+        );
+        app(NbxWebhookDispatcher::class)->dispatch($source, 'job.created');
+
+        return $source;
+    }
+
     public function createUploadJob(array $data, UploadedFile $file, MediaSourceService $mediaSourceService): MediaSource
     {
+        if ($existing = $this->findByIdempotencyKey($data['idempotency_key'] ?? null)) {
+            return $existing;
+        }
+
         $asset = MediaAsset::create([
             'type' => (string) ($data['asset_type'] ?? 'generic'),
             'title' => (string) ($data['title'] ?? pathinfo($file->getClientOriginalName(), PATHINFO_FILENAME)),
@@ -66,6 +125,8 @@ class NbxEngineService
             'status' => 'uploading',
             'progress_percent' => 0,
             'external_job_id' => (string) Str::uuid(),
+            'idempotency_key' => $this->normalizedIdempotencyKey($data['idempotency_key'] ?? null),
+            'processing_revision' => max(1, (int) ($data['processing_revision'] ?? 1)),
             'compress_enabled' => (bool) ($data['compress_enabled'] ?? false),
             'is_active' => true,
             'source_metadata' => $this->initialMetadata($data, 'upload'),
@@ -96,11 +157,201 @@ class NbxEngineService
             fclose($stream);
         }
 
-        $source = $this->publishAvailableArtifacts($source->fresh() ?? $source, ['original']);
+        if ($this->shouldRetainOriginal($source)) {
+            $source = $this->publishAvailableArtifacts($source->fresh() ?? $source, ['original']);
+        }
         $source = $this->markNbxStatus($source->fresh(), 'uploading');
         app(NbxWebhookDispatcher::class)->dispatch($source, 'job.created');
 
         return $source;
+    }
+
+    public function performAction(
+        MediaSource $source,
+        string $operation,
+        array $options,
+        MediaSourceService $mediaSourceService
+    ): MediaSource {
+        $metadata = (array) ($source->source_metadata ?? []);
+        $nbx = (array) ($metadata['nbx'] ?? []);
+        $actionKey = $this->normalizedIdempotencyKey($options['idempotency_key'] ?? null)
+            ?: hash('sha256', $source->id.'|'.$operation.'|'.$source->processing_revision);
+        $actions = (array) ($nbx['actions'] ?? []);
+
+        if (isset($actions[$actionKey]) && ($actions[$actionKey]['status'] ?? null) !== 'failed') {
+            return $source->fresh() ?? $source;
+        }
+        $wasFinalStorageFailure = str_contains(strtolower((string) $source->failure_reason), 'final storage');
+
+        $requested = (array) ($nbx['requested'] ?? []);
+        foreach ([
+            'faststart', 'allow_downloads', 'allow_hls_streaming', 'max_resolution',
+            'processing_preset', 'crf', 'encoder_preset', 'audio_bitrate',
+        ] as $key) {
+            if (array_key_exists($key, $options)) {
+                $requested[$key] = $options[$key];
+            }
+        }
+        if (array_key_exists('compress_enabled', $options)) {
+            $requested['compression'] = (bool) $options['compress_enabled'];
+            $source->compress_enabled = (bool) $options['compress_enabled'];
+        }
+        if (isset($options['retention_policy'])) {
+            $requested['retention_policy'] = (string) $options['retention_policy'];
+        }
+        if (isset($options['hls']) && is_array($options['hls'])) {
+            $requested['hls'] = array_merge((array) ($requested['hls'] ?? []), $options['hls']);
+        }
+
+        $actions[$actionKey] = [
+            'operation' => $operation,
+            'status' => 'accepted',
+            'requested_at' => now()->toIso8601String(),
+            'processing_revision' => $source->processing_revision,
+        ];
+        $nbx['requested'] = $requested;
+        $nbx['actions'] = $actions;
+        $nbx['operation'] = $operation;
+        $metadata['nbx'] = $nbx;
+
+        $updates = [
+            'source_metadata' => $metadata,
+            'failure_reason' => null,
+            'last_error' => null,
+            'optimize_error' => null,
+            'is_active' => true,
+        ];
+        if (in_array($operation, ['reprocess', 'retry'], true)) {
+            $updates['processing_revision'] = $source->processing_revision + 1;
+        }
+        $source->fill($updates)->save();
+        $source = $source->fresh() ?? $source;
+
+        $sourceMetadata = (array) ($source->source_metadata ?? []);
+        $hasLocalOptimized = $source->optimized_path
+            && $this->safeExists(
+                (string) ($source->storage_disk ?: config('nbx.work_storage', config('cdn.disk', 'public'))),
+                (string) $source->optimized_path,
+            );
+
+        try {
+            if ($operation === 'retry' && $hasLocalOptimized && $wasFinalStorageFailure) {
+                $source->update(['status' => 'ready', 'optimize_status' => 'ready']);
+                $source = $this->finalizeStorageIfNeeded($source->fresh() ?? $source);
+            } elseif ($operation === 'retry' && ($sourceMetadata['nbx']['input_type'] ?? null) === 'telegram') {
+                $telegramUrl = (string) ($sourceMetadata['telegram_url'] ?? '');
+                if ($telegramUrl === '') {
+                    throw new \RuntimeException('Telegram retry is unavailable because the original Telegram URL is missing.');
+                }
+                $source->update([
+                    'source_type' => 'remote_fetch',
+                    'source_url' => $telegramUrl,
+                    'status' => 'pending',
+                    'optimize_status' => null,
+                ]);
+                $dispatched = app(TelegramImportDispatchService::class)->dispatch($source->fresh() ?? $source);
+                $source = $this->markNbxStatus(
+                    $source->fresh() ?? $source,
+                    $dispatched ? 'telegram_fetching' : 'waiting_for_capacity',
+                );
+            } elseif ($operation === 'retry' && in_array($source->source_type, ['remote_fetch', 'object_storage'], true)) {
+                $source->update(['status' => 'pending', 'optimize_status' => null]);
+                $mediaSourceService->queueRemoteImport($source->fresh() ?? $source, true);
+            } elseif (in_array($operation, ['retry', 'reprocess', 'generate_faststart', 'compress'], true)) {
+                $source->update(['status' => 'ready', 'optimize_status' => null]);
+                if (! $mediaSourceService->queuePlaybackProcessing($source->fresh() ?? $source)) {
+                    throw new \RuntimeException('NBX could not queue playback processing because no verified work input is available.');
+                }
+            } elseif ($operation === 'generate_hls') {
+                $source->update(['status' => 'ready']);
+                $mediaSourceService->retryWorkerHlsOnly($source->fresh() ?? $source);
+            } else {
+                throw new \InvalidArgumentException('Unsupported NBX operation.');
+            }
+        } catch (\Throwable $exception) {
+            $source = $source->fresh() ?? $source;
+            $failureMetadata = (array) ($source->source_metadata ?? []);
+            $failureActions = (array) ($failureMetadata['nbx']['actions'] ?? []);
+            $failureActions[$actionKey] = array_merge((array) ($failureActions[$actionKey] ?? []), [
+                'status' => 'failed',
+                'failed_at' => now()->toIso8601String(),
+                'error' => $exception->getMessage(),
+            ]);
+            $failureMetadata['nbx']['actions'] = $failureActions;
+            $source->update(['source_metadata' => $failureMetadata]);
+
+            throw $exception;
+        }
+
+        app(NbxWebhookDispatcher::class)->dispatch($source->fresh() ?? $source, 'job.action_accepted', [
+            'operation' => $operation,
+            'idempotency_key' => $actionKey,
+        ]);
+
+        return $this->refreshOutputMetadata($source->fresh() ?? $source);
+    }
+
+    public function deleteOriginal(MediaSource $source, ?string $idempotencyKey = null): MediaSource
+    {
+        $source = $source->fresh() ?? $source;
+        $metadata = (array) ($source->source_metadata ?? []);
+        $nbx = (array) ($metadata['nbx'] ?? []);
+        $artifacts = (array) ($nbx['final_artifacts'] ?? []);
+        $faststart = is_array($artifacts['faststart'] ?? null) ? $artifacts['faststart'] : [];
+        $original = is_array($artifacts['original'] ?? null) ? $artifacts['original'] : [];
+        $actionKey = $this->normalizedIdempotencyKey($idempotencyKey)
+            ?: hash('sha256', $source->id.'|delete_original|'.$source->processing_revision);
+        $actions = (array) ($nbx['actions'] ?? []);
+
+        if (isset($actions[$actionKey]) || $original === []) {
+            return $this->refreshOutputMetadata($source);
+        }
+        if (! ($faststart['verified'] ?? false) || empty($faststart['disk']) || empty($faststart['key'])) {
+            throw new \RuntimeException('Original deletion refused: a verified optimized MP4 is not available.');
+        }
+        if (! app(VerifiedObjectStorageService::class)->verify(
+            (string) $faststart['disk'],
+            (string) $faststart['key'],
+            (int) ($faststart['bytes'] ?? 0),
+        )) {
+            throw new \RuntimeException('Original deletion refused: optimized MP4 storage verification failed.');
+        }
+
+        $originalDisk = (string) ($original['disk'] ?? '');
+        $originalKey = (string) ($original['key'] ?? '');
+        if ($originalDisk === '' || $originalKey === '') {
+            throw new \RuntimeException('Original deletion refused: original object metadata is incomplete.');
+        }
+        if ($originalDisk === (string) $faststart['disk'] && $originalKey === (string) $faststart['key']) {
+            throw new \RuntimeException('Original deletion refused: original and optimized object keys are identical.');
+        }
+
+        Storage::disk($originalDisk)->delete($originalKey);
+        if ($this->safeExists($originalDisk, $originalKey)) {
+            throw new \RuntimeException('Original deletion could not be verified.');
+        }
+
+        unset($artifacts['original']);
+        $actions[$actionKey] = [
+            'operation' => 'delete_original',
+            'status' => 'completed',
+            'completed_at' => now()->toIso8601String(),
+            'deleted_disk' => $originalDisk,
+            'deleted_key' => $originalKey,
+            'replacement_key' => $faststart['key'],
+        ];
+        $nbx['final_artifacts'] = $artifacts;
+        $nbx['actions'] = $actions;
+        $nbx['original_deleted_at'] = now()->toIso8601String();
+        $nbx['requested']['retention_policy'] = 'optimized_only';
+        $metadata['nbx'] = $nbx;
+        $source->update(['source_metadata' => $metadata]);
+
+        app(NbxWebhookDispatcher::class)->dispatch($source->fresh() ?? $source, 'job.original_deleted', [
+            'replacement_key' => $faststart['key'],
+        ]);
+
+        return $this->refreshOutputMetadata($source->fresh() ?? $source);
     }
 
     public function markNbxStatus(?MediaSource $source, string $status, ?string $message = null): MediaSource
@@ -134,6 +385,9 @@ class NbxEngineService
     public function finalizeStorageIfNeeded(MediaSource $source): MediaSource
     {
         $metadata = (array) ($source->source_metadata ?? []);
+        if (($metadata['provider'] ?? null) !== 'nbx_engine' && ! isset($metadata['nbx'])) {
+            return $source;
+        }
         $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
         $target = (string) ($nbx['storage_target'] ?? config('nbx.default_storage', 'contabo'));
         $targetDisk = $target === 'contabo' ? 'contabo' : ($target === 'local' ? 'public' : $target);
@@ -151,7 +405,20 @@ class NbxEngineService
             return $this->refreshOutputMetadata($source);
         }
 
-        $source = $this->publishAvailableArtifacts($source, ['original', 'faststart', 'hls']);
+        $roles = ['faststart', 'hls'];
+        if ($this->shouldRetainOriginal($source)) {
+            array_unshift($roles, 'original');
+        }
+        $source = $this->publishAvailableArtifacts($source, $roles);
+
+        if ($source->status !== 'ready') {
+            return $source;
+        }
+        $publishedMetadata = (array) ($source->source_metadata ?? []);
+        if (($publishedMetadata['nbx']['status'] ?? null) === 'partially_completed'
+            && ! empty($publishedMetadata['nbx']['finalization_error'])) {
+            return $this->refreshOutputMetadata($source);
+        }
 
         if (! (bool) config('nbx.keep_local_work_files', false)) {
             $this->cleanupLocalWorkFiles($source, $currentDisk);
@@ -161,7 +428,7 @@ class NbxEngineService
     }
 
     /**
-     * @param array<int, string> $roles
+     * @param  array<int, string>  $roles
      */
     public function publishAvailableArtifacts(MediaSource $source, array $roles = ['original', 'faststart', 'hls']): MediaSource
     {
@@ -186,7 +453,7 @@ class NbxEngineService
         $qualities = is_array($source->qualities_json) ? $source->qualities_json : [];
 
         try {
-            if (in_array('original', $roles, true)) {
+            if (in_array('original', $roles, true) && $this->shouldRetainOriginal($source)) {
                 $originalPath = $this->firstExistingPath($currentDisk, [
                     $source->original_storage_path,
                     $source->storage_path,
@@ -213,7 +480,7 @@ class NbxEngineService
                 $hlsFiles = $this->hlsDirectoryFiles($source, $currentDisk);
                 foreach ($hlsFiles as $path) {
                     $relative = ltrim(substr($path, strlen($hlsBase)), '/');
-                    $artifact = $this->copyFinalArtifact($currentDisk, $path, 'contabo', $this->finalObjectKey($source, 'hls/' . $relative, $path), str_ends_with($path, '.m3u8') ? 'hls' : 'hls_segment');
+                    $artifact = $this->copyFinalArtifact($currentDisk, $path, 'contabo', $this->finalObjectKey($source, 'hls/'.$relative, $path), str_ends_with($path, '.m3u8') ? 'hls' : 'hls_segment');
 
                     if ($path === $source->hls_master_path) {
                         $artifacts['hls_master'] = $artifact;
@@ -241,9 +508,13 @@ class NbxEngineService
                 'error' => $exception->getMessage(),
             ]);
 
+            $nbx['final_artifacts'] = $artifacts;
+            $metadata['nbx'] = $nbx;
+
             return $this->failFinalization($source, $exception->getMessage(), $metadata, $nbx, $target, $currentDisk);
         }
 
+        unset($nbx['finalization_error'], $nbx['failed_at']);
         $nbx = array_merge($nbx, [
             'storage_target' => $target,
             'work_storage_disk' => $currentDisk,
@@ -254,15 +525,26 @@ class NbxEngineService
         $metadata['nbx'] = $nbx;
         $metadata['provider'] = 'nbx_engine';
 
-        $source->update(['source_metadata' => $metadata]);
+        $source->update([
+            'failure_reason' => null,
+            'last_error' => null,
+            'optimize_error' => null,
+            'is_active' => true,
+            'source_metadata' => $metadata,
+        ]);
 
         return $source->fresh() ?? $source;
     }
 
     private function failFinalization(MediaSource $source, string $message, array $metadata, array $nbx, string $target, string $currentDisk): MediaSource
     {
+        $faststart = (array) ($nbx['final_artifacts']['faststart'] ?? []);
+        $hasVerifiedProgressive = (bool) ($faststart['verified'] ?? false)
+            && ! empty($faststart['url'])
+            && ! empty($faststart['bytes']);
+        $status = $hasVerifiedProgressive ? 'partially_completed' : 'failed';
         $metadata['nbx'] = array_merge($nbx, [
-            'status' => 'failed',
+            'status' => $status,
             'storage_target' => $target,
             'work_storage_disk' => $currentDisk,
             'finalization_error' => $message,
@@ -270,13 +552,17 @@ class NbxEngineService
         ]);
 
         $source->update([
+            'status' => $hasVerifiedProgressive ? 'ready' : 'failed',
+            'failure_reason' => ($hasVerifiedProgressive ? 'Final storage upload partially failed: ' : 'Final storage upload failed: ').$message,
+            'last_error' => $message,
+            'is_active' => $hasVerifiedProgressive,
             'optimize_status' => 'failed',
-            'optimize_error' => 'Final storage upload failed: ' . $message,
+            'optimize_error' => 'Final storage upload failed: '.$message,
             'source_metadata' => $metadata,
         ]);
 
         $fresh = $source->fresh() ?? $source;
-        app(NbxWebhookDispatcher::class)->dispatch($fresh, 'job.failed', [
+        app(NbxWebhookDispatcher::class)->dispatch($fresh, $hasVerifiedProgressive ? 'job.partially_completed' : 'job.failed', [
             'stage' => 'final_storage',
             'message' => $message,
         ]);
@@ -292,7 +578,9 @@ class NbxEngineService
         $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
         $probe = is_array($metadata['probe'] ?? null) ? $metadata['probe'] : [];
         $hlsUrl = $playback['hls_master_url'] ?? null;
-        $mp4Url = $playback['mp4_play_url'] ?? $playback['download_url'] ?? $mediaSourceService->buildPublicUrl($source);
+        $mp4Url = $playback['mp4_play_url'] ?? $playback['download_url'] ?? null;
+        $artifacts = is_array($nbx['final_artifacts'] ?? null) ? $nbx['final_artifacts'] : [];
+        $originalArtifact = is_array($artifacts['original'] ?? null) ? $artifacts['original'] : [];
 
         $metadata['provider'] = 'nbx_engine';
         $metadata['nbx'] = array_merge($nbx, [
@@ -301,7 +589,7 @@ class NbxEngineService
                 : ($hlsUrl ? 'completed' : ($mp4Url ? 'partially_completed' : ($nbx['status'] ?? 'pending'))),
             'job_id' => $source->external_job_id,
             'outputs' => [
-                'original_url' => $mediaSourceService->buildPublicUrl($source),
+                'original_url' => $originalArtifact['url'] ?? null,
                 'faststart_mp4_url' => $playback['mp4_play_url'] ?? null,
                 'download_mp4_url' => $this->mp4OnlyUrl($playback['download_url'] ?? null),
                 'hls_master_url' => $playback['hls_master_url'] ?? null,
@@ -348,7 +636,7 @@ class NbxEngineService
             'storage_disk' => $source->storage_disk,
             'storage_target' => $nbx['storage_target'] ?? null,
             'default_storage' => (string) config('nbx.default_storage', 'contabo'),
-            'original_url' => $mediaSourceService->buildPublicUrl($source),
+            'original_url' => $this->artifactUrl($nbx, 'original'),
             'faststart_mp4_url' => $playback['mp4_play_url'] ?? null,
             'download_mp4_url' => $this->mp4OnlyUrl($playback['download_url'] ?? null),
             'hls_master_url' => $playback['hls_master_url'] ?? null,
@@ -357,6 +645,9 @@ class NbxEngineService
             'hls_1080p_url' => $qualityUrl('1080p'),
             'qualities' => $qualities,
             'sources' => $this->sourceList($source, $nbx, $playback),
+            'outputs' => $this->structuredOutputs($source, $nbx),
+            'original_retained' => $this->artifactUrl($nbx, 'original') !== null,
+            'processing_revision' => $source->processing_revision,
             'unavailable' => $this->unavailableOutputs($nbx, $playback),
             'local_work_path' => $source->storage_disk === 'contabo' ? null : $source->storage_path,
             'local_public_url' => ($nbx['storage_target'] ?? null) === 'local' ? $mediaSourceService->buildPublicUrl($source) : null,
@@ -418,12 +709,20 @@ class NbxEngineService
             'faststart' => (bool) ($data['faststart'] ?? config('nbx.default_faststart', true)),
             'compression' => (bool) ($data['compress_enabled'] ?? false),
             'hls' => [
-                '480p' => (bool) ($data['hls_480p'] ?? config('nbx.default_hls_480', true)),
+                '480p' => (bool) ($data['hls_480p'] ?? config('nbx.default_hls_480', false)),
                 '720p' => (bool) ($data['hls_720p'] ?? config('nbx.default_hls_720', false)),
                 '1080p' => (bool) ($data['hls_1080p'] ?? config('nbx.default_hls_1080', false)),
             ],
             'allow_downloads' => (bool) ($data['allow_downloads'] ?? true),
             'allow_hls_streaming' => (bool) ($data['allow_hls_streaming'] ?? true),
+            'retention_policy' => (string) ($data['retention_policy'] ?? 'optimized_only'),
+            'keep_original' => (bool) ($data['keep_original'] ?? false),
+            'delete_original_after_optimization' => (bool) ($data['delete_original_after_optimization'] ?? true),
+            'max_resolution' => isset($data['max_resolution']) ? (int) $data['max_resolution'] : null,
+            'processing_preset' => (string) ($data['processing_preset'] ?? 'automatic'),
+            'crf' => isset($data['crf']) ? (int) $data['crf'] : null,
+            'encoder_preset' => $data['encoder_preset'] ?? null,
+            'audio_bitrate' => $data['audio_bitrate'] ?? null,
         ];
 
         if (! (bool) config('nbx.allow_1080p', false)) {
@@ -437,6 +736,7 @@ class NbxEngineService
 
         return [
             'provider' => 'nbx_engine',
+            'source_url' => $data['source_url'] ?? null,
             'video_ref_type' => $data['video_ref_type'] ?? null,
             'video_ref_id' => isset($data['video_ref_id']) ? (string) $data['video_ref_id'] : null,
             'callback_url' => $data['callback_url'] ?? null,
@@ -449,6 +749,9 @@ class NbxEngineService
                 'storage_target' => $storageTarget,
                 'callback_url' => $data['callback_url'] ?? null,
                 'requested' => $requested,
+                'processing_revision' => max(1, (int) ($data['processing_revision'] ?? 1)),
+                'operation' => (string) ($data['operation'] ?? 'ingest'),
+                'idempotency_key' => $this->normalizedIdempotencyKey($data['idempotency_key'] ?? null),
                 'submitted_at' => now()->toIso8601String(),
             ],
         ];
@@ -502,20 +805,8 @@ class NbxEngineService
 
     private function copyFinalArtifact(string $sourceDisk, string $sourcePath, string $targetDisk, string $targetPath, string $role): array
     {
-        $stream = Storage::disk($sourceDisk)->readStream($sourcePath);
-        if (! is_resource($stream)) {
-            throw new \RuntimeException("Could not open {$sourcePath} from {$sourceDisk} before final storage upload.");
-        }
-
-        try {
-            $stored = Storage::disk($targetDisk)->put($targetPath, $stream, ['visibility' => 'public']);
-        } finally {
-            fclose($stream);
-        }
-
-        if (! $stored || ! Storage::disk($targetDisk)->exists($targetPath)) {
-            throw new \RuntimeException("Could not store {$targetPath} on {$targetDisk}.");
-        }
+        $verified = app(VerifiedObjectStorageService::class)
+            ->copy($sourceDisk, $sourcePath, $targetDisk, $targetPath);
 
         return [
             'role' => $role,
@@ -523,6 +814,12 @@ class NbxEngineService
             'key' => $targetPath,
             'source_path' => $sourcePath,
             'url' => Storage::disk($targetDisk)->url($targetPath),
+            'bytes' => $verified['bytes'],
+            'mime_type' => $verified['content_type'],
+            'etag' => $verified['etag'],
+            'multipart' => $verified['multipart'],
+            'verified' => true,
+            'verified_at' => now()->toIso8601String(),
             'published_at' => now()->toIso8601String(),
         ];
     }
@@ -530,15 +827,15 @@ class NbxEngineService
     private function finalObjectKey(MediaSource $source, string $role, string $sourcePath): string
     {
         $prefix = trim((string) config('services.contabo_object_storage.path_prefix', 'videos'), '/');
-        $job = $source->external_job_id ?: ('source-' . $source->id);
-        $safeJob = Str::slug($job) ?: ('source-' . $source->id);
+        $job = $source->external_job_id ?: ('source-'.$source->id);
+        $safeJob = Str::slug($job) ?: ('source-'.$source->id);
         $filename = basename($sourcePath);
 
         if (str_starts_with($role, 'hls/')) {
-            return trim($prefix . '/nbx/' . $safeJob . '/' . $role, '/');
+            return trim($prefix.'/nbx/'.$safeJob.'/'.$role, '/');
         }
 
-        return trim($prefix . '/nbx/' . $safeJob . '/' . trim($role, '/') . '/' . $filename, '/');
+        return trim($prefix.'/nbx/'.$safeJob.'/'.trim($role, '/').'/'.$filename, '/');
     }
 
     private function cleanupLocalWorkFiles(MediaSource $source, string $disk): void
@@ -570,19 +867,29 @@ class NbxEngineService
 
         foreach (['original' => 'source', 'faststart' => '480p', 'hls_master' => 'auto'] as $role => $quality) {
             $artifact = is_array($artifacts[$role] ?? null) ? $artifacts[$role] : [];
-            if (! is_string($artifact['url'] ?? null) || $artifact['url'] === '') {
+            if (! is_string($artifact['url'] ?? null) || $artifact['url'] === '' || ! ($artifact['verified'] ?? false)) {
                 continue;
             }
 
             $isHls = $role === 'hls_master';
             $sources[] = [
                 'type' => $isHls ? 'hls' : 'mp4',
-                'role' => $role === 'hls_master' ? 'hls' : $role,
+                'role' => match ($role) {
+                    'original' => 'source_original',
+                    'faststart' => 'playback_progressive',
+                    default => 'hls_master',
+                },
                 'quality' => $quality,
                 'disk' => $artifact['disk'] ?? 'contabo',
                 'key' => $artifact['key'] ?? null,
                 'url' => $artifact['url'],
-                'is_downloadable' => ! $isHls,
+                'container' => $isHls ? 'hls' : 'mp4',
+                'mime_type' => $artifact['mime_type'] ?? ($isHls ? 'application/vnd.apple.mpegurl' : 'video/mp4'),
+                'bytes' => $artifact['bytes'] ?? null,
+                'verified' => (bool) ($artifact['verified'] ?? false),
+                'fast_start' => $role === 'faststart',
+                'is_downloadable' => $role === 'faststart'
+                    && (bool) ($nbx['requested']['allow_downloads'] ?? true),
                 'is_streamable' => true,
             ];
         }
@@ -682,5 +989,78 @@ class NbxEngineService
 
             return false;
         }
+    }
+
+    public function shouldRetainOriginal(MediaSource $source): bool
+    {
+        $metadata = (array) ($source->source_metadata ?? []);
+        $requested = (array) ($metadata['nbx']['requested'] ?? []);
+        $policy = (string) ($requested['retention_policy'] ?? '');
+
+        if ($policy !== '') {
+            return in_array($policy, ['keep_original', 'retain_original'], true);
+        }
+
+        return (bool) ($requested['keep_original'] ?? false);
+    }
+
+    private function findByIdempotencyKey(mixed $key): ?MediaSource
+    {
+        $key = $this->normalizedIdempotencyKey($key);
+
+        return $key ? MediaSource::with('asset')->where('idempotency_key', $key)->first() : null;
+    }
+
+    private function normalizedIdempotencyKey(mixed $key): ?string
+    {
+        if (! is_string($key) || trim($key) === '') {
+            return null;
+        }
+
+        return substr(trim($key), 0, 128);
+    }
+
+    private function artifactUrl(array $nbx, string $role): ?string
+    {
+        $artifact = $nbx['final_artifacts'][$role] ?? null;
+
+        return is_array($artifact) && is_string($artifact['url'] ?? null) && ($artifact['verified'] ?? false)
+            ? $artifact['url']
+            : null;
+    }
+
+    private function structuredOutputs(MediaSource $source, array $nbx): array
+    {
+        $outputs = [];
+        $roles = [
+            'original' => 'source_original',
+            'faststart' => 'playback_progressive',
+            'hls_master' => 'hls_master',
+        ];
+
+        foreach ($roles as $key => $role) {
+            $artifact = $nbx['final_artifacts'][$key] ?? null;
+            if (! is_array($artifact) || ! is_string($artifact['url'] ?? null)) {
+                continue;
+            }
+
+            $isHls = $key === 'hls_master';
+            $outputs[] = [
+                'role' => $role,
+                'container' => $isHls ? 'hls' : 'mp4',
+                'mime_type' => $artifact['mime_type'] ?? ($isHls ? 'application/vnd.apple.mpegurl' : 'video/mp4'),
+                'url' => $artifact['url'],
+                'object_key' => $artifact['key'] ?? null,
+                'storage_disk' => $artifact['disk'] ?? null,
+                'bytes' => $artifact['bytes'] ?? null,
+                'fast_start' => $key === 'faststart',
+                'downloadable' => $key === 'faststart'
+                    && (bool) ($nbx['requested']['allow_downloads'] ?? true),
+                'verified' => (bool) ($artifact['verified'] ?? false),
+                'created_by_job' => $source->external_job_id,
+            ];
+        }
+
+        return $outputs;
     }
 }

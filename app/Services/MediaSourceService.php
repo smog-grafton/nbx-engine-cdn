@@ -3,16 +3,15 @@
 namespace App\Services;
 
 use App\Jobs\ImportRemoteMediaSourceJob;
-use App\Jobs\GenerateHlsVariantsJob;
 use App\Jobs\OptimizeMp4FaststartJob;
 use App\Models\MediaAsset;
 use App\Models\MediaSource;
 use App\Support\MediaUrl;
+use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 
@@ -36,12 +35,18 @@ class MediaSourceService
         $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
         $artifacts = is_array($nbx['final_artifacts'] ?? null) ? $nbx['final_artifacts'] : [];
         $originalArtifact = is_array($artifacts['original'] ?? null) ? $artifacts['original'] : [];
+        $faststartArtifact = is_array($artifacts['faststart'] ?? null) ? $artifacts['faststart'] : [];
 
         $candidates = [
             [
                 'disk' => $source->original_storage_path ? $disk : null,
                 'key' => $source->original_storage_path,
                 'label' => 'original_storage_path',
+            ],
+            [
+                'disk' => ($faststartArtifact['verified'] ?? false) ? ($faststartArtifact['disk'] ?? null) : null,
+                'key' => ($faststartArtifact['verified'] ?? false) ? ($faststartArtifact['key'] ?? null) : null,
+                'label' => 'nbx_verified_faststart',
             ],
             [
                 'disk' => $originalArtifact['disk'] ?? null,
@@ -56,7 +61,12 @@ class MediaSourceService
         ];
 
         $workDisk = (string) config('nbx.work_storage', config('cdn.disk', 'public'));
-        $fileName = $this->sanitizeFileName((string) basename((string) ($source->storage_path ?: $source->original_storage_path ?: ($originalArtifact['key'] ?? 'source.mp4'))));
+        $fileName = $this->sanitizeFileName((string) basename((string) (
+            $source->storage_path
+            ?: $source->original_storage_path
+            ?: ($faststartArtifact['key'] ?? null)
+            ?: ($originalArtifact['key'] ?? 'source.mp4')
+        )));
         $workPath = sprintf('media/%s/%d/restored/%s', $source->media_asset_id, $source->id, $fileName ?: 'source.mp4');
 
         foreach ($candidates as $candidate) {
@@ -114,7 +124,7 @@ class MediaSourceService
         }
 
         $remoteUrl = null;
-        foreach ([$originalArtifact['url'] ?? null, $metadata['object_url'] ?? null, $source->source_url] as $url) {
+        foreach ([$faststartArtifact['url'] ?? null, $originalArtifact['url'] ?? null, $metadata['object_url'] ?? null, $source->source_url] as $url) {
             if (is_string($url) && preg_match('~^https?://~i', $url) === 1) {
                 $remoteUrl = $url;
                 break;
@@ -170,8 +180,8 @@ class MediaSourceService
         }
 
         if ($this->shouldUseNbxFinalArtifacts($source)) {
-            return $this->nbxArtifactUrl($source, 'original')
-                ?: $this->nbxArtifactUrl($source, 'faststart');
+            return $this->nbxArtifactUrl($source, 'faststart')
+                ?: $this->nbxArtifactUrl($source, 'original');
         }
 
         if ($source->source_type === 'url') {
@@ -304,7 +314,7 @@ class MediaSourceService
         }
 
         $hlsBase = dirname((string) $source->hls_master_path);
-        $relative = ltrim(str_replace($hlsBase . '/', '', $variantPath), '/');
+        $relative = ltrim(str_replace($hlsBase.'/', '', $variantPath), '/');
 
         return $this->absoluteRoute('media.hls.source', [
             'asset' => $source->media_asset_id,
@@ -420,8 +430,8 @@ class MediaSourceService
                 $height = (int) $m[2];
             }
 
-            $variantPath = $baseDir . '/' . ltrim($nextLine, '/');
-            $label = $height ? ($height . 'p') : ('Q' . (count($rows) + 1));
+            $variantPath = $baseDir.'/'.ltrim($nextLine, '/');
+            $label = $height ? ($height.'p') : ('Q'.(count($rows) + 1));
             $rows[] = [
                 'id' => $label,
                 'label' => strtoupper($label),
@@ -487,7 +497,7 @@ class MediaSourceService
     /**
      * Store a raw request body stream directly into CDN storage.
      *
-     * @param resource $inputStream
+     * @param  resource  $inputStream
      */
     public function storeStreamedSource(
         MediaAsset $asset,
@@ -549,6 +559,7 @@ class MediaSourceService
                 'completed_at' => now(),
             ]);
             $this->refreshAssetStatus($asset);
+
             return $source->fresh();
         }
 
@@ -604,6 +615,7 @@ class MediaSourceService
                 'completed_at' => now(),
             ]);
             $this->refreshAssetStatus($asset);
+
             return $source->fresh();
         }
 
@@ -662,6 +674,7 @@ class MediaSourceService
                 'completed_at' => now(),
             ]);
             $this->refreshAssetStatus($asset);
+
             return $source->fresh();
         }
 
@@ -714,6 +727,7 @@ class MediaSourceService
                 'completed_at' => now(),
             ]);
             $this->refreshAssetStatus($source->asset);
+
             return $source->fresh();
         }
 
@@ -746,19 +760,23 @@ class MediaSourceService
         return $source->fresh();
     }
 
-    public function queueRemoteImport(MediaSource $source): void
+    public function queueRemoteImport(MediaSource $source, bool $preserveJobId = false): void
     {
-        $queued = $this->withLock('media-source:queue-remote-import:' . $source->id, function () use ($source): bool {
+        $queued = $this->withLock('media-source:queue-remote-import:'.$source->id, function () use ($source, $preserveJobId): bool {
             $source = $source->fresh() ?? $source;
 
             if (
+                ! $preserveJobId
+                &&
                 in_array((string) $source->status, ['pending', 'downloading', 'processing', 'proxying', 'uploading'], true)
                 && filled($source->external_job_id)
             ) {
                 return false;
             }
 
-            $jobId = (string) Str::uuid();
+            $jobId = $preserveJobId && filled($source->external_job_id)
+                ? (string) $source->external_job_id
+                : (string) Str::uuid();
 
             $source->update([
                 'status' => 'pending',
@@ -870,7 +888,7 @@ class MediaSourceService
                 'source_id' => $source->id,
                 'asset_id' => (string) $source->media_asset_id,
                 'source_url' => (string) $source->source_url,
-                'filename' => basename((string) parse_url((string) $source->source_url, PHP_URL_PATH)) ?: ('source-' . $source->id . '.mp4'),
+                'filename' => basename((string) parse_url((string) $source->source_url, PHP_URL_PATH)) ?: ('source-'.$source->id.'.mp4'),
                 'mime_type' => $source->mime_type,
                 'size_bytes' => $source->bytes_total,
             ]);
@@ -878,14 +896,14 @@ class MediaSourceService
         if (! $response->successful()) {
             $body = $response->json();
             $error = is_array($body) ? ($body['error'] ?? null) : null;
-            throw new \RuntimeException((string) ($error ?: ('Python worker enqueue failed with status ' . $response->status())));
+            throw new \RuntimeException((string) ($error ?: ('Python worker enqueue failed with status '.$response->status())));
         }
 
         $payload = $response->json();
         $jobIdFromWorker = is_array($payload) ? ($payload['data']['id'] ?? null) : null;
         if (is_numeric($jobIdFromWorker)) {
             $source->update([
-                'external_job_id' => 'pyw:' . (int) $jobIdFromWorker,
+                'external_job_id' => 'pyw:'.(int) $jobIdFromWorker,
                 'last_progress_at' => now(),
             ]);
         }
@@ -950,7 +968,7 @@ class MediaSourceService
 
     public function queuePlaybackProcessing(MediaSource $source): bool
     {
-        return $this->withLock('media-source:queue-playback:' . $source->id, function () use ($source): bool {
+        return $this->withLock('media-source:queue-playback:'.$source->id, function () use ($source): bool {
             $source = $source->fresh() ?? $source;
 
             if ($source->status !== 'ready') {
@@ -962,7 +980,7 @@ class MediaSourceService
 
                 $source->update([
                     'optimize_status' => 'failed',
-                    'optimize_error' => 'Cannot optimize because source status is not ready (current status: ' . $source->status . ').',
+                    'optimize_error' => 'Cannot optimize because source status is not ready (current status: '.$source->status.').',
                 ]);
 
                 return false;
@@ -1067,31 +1085,32 @@ class MediaSourceService
         if (! $inputPath || ! $this->safeExists($disk, $inputPath)) {
             Log::warning('retryWorkerHlsOnly: input file missing, cannot retry HLS', [
                 'source_id' => $source->id,
-                'asset_id'  => $source->media_asset_id,
+                'asset_id' => $source->media_asset_id,
                 'input_path' => $inputPath,
             ]);
+
             return;
         }
 
         Log::info('retryWorkerHlsOnly: re-dispatching HLS step only (skipping compression)', [
-            'source_id'       => $source->id,
-            'asset_id'        => $source->media_asset_id,
-            'input_path'      => $inputPath,
-            'is_faststart'    => $source->is_faststart,
+            'source_id' => $source->id,
+            'asset_id' => $source->media_asset_id,
+            'input_path' => $inputPath,
+            'is_faststart' => $source->is_faststart,
             'optimize_status' => $source->optimize_status,
-            'worker_status'   => $source->hls_worker_status,
+            'worker_status' => $source->hls_worker_status,
         ]);
 
         $source->update([
-            'optimize_status'              => 'pending',
-            'optimize_error'               => null,
-            'hls_master_path'              => null,
-            'qualities_json'               => null,
-            'hls_worker_status'            => null,
-            'hls_worker_artifact_url'      => null,
+            'optimize_status' => 'pending',
+            'optimize_error' => null,
+            'hls_master_path' => null,
+            'qualities_json' => null,
+            'hls_worker_status' => null,
+            'hls_worker_artifact_url' => null,
             'hls_worker_artifact_expires_at' => null,
-            'hls_worker_last_error'        => null,
-            'optimize_retry_count'         => ($source->optimize_retry_count ?? 0) + 1,
+            'hls_worker_last_error' => null,
+            'optimize_retry_count' => ($source->optimize_retry_count ?? 0) + 1,
         ]);
 
         \App\Jobs\ProcessHlsAfterFaststartJob::dispatch($source->id)
@@ -1119,7 +1138,7 @@ class MediaSourceService
             ->connectTimeout(30)
             ->timeout(60)
             ->withToken($token)
-            ->post($baseUrl . '/api/v1/processing/submit', [
+            ->post($baseUrl.'/api/v1/processing/submit', [
                 'cdn_asset_id' => (string) $source->media_asset_id,
                 'cdn_source_id' => $source->id,
                 'source_url' => $sourceUrl,
@@ -1137,6 +1156,7 @@ class MediaSourceService
                 'status' => $response->status(),
                 'body' => $response->json(),
             ]);
+
             return false;
         }
 
@@ -1145,6 +1165,7 @@ class MediaSourceService
             'asset_id' => $source->media_asset_id,
             'external_id' => $response->json('data.external_id'),
         ]);
+
         return true;
     }
 
@@ -1165,7 +1186,8 @@ class MediaSourceService
             $url = Storage::disk($disk)->url($path);
             if (is_string($url) && str_starts_with($url, '/')) {
                 $baseUrl = rtrim((string) config('app.url', config('cdn.app_url')), '/');
-                return $baseUrl !== '' ? ($baseUrl . $url) : $url;
+
+                return $baseUrl !== '' ? ($baseUrl.$url) : $url;
             }
 
             return $url;
@@ -1191,7 +1213,9 @@ class MediaSourceService
         $artifact = is_array($artifacts[$role] ?? null) ? $artifacts[$role] : [];
         $url = $artifact['url'] ?? null;
 
-        return is_string($url) && trim($url) !== '' ? trim($url) : null;
+        return ($artifact['verified'] ?? false) && is_string($url) && trim($url) !== ''
+            ? trim($url)
+            : null;
     }
 
     private function nbxHlsVariantUrl(MediaSource $source, string $variantPath): ?string
@@ -1208,6 +1232,7 @@ class MediaSourceService
 
             if (($quality['source_path'] ?? null) === $variantPath || ($quality['path'] ?? null) === $variantPath) {
                 $url = $quality['url'] ?? null;
+
                 return is_string($url) && trim($url) !== '' ? trim($url) : null;
             }
         }
@@ -1246,7 +1271,7 @@ class MediaSourceService
         $relative = route($name, $parameters, false);
         $baseUrl = rtrim((string) config('app.url', config('cdn.app_url')), '/');
 
-        return $baseUrl !== '' ? ($baseUrl . $relative) : route($name, $parameters);
+        return $baseUrl !== '' ? ($baseUrl.$relative) : route($name, $parameters);
     }
 
     private function withLock(string $key, callable $callback): mixed
