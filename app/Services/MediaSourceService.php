@@ -1029,6 +1029,7 @@ class MediaSourceService
             }
 
             $updates = [
+                'processing_attempt_id' => (string) Str::uuid(),
                 'is_faststart' => false,
                 'compress_enabled' => $source->compress_enabled ?? true,
                 'optimize_status' => 'pending',
@@ -1042,6 +1043,12 @@ class MediaSourceService
                 'hls_worker_artifact_url' => null,
                 'hls_worker_artifact_expires_at' => null,
                 'hls_worker_last_error' => null,
+                'processing_stage' => 'queued',
+                'processing_stage_progress' => 0,
+                'processing_heartbeat_at' => now(),
+                'processing_diagnostics' => null,
+                'progress_percent' => 0,
+                'last_progress_at' => now(),
             ];
 
             if (! $source->original_storage_path && $source->storage_path) {
@@ -1049,17 +1056,18 @@ class MediaSourceService
             }
 
             $source->update($updates);
+            $attemptId = (string) $source->fresh()->processing_attempt_id;
 
             $queue = (string) config('cdn.optimization_queue', 'optimization');
             $enableHls = (bool) config('cdn.enable_hls', true);
 
             if ($enableHls) {
                 Bus::chain([
-                    new OptimizeMp4FaststartJob($source->id),
-                    new \App\Jobs\ProcessHlsAfterFaststartJob($source->id),
+                    new OptimizeMp4FaststartJob($source->id, $attemptId),
+                    new \App\Jobs\ProcessHlsAfterFaststartJob($source->id, $attemptId),
                 ])->onQueue($queue)->dispatch();
             } else {
-                OptimizeMp4FaststartJob::dispatch($source->id)->onQueue($queue);
+                OptimizeMp4FaststartJob::dispatch($source->id, $attemptId)->onQueue($queue);
             }
 
             return true;
@@ -1101,7 +1109,9 @@ class MediaSourceService
             'worker_status' => $source->hls_worker_status,
         ]);
 
+        $attemptId = (string) Str::uuid();
         $source->update([
+            'processing_attempt_id' => $attemptId,
             'optimize_status' => 'pending',
             'optimize_error' => null,
             'hls_master_path' => null,
@@ -1113,7 +1123,7 @@ class MediaSourceService
             'optimize_retry_count' => ($source->optimize_retry_count ?? 0) + 1,
         ]);
 
-        \App\Jobs\ProcessHlsAfterFaststartJob::dispatch($source->id)
+        \App\Jobs\ProcessHlsAfterFaststartJob::dispatch($source->id, $attemptId)
             ->onQueue((string) config('cdn.optimization_queue', 'optimization'));
     }
 
@@ -1213,9 +1223,21 @@ class MediaSourceService
         $artifact = is_array($artifacts[$role] ?? null) ? $artifacts[$role] : [];
         $url = $artifact['url'] ?? null;
 
-        return ($artifact['verified'] ?? false) && is_string($url) && trim($url) !== ''
-            ? trim($url)
-            : null;
+        if (! ($artifact['verified'] ?? false) || ! is_string($url) || trim($url) === '') {
+            return null;
+        }
+        $path = strtolower((string) parse_url((string) ($artifact['key'] ?? $url), PHP_URL_PATH));
+        if ($role === 'faststart') {
+            $mime = strtolower((string) ($artifact['mime_type'] ?? 'video/mp4'));
+            if (! str_ends_with($path, '.mp4') || ! in_array($mime, ['video/mp4', 'application/mp4'], true)) {
+                return null;
+            }
+        }
+        if ($role === 'hls_master' && ! str_ends_with($path, '.m3u8')) {
+            return null;
+        }
+
+        return trim($url);
     }
 
     private function nbxHlsVariantUrl(MediaSource $source, string $variantPath): ?string
@@ -1248,7 +1270,7 @@ class MediaSourceService
 
         $path = strtolower((string) parse_url($url, PHP_URL_PATH));
 
-        return str_ends_with($path, '.m3u8') ? null : $url;
+        return str_ends_with($path, '.mp4') ? $url : null;
     }
 
     private function safeExists(string $disk, ?string $path): bool

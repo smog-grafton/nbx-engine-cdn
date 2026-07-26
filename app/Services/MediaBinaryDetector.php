@@ -2,6 +2,8 @@
 
 namespace App\Services;
 
+use Symfony\Component\Process\Process;
+
 class MediaBinaryDetector
 {
     /** @var array<string, ?string> */
@@ -94,7 +96,19 @@ class MediaBinaryDetector
 
     private function isRunnable(string $path): bool
     {
-        return $path !== '' && is_file($path) && is_executable($path);
+        if ($path === '' || ! is_file($path) || ! is_executable($path)) {
+            return false;
+        }
+
+        try {
+            $process = new Process([$path, '-version']);
+            $process->setTimeout(5);
+            $process->run();
+
+            return $process->isSuccessful();
+        } catch (\Throwable) {
+            return false;
+        }
     }
 
     private function shellLookup(string $binary): ?string

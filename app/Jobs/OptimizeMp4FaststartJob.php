@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Models\MediaSource;
+use App\Services\FfmpegProcessRunner;
 use App\Services\MediaBinaryDetector;
 use App\Services\MediaSourceService;
 use App\Services\NbxEngineService;
@@ -16,6 +17,7 @@ use Illuminate\Queue\Middleware\WithoutOverlapping;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
+use Throwable;
 
 class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
 {
@@ -26,28 +28,31 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
 
     public int $tries = 1;
 
-    public int $timeout = 7200;
+    public int $timeout = 25200;
 
-    public int $uniqueFor = 3600;
+    public int $uniqueFor = 28800;
 
-    public function __construct(public int $sourceId) {}
+    public function __construct(public int $sourceId, public ?string $attemptId = null)
+    {
+        $this->timeout = max(600, (int) config('cdn.ffmpeg_timeout_seconds', 21600) + 3600);
+    }
 
     public function uniqueId(): string
     {
-        return 'optimization:faststart:'.$this->sourceId;
+        return 'optimization:faststart:'.$this->sourceId.':'.($this->attemptId ?: 'legacy');
     }
 
     public function middleware(): array
     {
         $locks = [
             (new WithoutOverlapping('optimization:source:'.$this->sourceId))
-                ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 14400)))
+                ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 25200)))
                 ->dontRelease(),
         ];
 
         if ((bool) config('cdn.serialize_optimization_jobs', true)) {
             $locks[] = (new WithoutOverlapping('optimization:global'))
-                ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 14400)))
+                ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 25200)))
                 ->releaseAfter(30);
         }
 
@@ -58,6 +63,15 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
     {
         $source = MediaSource::find($this->sourceId);
         if (! $source || $source->status !== 'ready') {
+            return;
+        }
+        if ($this->attemptId !== null && $source->processing_attempt_id !== $this->attemptId) {
+            Log::info('Ignoring superseded optimization attempt', [
+                'source_id' => $this->sourceId,
+                'job_attempt_id' => $this->attemptId,
+                'current_attempt_id' => $source->processing_attempt_id,
+            ]);
+
             return;
         }
 
@@ -97,9 +111,13 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
         $source->update([
             'optimize_status' => 'processing',
             'optimize_error' => null,
+            'processing_stage' => 'probing',
+            'processing_stage_progress' => 0,
+            'processing_heartbeat_at' => now(),
+            'processing_diagnostics' => null,
+            'progress_percent' => 5,
+            'last_progress_at' => now(),
         ]);
-        $this->markNbxStatusIfManaged($source, $this->shouldCompress($source) ? 'compressing' : 'faststarting');
-
         $originalPath = $source->storage_path;
         $absoluteInput = Storage::disk($disk)->path($originalPath);
         $optimizedPath = $this->buildOptimizedPath($source, $originalPath);
@@ -114,21 +132,41 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             $metadata['probe'] = $probe;
             $source->update(['source_metadata' => $metadata]);
         }
+        if ($probe === [] || ! ($probe['has_video'] ?? false)) {
+            $this->failOptimization($source, 'The input could not be probed as a complete video file.');
+
+            return;
+        }
 
         $shouldCompress = $this->shouldCompress($source);
+        $duration = (float) ($probe['duration'] ?? $probe['duration_seconds'] ?? 0);
         $maxHeight = $this->requestedMaxHeight($source);
         $needsDownscale = $maxHeight > 0 && (int) ($probe['height'] ?? 0) > $maxHeight;
         $videoCompatible = in_array(strtolower((string) ($probe['video_codec'] ?? '')), ['h264', 'avc1'], true)
             && in_array(strtolower((string) ($probe['pixel_format'] ?? 'yuv420p')), ['yuv420p', 'yuvj420p'], true);
         $hasAudio = (bool) ($probe['has_audio'] ?? ! empty($probe['audio_codec']));
         $audioCompatible = ! $hasAudio || strtolower((string) ($probe['audio_codec'] ?? '')) === 'aac';
+        $alreadyEfficient = $shouldCompress
+            && $videoCompatible
+            && $audioCompatible
+            && ! $needsDownscale
+            && $this->isAlreadyEfficient($probe);
+        $stage = $shouldCompress && ! $alreadyEfficient ? 'compressing' : 'faststarting';
+        $source->update([
+            'processing_stage' => $stage,
+            'processing_stage_progress' => 0,
+            'processing_heartbeat_at' => now(),
+            'progress_percent' => 10,
+            'last_progress_at' => now(),
+        ]);
+        $this->markNbxStatusIfManaged($source, $stage);
 
-        if (! $shouldCompress && ! $needsDownscale && $videoCompatible && $audioCompatible) {
-            $processingMode = 'remux';
-            [$exitCode, $rawError] = $this->runFaststartCopy($ffmpeg, $absoluteInput, $absoluteOutput);
+        if ((! $shouldCompress || $alreadyEfficient) && ! $needsDownscale && $videoCompatible && $audioCompatible) {
+            $processingMode = $alreadyEfficient ? 'remux_already_efficient' : 'remux';
+            [$exitCode, $rawError] = $this->runFaststartCopy($ffmpeg, $absoluteInput, $absoluteOutput, $source, $duration);
         } elseif (! $shouldCompress && ! $needsDownscale && $videoCompatible) {
             $processingMode = 'audio_transcode';
-            [$exitCode, $rawError] = $this->runAudioTranscode($ffmpeg, $absoluteInput, $absoluteOutput, $source);
+            [$exitCode, $rawError] = $this->runAudioTranscode($ffmpeg, $absoluteInput, $absoluteOutput, $source, $duration);
         } else {
             $processingMode = 'video_transcode';
             [$exitCode, $rawError] = $this->runCompressionTranscode(
@@ -137,6 +175,7 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
                 $absoluteOutput,
                 $source,
                 $maxHeight,
+                $duration,
             );
         }
 
@@ -159,6 +198,10 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
                 'is_faststart' => false,
                 'optimized_path' => $originalPath,
                 'playback_type' => 'mp4',
+                'processing_stage' => 'failed',
+                'processing_stage_progress' => null,
+                'processing_heartbeat_at' => now(),
+                'processing_diagnostics' => $rawError !== '' ? $rawError : null,
             ]);
             $this->markNbxStatusIfManaged(
                 $source->fresh() ?? $source,
@@ -169,6 +212,13 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             return;
         }
 
+        $source->update([
+            'processing_stage' => 'validating',
+            'processing_stage_progress' => 0,
+            'processing_heartbeat_at' => now(),
+            'progress_percent' => 80,
+            'last_progress_at' => now(),
+        ]);
         $outputProbe = app(VideoProbeService::class)->probe($absoluteOutput);
         $verificationError = $this->outputVerificationError($probe, $outputProbe, $absoluteOutput);
         if ($verificationError !== null) {
@@ -177,6 +227,10 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
                 'optimize_status' => 'failed',
                 'optimize_error' => $verificationError,
                 'is_faststart' => false,
+                'processing_stage' => 'failed',
+                'processing_stage_progress' => null,
+                'processing_heartbeat_at' => now(),
+                'processing_diagnostics' => $verificationError,
             ]);
             $this->markNbxStatusIfManaged($source->fresh() ?? $source, 'failed', $verificationError);
 
@@ -193,7 +247,7 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             && ! $needsDownscale
         ) {
             $fallbackOutput = $absoluteOutput.'.fallback.mp4';
-            [$fallbackExit, $fallbackError] = $this->runFaststartCopy($ffmpeg, $absoluteInput, $fallbackOutput);
+            [$fallbackExit, $fallbackError] = $this->runFaststartCopy($ffmpeg, $absoluteInput, $fallbackOutput, $source, $duration);
             if ($fallbackExit === 0 && is_file($fallbackOutput) && filesize($fallbackOutput) > 0) {
                 $fallbackProbe = app(VideoProbeService::class)->probe($fallbackOutput);
                 if ($this->outputVerificationError($probe, $fallbackProbe, $fallbackOutput) === null) {
@@ -256,6 +310,12 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             'optimized_at' => now(),
             'playback_type' => 'mp4',
             'source_metadata' => $nbxMetadata,
+            'processing_stage' => 'publishing',
+            'processing_stage_progress' => 0,
+            'processing_heartbeat_at' => now(),
+            'processing_diagnostics' => $rawError !== '' ? $rawError : null,
+            'progress_percent' => 85,
+            'last_progress_at' => now(),
         ];
 
         if ($deletedOriginal) {
@@ -289,6 +349,14 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
                 'optimized_path' => $optimizedPath,
             ]);
         }
+
+        $source->update([
+            'processing_stage' => 'ready',
+            'processing_stage_progress' => 100,
+            'processing_heartbeat_at' => now(),
+            'progress_percent' => 100,
+            'last_progress_at' => now(),
+        ]);
     }
 
     private function shouldCompress(MediaSource $source): bool
@@ -302,15 +370,27 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
      *
      * @return array{0:int,1:string}
      */
-    private function runFaststartCopy(string $ffmpeg, string $absoluteInput, string $absoluteOutput): array
+    private function runFaststartCopy(
+        string $ffmpeg,
+        string $absoluteInput,
+        string $absoluteOutput,
+        MediaSource $source,
+        float $duration,
+    ): array
     {
-        $cmd = implode(' ', [
-            escapeshellarg($ffmpeg),
+        $command = [
+            $ffmpeg,
             '-y',
+            '-nostdin',
+            '-hide_banner',
             '-loglevel',
             'error',
+            '-progress',
+            'pipe:2',
+            '-stats_period',
+            '5',
             '-i',
-            escapeshellarg($absoluteInput),
+            $absoluteInput,
             '-map',
             '0:v:0',
             '-map',
@@ -321,15 +401,10 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             'copy',
             '-movflags',
             '+faststart',
-            escapeshellarg($absoluteOutput),
-            '2>&1',
-        ]);
+            $absoluteOutput,
+        ];
 
-        $outputLines = [];
-        $exitCode = 0;
-        @exec($cmd, $outputLines, $exitCode);
-
-        return [$exitCode, trim(implode("\n", $outputLines))];
+        return app(FfmpegProcessRunner::class)->run($command, $source, $duration, 'faststarting');
     }
 
     /**
@@ -340,14 +415,21 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
         string $absoluteInput,
         string $absoluteOutput,
         MediaSource $source,
+        float $duration,
     ): array {
-        $cmd = implode(' ', [
-            escapeshellarg($ffmpeg),
+        $command = [
+            $ffmpeg,
             '-y',
+            '-nostdin',
+            '-hide_banner',
             '-loglevel',
             'error',
+            '-progress',
+            'pipe:2',
+            '-stats_period',
+            '5',
             '-i',
-            escapeshellarg($absoluteInput),
+            $absoluteInput,
             '-map',
             '0:v:0',
             '-map',
@@ -357,18 +439,13 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             '-c:a',
             'aac',
             '-b:a',
-            escapeshellarg((string) $this->requestedValue($source, 'audio_bitrate', config('cdn.compress_audio_bitrate', '128k'))),
+            (string) $this->requestedValue($source, 'audio_bitrate', config('cdn.compress_audio_bitrate', '128k')),
             '-movflags',
             '+faststart',
-            escapeshellarg($absoluteOutput),
-            '2>&1',
-        ]);
+            $absoluteOutput,
+        ];
 
-        $outputLines = [];
-        $exitCode = 0;
-        @exec($cmd, $outputLines, $exitCode);
-
-        return [$exitCode, trim(implode("\n", $outputLines))];
+        return app(FfmpegProcessRunner::class)->run($command, $source, $duration, 'faststarting');
     }
 
     private function runCompressionTranscode(
@@ -377,6 +454,7 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
         string $absoluteOutput,
         MediaSource $source,
         int $requestedMaxHeight = 0,
+        float $duration = 0,
     ): array {
         $videoCodec = (string) config('cdn.compress_video_codec', 'libx264');
         $audioCodec = (string) config('cdn.compress_audio_codec', 'aac');
@@ -390,47 +468,52 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             : max(0, (int) config('cdn.compress_max_height', 0));
 
         $parts = [
-            escapeshellarg($ffmpeg),
+            $ffmpeg,
             '-y',
+            '-nostdin',
+            '-hide_banner',
             '-loglevel',
             'error',
+            '-progress',
+            'pipe:2',
+            '-stats_period',
+            '5',
             '-i',
-            escapeshellarg($absoluteInput),
+            $absoluteInput,
             '-map',
             '0:v:0',
             '-map',
             '0:a?',
             '-c:v',
-            escapeshellarg($videoCodec),
+            $videoCodec,
             '-preset',
-            escapeshellarg($preset),
+            $preset,
             '-crf',
             (string) $crf,
-            '-threads',
-            '1',
             '-pix_fmt',
             'yuv420p',
             '-c:a',
-            escapeshellarg($audioCodec),
+            $audioCodec,
             '-b:a',
-            escapeshellarg($audioBitrate),
+            $audioBitrate,
             '-movflags',
             '+faststart',
         ];
 
-        if ($maxHeight > 0) {
-            $parts[] = '-vf';
-            $parts[] = escapeshellarg("scale=-2:'min({$maxHeight},ih)':force_original_aspect_ratio=decrease");
+        $threads = max(0, min(64, (int) config('cdn.ffmpeg_threads', 0)));
+        if ($threads > 0) {
+            $parts[] = '-threads';
+            $parts[] = (string) $threads;
         }
 
-        $parts[] = escapeshellarg($absoluteOutput);
-        $parts[] = '2>&1';
+        if ($maxHeight > 0) {
+            $parts[] = '-vf';
+            $parts[] = "scale=-2:min({$maxHeight}\\,ih):force_original_aspect_ratio=decrease";
+        }
 
-        $outputLines = [];
-        $exitCode = 0;
-        @exec(implode(' ', $parts), $outputLines, $exitCode);
+        $parts[] = $absoluteOutput;
 
-        return [$exitCode, trim(implode("\n", $outputLines))];
+        return app(FfmpegProcessRunner::class)->run($parts, $source, $duration, 'compressing');
     }
 
     private function requestedValue(MediaSource $source, string $key, mixed $fallback): mixed
@@ -549,10 +632,30 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
         return max(0, (int) ($requested['max_resolution'] ?? 0));
     }
 
+    private function isAlreadyEfficient(array $probe): bool
+    {
+        $bitrate = (int) ($probe['bitrate'] ?? 0);
+        $height = (int) ($probe['height'] ?? 0);
+        if ($bitrate <= 0 || $height <= 0) {
+            return false;
+        }
+
+        $ceiling = $height <= 480
+            ? (int) config('cdn.compress_skip_bitrate_480p', 900000)
+            : ($height <= 720
+                ? (int) config('cdn.compress_skip_bitrate_720p', 1500000)
+                : (int) config('cdn.compress_skip_bitrate_1080p', 2200000));
+
+        return $bitrate <= max(100000, $ceiling);
+    }
+
     private function outputVerificationError(array $input, array $output, string $absoluteOutput): ?string
     {
         if ($output === [] || ! is_file($absoluteOutput) || filesize($absoluteOutput) <= 0) {
             return 'Optimized output could not be probed or is empty.';
+        }
+        if (strtolower((string) pathinfo($absoluteOutput, PATHINFO_EXTENSION)) !== 'mp4') {
+            return 'Optimized output filename is not an MP4.';
         }
 
         if (! in_array(strtolower((string) ($output['video_codec'] ?? '')), ['h264', 'avc1'], true)) {
@@ -584,6 +687,38 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
         }
 
         return null;
+    }
+
+    public function failed(?Throwable $exception): void
+    {
+        $source = MediaSource::find($this->sourceId);
+        if (! $source || $source->optimize_status === 'ready') {
+            return;
+        }
+        if ($this->attemptId !== null && $source->processing_attempt_id !== $this->attemptId) {
+            return;
+        }
+
+        $message = $exception
+            ? 'Optimization worker stopped: '.$exception->getMessage()
+            : 'Optimization worker stopped before the video was completed.';
+        $this->failOptimization($source, $message);
+    }
+
+    private function failOptimization(MediaSource $source, string $message): void
+    {
+        $bounded = mb_substr($message, -12000);
+        $source->update([
+            'optimize_status' => 'failed',
+            'optimize_error' => $bounded,
+            'is_faststart' => false,
+            'processing_stage' => 'failed',
+            'processing_stage_progress' => null,
+            'processing_heartbeat_at' => now(),
+            'processing_diagnostics' => $bounded,
+            'last_progress_at' => now(),
+        ]);
+        $this->markNbxStatusIfManaged($source->fresh() ?? $source, 'failed', $bounded);
     }
 
     private function hasFastStartAtomOrder(string $absolutePath): bool

@@ -172,6 +172,10 @@ class NbxWebhookDispatcher
             'status' => $context['status'] ?? ($discovery['status'] ?? ($nbx['status'] ?? $fresh->status)),
             'source_status' => $discovery['source_status'] ?? $fresh->status,
             'optimize_status' => $discovery['optimize_status'] ?? $fresh->optimize_status,
+            'processing_stage' => $discovery['processing_stage'] ?? $fresh->processing_stage,
+            'processing_stage_progress' => $discovery['processing_stage_progress'] ?? $fresh->processing_stage_progress,
+            'processing_heartbeat_at' => $discovery['processing_heartbeat_at'] ?? $fresh->processing_heartbeat_at?->toIso8601String(),
+            'progress_percent' => $fresh->progress_percent,
             'source_metadata' => $metadata,
             'available_sources' => [
                 'original_url' => $discovery['original_url'] ?? null,

@@ -26,29 +26,29 @@ class ProcessHlsAfterFaststartJob implements ShouldBeUnique, ShouldQueue
 
     public int $timeout = 120;
 
-    public int $uniqueFor = 3600;
+    public int $uniqueFor = 28800;
 
-    public function __construct(public int $sourceId)
+    public function __construct(public int $sourceId, public ?string $attemptId = null)
     {
         $this->onQueue((string) config('cdn.optimization_queue', 'optimization'));
     }
 
     public function uniqueId(): string
     {
-        return 'optimization:after-faststart:'.$this->sourceId;
+        return 'optimization:after-faststart:'.$this->sourceId.':'.($this->attemptId ?: 'hls-only');
     }
 
     public function middleware(): array
     {
         $locks = [
             (new WithoutOverlapping('optimization:source:'.$this->sourceId))
-                ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 14400)))
+                ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 25200)))
                 ->dontRelease(),
         ];
 
         if ((bool) config('cdn.serialize_optimization_jobs', true)) {
             $locks[] = (new WithoutOverlapping('optimization:global'))
-                ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 14400)))
+                ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 25200)))
                 ->releaseAfter(30);
         }
 
@@ -61,9 +61,18 @@ class ProcessHlsAfterFaststartJob implements ShouldBeUnique, ShouldQueue
         if (! $source || $source->status !== 'ready') {
             return;
         }
+        if ($this->attemptId !== null && $source->processing_attempt_id !== $this->attemptId) {
+            Log::info('Ignoring superseded post-faststart attempt', [
+                'source_id' => $this->sourceId,
+                'job_attempt_id' => $this->attemptId,
+                'current_attempt_id' => $source->processing_attempt_id,
+            ]);
+
+            return;
+        }
 
         // Do not run HLS when faststart already failed (e.g. corrupt/incomplete MP4 – moov atom not found).
-        if ($source->optimize_status === 'failed') {
+        if ($source->optimize_status === 'failed' || ($this->attemptId !== null && $source->optimize_status !== 'ready')) {
             return;
         }
 
@@ -139,7 +148,7 @@ class ProcessHlsAfterFaststartJob implements ShouldBeUnique, ShouldQueue
                 'source_id' => $source->id,
                 'asset_id' => $source->media_asset_id,
             ]);
-            GenerateHlsVariantsJob::dispatch($source->id)
+            GenerateHlsVariantsJob::dispatch($source->id, $this->attemptId ?: $source->processing_attempt_id)
                 ->onQueue((string) config('cdn.optimization_queue', 'optimization'));
         } else {
             // HLS disabled; mark the source as fully ready with mp4 playback.

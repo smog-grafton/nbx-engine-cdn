@@ -4,6 +4,7 @@ namespace App\Jobs;
 
 use App\Models\MediaSource;
 use App\Services\MediaBinaryDetector;
+use App\Services\FfmpegProcessRunner;
 use App\Services\NbxEngineService;
 use App\Services\MediaSourceService;
 use App\Services\VideoProbeService;
@@ -16,6 +17,7 @@ use Illuminate\Queue\Middleware\WithoutOverlapping;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
+use Throwable;
 
 class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
 {
@@ -26,31 +28,32 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
 
     public int $tries = 1;
 
-    public int $timeout = 7200;
+    public int $timeout = 25200;
 
-    public int $uniqueFor = 3600;
+    public int $uniqueFor = 28800;
 
-    public function __construct(public int $sourceId)
+    public function __construct(public int $sourceId, public ?string $attemptId = null)
     {
+        $this->timeout = max(600, (int) config('cdn.ffmpeg_timeout_seconds', 21600) + 3600);
         $this->onQueue((string) config('cdn.optimization_queue', 'optimization'));
     }
 
     public function uniqueId(): string
     {
-        return 'optimization:hls:' . $this->sourceId;
+        return 'optimization:hls:' . $this->sourceId . ':' . ($this->attemptId ?: 'legacy');
     }
 
     public function middleware(): array
     {
         $locks = [
             (new WithoutOverlapping('optimization:source:' . $this->sourceId))
-                ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 14400)))
+                ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 25200)))
                 ->dontRelease(),
         ];
 
         if ((bool) config('cdn.serialize_optimization_jobs', true)) {
             $locks[] = (new WithoutOverlapping('optimization:global'))
-                ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 14400)))
+                ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 25200)))
                 ->releaseAfter(30);
         }
 
@@ -61,6 +64,15 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
     {
         $source = MediaSource::find($this->sourceId);
         if (! $source || $source->status !== 'ready') {
+            return;
+        }
+        if ($this->attemptId !== null && $source->processing_attempt_id !== $this->attemptId) {
+            Log::info('Ignoring superseded HLS attempt', [
+                'source_id' => $this->sourceId,
+                'job_attempt_id' => $this->attemptId,
+                'current_attempt_id' => $source->processing_attempt_id,
+            ]);
+
             return;
         }
 
@@ -178,6 +190,13 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
             $label = (string) $profile['label'];
             $height = (int) $profile['height'];
             app(NbxEngineService::class)->markNbxStatus($source->fresh() ?? $source, 'encoding_' . $label);
+            $source->update([
+                'processing_stage' => 'hls_'.$label,
+                'processing_stage_progress' => 0,
+                'processing_heartbeat_at' => now(),
+                'progress_percent' => 85,
+                'last_progress_at' => now(),
+            ]);
 
             $variantPath = $hlsBasePath . '/' . $label;
             $variantAbsolute = $hlsBaseAbsolute . '/' . $label;
@@ -192,7 +211,9 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
                 $playlistAbsolute,
                 $segmentPattern,
                 $profile,
-                $hasAudio
+                $hasAudio,
+                $source,
+                (float) ($probe['duration'] ?? $probe['duration_seconds'] ?? 0),
             );
 
             if ($exitCode !== 0 || ! is_file($playlistAbsolute)) {
@@ -272,6 +293,11 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
             'hls_master_path' => $masterPath,
             'qualities_json' => $generated,
             'optimize_error' => $skipped === [] ? null : 'Some HLS profiles were skipped or failed.',
+            'processing_stage' => $skipped === [] ? 'ready' : 'partially_completed',
+            'processing_stage_progress' => 100,
+            'processing_heartbeat_at' => now(),
+            'progress_percent' => 100,
+            'last_progress_at' => now(),
         ]);
 
         $source = $nbx->finalizeStorageIfNeeded($source->fresh() ?? $source);
@@ -327,20 +353,30 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
         string $playlistAbsolute,
         string $segmentPattern,
         array $profile,
-        bool $hasAudio
+        bool $hasAudio,
+        MediaSource $source,
+        float $duration,
     ): array {
         $height = (int) $profile['height'];
         $parts = [
-            escapeshellarg($ffmpeg),
+            $ffmpeg,
             '-y',
+            '-nostdin',
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            '-progress',
+            'pipe:2',
+            '-stats_period',
+            '5',
             '-i',
-            escapeshellarg($inputAbsolute),
+            $inputAbsolute,
             '-map',
             '0:v:0',
             '-map',
             '0:a:0?',
             '-vf',
-            escapeshellarg("scale=-2:{$height}:force_original_aspect_ratio=decrease"),
+            "scale=-2:{$height}:force_original_aspect_ratio=decrease",
             '-c:v',
             'libx264',
             '-preset',
@@ -348,9 +384,9 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
             '-crf',
             (string) $profile['crf'],
             '-maxrate',
-            escapeshellarg((string) $profile['maxrate']),
+            (string) $profile['maxrate'],
             '-bufsize',
-            escapeshellarg((string) $profile['bufsize']),
+            (string) $profile['bufsize'],
         ];
 
         if ($hasAudio) {
@@ -358,7 +394,7 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
                 '-c:a',
                 'aac',
                 '-b:a',
-                escapeshellarg((string) $profile['audio_bitrate']),
+                (string) $profile['audio_bitrate'],
             ]);
         } else {
             $parts[] = '-an';
@@ -374,16 +410,16 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
             '-hls_flags',
             'independent_segments',
             '-hls_segment_filename',
-            escapeshellarg($segmentPattern),
-            escapeshellarg($playlistAbsolute),
-            '2>&1',
+            $segmentPattern,
+            $playlistAbsolute,
         ]);
 
-        $output = [];
-        $exitCode = 0;
-        @exec(implode(' ', $parts), $output, $exitCode);
-
-        return [$exitCode, trim(implode("\n", $output))];
+        return app(FfmpegProcessRunner::class)->run(
+            $parts,
+            $source,
+            $duration,
+            'hls_'.(string) $profile['label'],
+        );
     }
 
     private function probeSourceHasAudio(?string $ffprobe, string $inputAbsolute): bool
@@ -435,6 +471,29 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
         $trimmed = trim(preg_replace('/\s+/', ' ', $error) ?: $error);
 
         return mb_substr($trimmed !== '' ? $trimmed : 'FFmpeg failed.', 0, 500);
+    }
+
+    public function failed(?Throwable $exception): void
+    {
+        $source = MediaSource::find($this->sourceId);
+        if (! $source || ($this->attemptId !== null && $source->processing_attempt_id !== $this->attemptId)) {
+            return;
+        }
+
+        $message = mb_substr(
+            $exception ? 'HLS worker stopped: '.$exception->getMessage() : 'HLS worker stopped before completion.',
+            -12000,
+        );
+        $source->update([
+            'optimize_status' => 'failed',
+            'optimize_error' => $message,
+            'processing_stage' => 'failed',
+            'processing_stage_progress' => null,
+            'processing_heartbeat_at' => now(),
+            'processing_diagnostics' => $message,
+            'last_progress_at' => now(),
+        ]);
+        app(NbxEngineService::class)->markNbxStatus($source->fresh(), 'failed', $message);
     }
 
     /**

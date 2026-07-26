@@ -184,6 +184,10 @@ class CdnLoadHardeningTest extends TestCase
         @mkdir(dirname($fakeFfmpeg), 0755, true);
         file_put_contents($fakeFfmpeg, <<<'SH'
 #!/bin/sh
+if [ "$1" = "-version" ]; then
+  echo "ffmpeg test double"
+  exit 0
+fi
 input=""
 output=""
 prev=""
@@ -202,6 +206,10 @@ SH
         $fakeFfprobe = storage_path('framework/testing/fake-ffprobe.sh');
         file_put_contents($fakeFfprobe, <<<'SH'
 #!/bin/sh
+if [ "$1" = "-version" ]; then
+  echo "ffprobe test double"
+  exit 0
+fi
 cat <<'JSON'
 {"streams":[{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p","width":1280,"height":720},{"codec_type":"audio","codec_name":"aac","channels":2}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"60.0","size":"16"}}
 JSON

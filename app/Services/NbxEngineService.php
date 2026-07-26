@@ -465,13 +465,19 @@ class NbxEngineService
             }
 
             if (in_array('faststart', $roles, true)) {
-                $faststartPath = $this->firstExistingPath($currentDisk, [
-                    $source->optimized_path,
-                    $source->storage_path,
-                ]);
+                $faststartPath = $source->is_faststart
+                    && $source->optimize_status === 'ready'
+                    && is_string($source->optimized_path)
+                    && strtolower((string) pathinfo($source->optimized_path, PATHINFO_EXTENSION)) === 'mp4'
+                    ? $this->firstExistingPath($currentDisk, [$source->optimized_path])
+                    : null;
 
                 if ($faststartPath) {
                     $artifacts['faststart'] = $this->copyFinalArtifact($currentDisk, $faststartPath, 'contabo', $this->finalObjectKey($source, 'faststart', $faststartPath), 'faststart');
+                } elseif (isset($artifacts['faststart']) && ! $this->validFinalArtifact((array) $artifacts['faststart'], 'faststart')) {
+                    // A previous release could publish storage_path here before FFmpeg
+                    // finished, which mislabeled MOV/MKV originals as optimized files.
+                    unset($artifacts['faststart']);
                 }
             }
 
@@ -539,8 +545,7 @@ class NbxEngineService
     private function failFinalization(MediaSource $source, string $message, array $metadata, array $nbx, string $target, string $currentDisk): MediaSource
     {
         $faststart = (array) ($nbx['final_artifacts']['faststart'] ?? []);
-        $hasVerifiedProgressive = (bool) ($faststart['verified'] ?? false)
-            && ! empty($faststart['url'])
+        $hasVerifiedProgressive = $this->validFinalArtifact($faststart, 'faststart')
             && ! empty($faststart['bytes']);
         $status = $hasVerifiedProgressive ? 'partially_completed' : 'failed';
         $metadata['nbx'] = array_merge($nbx, [
@@ -632,6 +637,11 @@ class NbxEngineService
             'status' => $nbx['status'] ?? $source->status,
             'source_status' => $source->status,
             'optimize_status' => $source->optimize_status,
+            'processing_stage' => $source->processing_stage,
+            'processing_stage_progress' => $source->processing_stage_progress,
+            'processing_heartbeat_at' => $source->processing_heartbeat_at?->toIso8601String(),
+            'processing_diagnostics' => $source->processing_stage === 'failed' ? $source->processing_diagnostics : null,
+            'progress_percent' => $source->progress_percent,
             'failure_reason' => $source->failure_reason ?: $source->optimize_error,
             'storage_disk' => $source->storage_disk,
             'storage_target' => $nbx['storage_target'] ?? null,
@@ -762,8 +772,9 @@ class NbxEngineService
         $event = match ($status) {
             'fetching' => 'job.fetching',
             'probing' => 'job.probing',
+            'compressing', 'faststarting' => 'job.processing',
             'failed' => 'job.failed',
-            default => null,
+            default => str_starts_with($status, 'encoding_') ? 'job.processing' : null,
         };
 
         if ($event === null) {
@@ -867,7 +878,7 @@ class NbxEngineService
 
         foreach (['original' => 'source', 'faststart' => '480p', 'hls_master' => 'auto'] as $role => $quality) {
             $artifact = is_array($artifacts[$role] ?? null) ? $artifacts[$role] : [];
-            if (! is_string($artifact['url'] ?? null) || $artifact['url'] === '' || ! ($artifact['verified'] ?? false)) {
+            if (! $this->validFinalArtifact($artifact, $role)) {
                 continue;
             }
 
@@ -1024,7 +1035,7 @@ class NbxEngineService
     {
         $artifact = $nbx['final_artifacts'][$role] ?? null;
 
-        return is_array($artifact) && is_string($artifact['url'] ?? null) && ($artifact['verified'] ?? false)
+        return is_array($artifact) && $this->validFinalArtifact($artifact, $role)
             ? $artifact['url']
             : null;
     }
@@ -1040,7 +1051,7 @@ class NbxEngineService
 
         foreach ($roles as $key => $role) {
             $artifact = $nbx['final_artifacts'][$key] ?? null;
-            if (! is_array($artifact) || ! is_string($artifact['url'] ?? null)) {
+            if (! is_array($artifact) || ! $this->validFinalArtifact($artifact, $key)) {
                 continue;
             }
 
@@ -1062,5 +1073,23 @@ class NbxEngineService
         }
 
         return $outputs;
+    }
+
+    private function validFinalArtifact(array $artifact, string $role): bool
+    {
+        if (! ($artifact['verified'] ?? false) || ! is_string($artifact['url'] ?? null) || trim($artifact['url']) === '') {
+            return false;
+        }
+
+        $path = strtolower((string) parse_url((string) ($artifact['key'] ?? $artifact['url']), PHP_URL_PATH));
+        if ($role === 'faststart') {
+            return str_ends_with($path, '.mp4')
+                && in_array(strtolower((string) ($artifact['mime_type'] ?? 'video/mp4')), ['video/mp4', 'application/mp4'], true);
+        }
+        if ($role === 'hls_master') {
+            return str_ends_with($path, '.m3u8');
+        }
+
+        return true;
     }
 }

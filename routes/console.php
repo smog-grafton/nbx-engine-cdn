@@ -184,8 +184,13 @@ Artisan::command('nbx:reconcile-artifacts {--limit=200} {--apply : Persist corre
             $checked++;
             $metadata = (array) ($source->source_metadata ?? []);
             $artifact = (array) ($metadata['nbx']['final_artifacts']['faststart'] ?? []);
+            $artifactPath = strtolower((string) parse_url((string) ($artifact['key'] ?? $artifact['url'] ?? ''), PHP_URL_PATH));
             $verified = ! empty($artifact['disk'])
                 && ! empty($artifact['key'])
+                && str_ends_with($artifactPath, '.mp4')
+                && in_array(strtolower((string) ($artifact['mime_type'] ?? 'video/mp4')), ['video/mp4', 'application/mp4'], true)
+                && $source->is_faststart
+                && $source->optimize_status === 'ready'
                 && $storage->verify((string) $artifact['disk'], (string) $artifact['key'], (int) ($artifact['bytes'] ?? 0));
 
             if ($verified && $source->status === 'failed') {
@@ -394,7 +399,7 @@ Artisan::command('media:process-optimization-queue {--max-jobs=10 : Max optimiza
         '--max-jobs' => $maxJobs,
         '--stop-when-empty' => true,
         '--tries' => 1,
-        '--timeout' => 7200,
+        '--timeout' => 25200,
     ]);
 
     $this->info('Done.');
@@ -698,7 +703,7 @@ Schedule::call(function (): void {
         '--stop-when-empty' => true,
         '--sleep' => 1,
         '--tries' => 1,
-        '--timeout' => 7200,
+        '--timeout' => 25200,
         '--max-time' => 55,
     ]);
 })->name('cdn:queue-work:default')->withoutOverlapping()->everyMinute();
@@ -717,3 +722,11 @@ Schedule::call(function (): void {
 Schedule::call(function (): void {
     Artisan::call('media:retry-failed-optimizations', ['--limit' => 5, '--stale-minutes' => 30]);
 })->name('cdn:retry-failed-optimizations')->withoutOverlapping()->everyFiveMinutes();
+
+Schedule::command('media:recover-stale-optimizations', [
+    '--limit' => 1,
+    '--stale-minutes' => (int) config('cdn.optimization_stale_minutes', 20),
+])
+    ->name('cdn:recover-stale-optimizations')
+    ->withoutOverlapping()
+    ->everyFiveMinutes();

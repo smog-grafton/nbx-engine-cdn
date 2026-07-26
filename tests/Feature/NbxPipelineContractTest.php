@@ -33,6 +33,43 @@ class NbxPipelineContractTest extends TestCase
         $this->assertSame('optimized_only', $requested['retention_policy']);
     }
 
+    public function test_unprocessed_mov_is_never_published_as_a_faststart_artifact(): void
+    {
+        config()->set('filesystems.disks.contabo.key', 'test-key');
+        config()->set('filesystems.disks.contabo.secret', 'test-secret');
+
+        $asset = MediaAsset::query()->create([
+            'type' => 'movie',
+            'title' => 'MOV awaiting normalization',
+            'status' => 'ready',
+            'visibility' => 'public',
+        ]);
+        Storage::disk('public')->put('media/'.$asset->id.'/movie.mov', 'original-mov');
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'remote_fetch',
+            'storage_disk' => 'public',
+            'storage_path' => 'media/'.$asset->id.'/movie.mov',
+            'status' => 'ready',
+            'optimize_status' => 'processing',
+            'is_faststart' => false,
+            'external_job_id' => 'never-publish-original-as-faststart',
+            'is_active' => true,
+            'source_metadata' => [
+                'provider' => 'nbx_engine',
+                'nbx' => [
+                    'storage_target' => 'contabo',
+                    'requested' => ['retention_policy' => 'optimized_only'],
+                ],
+            ],
+        ]);
+
+        $result = app(NbxEngineService::class)->publishAvailableArtifacts($source, ['faststart']);
+
+        $this->assertArrayNotHasKey('faststart', $result->source_metadata['nbx']['final_artifacts'] ?? []);
+        Storage::disk('contabo')->assertMissing('videos/nbx/never-publish-original-as-faststart/faststart/movie.mov');
+    }
+
     public function test_original_deletion_requires_and_preserves_verified_faststart_object(): void
     {
         $asset = MediaAsset::query()->create([
