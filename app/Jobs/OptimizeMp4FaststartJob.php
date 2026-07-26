@@ -120,6 +120,9 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
         ]);
         $originalPath = $source->storage_path;
         $absoluteInput = Storage::disk($disk)->path($originalPath);
+        // Capture this before FFmpeg starts. The Telegram/import cleanup
+        // lifecycle may remove the work input after FFmpeg has opened it.
+        $inputSize = $this->safeLocalFileSize($absoluteInput, (int) ($source->file_size_bytes ?? 0));
         $optimizedPath = $this->buildOptimizedPath($source, $originalPath);
         $absoluteOutput = Storage::disk($disk)->path($optimizedPath);
         Storage::disk($disk)->makeDirectory(dirname($optimizedPath));
@@ -179,7 +182,7 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             );
         }
 
-        if ($exitCode !== 0 || ! is_file($absoluteOutput) || filesize($absoluteOutput) <= 0) {
+        if ($exitCode !== 0 || $this->safeLocalFileSize($absoluteOutput) <= 0) {
             $optimizeError = $this->summarizeFfmpegError($rawError);
             Log::warning('Faststart optimization failed', [
                 'source_id' => $source->id,
@@ -237,25 +240,25 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             return;
         }
 
-        $inputSize = (int) (filesize($absoluteInput) ?: ($source->file_size_bytes ?? 0));
-        $optimizedSize = (int) filesize($absoluteOutput);
+        $optimizedSize = $this->safeLocalFileSize($absoluteOutput);
         if (
             $processingMode === 'video_transcode'
             && $optimizedSize >= $inputSize
             && $videoCompatible
             && $audioCompatible
             && ! $needsDownscale
+            && is_file($absoluteInput)
         ) {
             $fallbackOutput = $absoluteOutput.'.fallback.mp4';
             [$fallbackExit, $fallbackError] = $this->runFaststartCopy($ffmpeg, $absoluteInput, $fallbackOutput, $source, $duration);
-            if ($fallbackExit === 0 && is_file($fallbackOutput) && filesize($fallbackOutput) > 0) {
+            if ($fallbackExit === 0 && $this->safeLocalFileSize($fallbackOutput) > 0) {
                 $fallbackProbe = app(VideoProbeService::class)->probe($fallbackOutput);
                 if ($this->outputVerificationError($probe, $fallbackProbe, $fallbackOutput) === null) {
                     @unlink($absoluteOutput);
                     @rename($fallbackOutput, $absoluteOutput);
                     $processingMode = 'remux_fallback_smaller';
                     $outputProbe = $fallbackProbe;
-                    $optimizedSize = (int) filesize($absoluteOutput);
+                    $optimizedSize = $this->safeLocalFileSize($absoluteOutput);
                 }
             } else {
                 $rawError .= "\nCompression fallback failed: ".$fallbackError;
@@ -278,6 +281,7 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             $optimizedPath,
             $deleteLocalOriginal,
         );
+        $originalMissingAfterProcessing = ! Storage::disk($disk)->exists($originalPath);
         $bytesSaved = max(0, $inputSize - $optimizedSize);
         $nbxMetadata['probe_output'] = $outputProbe;
         $processingResult = [
@@ -294,6 +298,7 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             'max_resolution' => $requested['max_resolution'] ?? null,
             'verified' => true,
             'verified_at' => now()->toIso8601String(),
+            'original_missing_after_processing' => $originalMissingAfterProcessing,
         ];
         if ($wasNbxManaged) {
             $nbxMetadata['nbx'] = array_merge((array) ($nbxMetadata['nbx'] ?? []), [
@@ -318,7 +323,7 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             'last_progress_at' => now(),
         ];
 
-        if ($deletedOriginal) {
+        if ($deletedOriginal || $originalMissingAfterProcessing) {
             $updates['storage_path'] = $optimizedPath;
             $updates['mime_type'] = 'video/mp4';
             $updates['file_size_bytes'] = $optimizedSize > 0 ? $optimizedSize : null;
@@ -376,8 +381,7 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
         string $absoluteOutput,
         MediaSource $source,
         float $duration,
-    ): array
-    {
+    ): array {
         $command = [
             $ffmpeg,
             '-y',
@@ -651,7 +655,7 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
 
     private function outputVerificationError(array $input, array $output, string $absoluteOutput): ?string
     {
-        if ($output === [] || ! is_file($absoluteOutput) || filesize($absoluteOutput) <= 0) {
+        if ($output === [] || $this->safeLocalFileSize($absoluteOutput) <= 0) {
             return 'Optimized output could not be probed or is empty.';
         }
         if (strtolower((string) pathinfo($absoluteOutput, PATHINFO_EXTENSION)) !== 'mp4') {
@@ -687,6 +691,17 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
         }
 
         return null;
+    }
+
+    private function safeLocalFileSize(string $absolutePath, int $fallback = 0): int
+    {
+        if (! is_file($absolutePath)) {
+            return max(0, $fallback);
+        }
+
+        $size = @filesize($absolutePath);
+
+        return $size === false ? max(0, $fallback) : max(0, (int) $size);
     }
 
     public function failed(?Throwable $exception): void

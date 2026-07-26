@@ -330,12 +330,15 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
                 'error' => $throwable->getMessage(),
             ]);
 
-            if (is_string($absolutePath) && is_file($absolutePath)) {
+            $source->refresh();
+            // A ready source belongs to the optimization pipeline. If a
+            // synchronous dispatch fails, deleting it here races FFmpeg and
+            // destroys an otherwise valid intake.
+            if ($source->status !== 'ready' && is_string($absolutePath) && is_file($absolutePath)) {
                 @unlink($absolutePath);
             }
 
             // Only mark source as failed if it never reached ready (e.g. don't overwrite if only queuePlaybackProcessing threw)
-            $source->refresh();
             if ($source->status !== 'ready') {
                 $source->update([
                     'status' => 'failed',

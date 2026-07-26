@@ -247,6 +247,83 @@ SH
         $this->assertTrue(Storage::disk('public')->exists((string) $source->optimized_path));
     }
 
+    public function test_verified_output_survives_when_the_original_disappears_after_ffmpeg(): void
+    {
+        config()->set('filesystems.default', 'public');
+        config()->set('cdn.disk', 'public');
+        config()->set('nbx.work_storage', 'public');
+        config()->set('cdn.enable_hls', false);
+        config()->set('cdn.compress_before_playback', false);
+
+        $fakeFfmpeg = storage_path('framework/testing/fake-ffmpeg-removes-input.sh');
+        @mkdir(dirname($fakeFfmpeg), 0755, true);
+        file_put_contents($fakeFfmpeg, <<<'SH'
+#!/bin/sh
+if [ "$1" = "-version" ]; then
+  echo "ffmpeg test double"
+  exit 0
+fi
+input=""
+output=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-i" ]; then
+    input="$arg"
+  fi
+  prev="$arg"
+  output="$arg"
+done
+cp "$input" "$output"
+rm -f "$input"
+SH
+        );
+        @chmod($fakeFfmpeg, 0755);
+        config()->set('cdn.ffmpeg_binary', $fakeFfmpeg);
+
+        $fakeFfprobe = storage_path('framework/testing/fake-ffprobe-missing-input.sh');
+        file_put_contents($fakeFfprobe, <<<'SH'
+#!/bin/sh
+if [ "$1" = "-version" ]; then
+  echo "ffprobe test double"
+  exit 0
+fi
+cat <<'JSON'
+{"streams":[{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p","width":1280,"height":720},{"codec_type":"audio","codec_name":"aac","channels":2}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"60.0","size":"16"}}
+JSON
+SH
+        );
+        @chmod($fakeFfprobe, 0755);
+        config()->set('cdn.ffprobe_binary', $fakeFfprobe);
+
+        $asset = MediaAsset::query()->create([
+            'type' => 'movie',
+            'title' => 'Missing Original Recovery',
+            'status' => 'ready',
+            'visibility' => 'public',
+        ]);
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'remote_fetch',
+            'storage_disk' => 'public',
+            'storage_path' => 'media/'.$asset->id.'/124/input.mov',
+            'mime_type' => 'video/quicktime',
+            'file_size_bytes' => 16,
+            'status' => 'ready',
+            'is_active' => true,
+            'compress_enabled' => false,
+        ]);
+        Storage::disk('public')->put((string) $source->storage_path, 'xxxxmoovxxxxmdat');
+
+        (new OptimizeMp4FaststartJob($source->id))->handle();
+        $source->refresh();
+
+        $this->assertSame('ready', $source->optimize_status, (string) $source->optimize_error);
+        $this->assertTrue((bool) $source->is_faststart);
+        $this->assertSame($source->optimized_path, $source->storage_path);
+        Storage::disk('public')->assertExists((string) $source->optimized_path);
+        $this->assertTrue((bool) data_get($source->source_metadata, 'processing_result.original_missing_after_processing'));
+    }
+
     public function test_nbx_contabo_manifest_does_not_check_missing_local_hls_path_or_return_local_urls(): void
     {
         config()->set('app.url', 'https://nbx.naraboxtv.com');
