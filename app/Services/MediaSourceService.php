@@ -36,12 +36,21 @@ class MediaSourceService
         $artifacts = is_array($nbx['final_artifacts'] ?? null) ? $nbx['final_artifacts'] : [];
         $originalArtifact = is_array($artifacts['original'] ?? null) ? $artifacts['original'] : [];
         $faststartArtifact = is_array($artifacts['faststart'] ?? null) ? $artifacts['faststart'] : [];
+        $inferredFaststartPath = $this->inferredFaststartPath($source->storage_path);
 
         $candidates = [
             [
                 'disk' => $source->original_storage_path ? $disk : null,
                 'key' => $source->original_storage_path,
                 'label' => 'original_storage_path',
+            ],
+            [
+                // Older workers could finish and verify this deterministic
+                // output, then crash while reading the vanished input size
+                // before optimized_path was persisted.
+                'disk' => $inferredFaststartPath ? $disk : null,
+                'key' => $inferredFaststartPath,
+                'label' => 'inferred_orphan_faststart',
             ],
             [
                 'disk' => ($faststartArtifact['verified'] ?? false) ? ($faststartArtifact['disk'] ?? null) : null,
@@ -171,6 +180,20 @@ class MediaSourceService
         }
 
         return null;
+    }
+
+    private function inferredFaststartPath(?string $storagePath): ?string
+    {
+        if (! is_string($storagePath) || trim($storagePath) === '') {
+            return null;
+        }
+
+        $baseName = (string) pathinfo($storagePath, PATHINFO_FILENAME);
+        $normalized = preg_replace('/_play$/', '', $baseName) ?: $baseName;
+        $directory = trim((string) dirname($storagePath), '.');
+        $candidate = ltrim($directory.'/'.$normalized.'_play.mp4', '/');
+
+        return $candidate !== $storagePath ? $candidate : null;
     }
 
     public function buildPublicUrl(MediaSource $source): ?string

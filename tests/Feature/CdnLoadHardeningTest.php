@@ -324,6 +324,42 @@ SH
         $this->assertTrue((bool) data_get($source->source_metadata, 'processing_result.original_missing_after_processing'));
     }
 
+    public function test_failed_legacy_job_recovers_an_orphaned_deterministic_faststart_output(): void
+    {
+        config()->set('cdn.disk', 'public');
+        config()->set('nbx.work_storage', 'public');
+
+        $asset = MediaAsset::query()->create([
+            'type' => 'movie',
+            'title' => 'Orphaned Faststart Recovery',
+            'status' => 'ready',
+            'visibility' => 'public',
+        ]);
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'remote_fetch',
+            'storage_disk' => 'public',
+            'storage_path' => 'media/'.$asset->id.'/124/weekend.mov',
+            'mime_type' => 'video/quicktime',
+            'status' => 'ready',
+            'optimize_status' => 'failed',
+            'optimize_error' => 'Optimization worker stopped: filesize(): stat failed',
+            'is_active' => true,
+        ]);
+        $orphanedOutput = 'media/'.$asset->id.'/124/weekend_play.mp4';
+        Storage::disk('public')->put($orphanedOutput, 'verified-output-bytes');
+
+        $restored = app(MediaSourceService::class)->ensureLocalWorkFileForProcessing($source);
+
+        $this->assertNotNull($restored);
+        $this->assertStringContainsString('/restored/', (string) $restored->storage_path);
+        Storage::disk('public')->assertExists((string) $restored->storage_path);
+        $this->assertSame(
+            'inferred_orphan_faststart',
+            data_get($restored->source_metadata, 'nbx.restored_work_file.from'),
+        );
+    }
+
     public function test_nbx_contabo_manifest_does_not_check_missing_local_hls_path_or_return_local_urls(): void
     {
         config()->set('app.url', 'https://nbx.naraboxtv.com');
