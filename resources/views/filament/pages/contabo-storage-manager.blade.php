@@ -2,22 +2,87 @@
     <div class="space-y-6">
         @if ($loadError)
             <div role="alert" class="rounded-xl bg-danger-50 p-5 text-danger-800 ring-1 ring-danger-600/20 dark:bg-danger-950/40 dark:text-danger-200 dark:ring-danger-500/30">
-                <h2 class="font-semibold">Contabo storage is unavailable</h2>
+                <h2 class="font-semibold">Storage inventory needs attention</h2>
                 <p class="mt-1 text-sm">{{ $loadError }}</p>
-                <p class="mt-2 text-xs opacity-80">
-                    Configure the S3 key pair (or Contabo API fallback), set <code>AWS_EC2_METADATA_DISABLED=true</code>, then run <code>php artisan optimize:clear</code>.
-                </p>
             </div>
         @endif
+
+        <div class="grid gap-4 sm:grid-cols-2 xl:grid-cols-6">
+            @foreach ([
+                ['Stored objects', $summary['objects'] ?? 0],
+                ['Logical packages', $summary['packages'] ?? 0],
+                ['Accounted storage', number_format(($summary['bytes'] ?? 0) / 1073741824, 2).' GB'],
+                ['HLS packages', number_format(($summary['hls_bytes'] ?? 0) / 1073741824, 2).' GB · '.number_format($summary['hls_objects'] ?? 0).' objects'],
+                ['Duplicate signatures', number_format($summary['duplicate_candidates'] ?? 0).' candidates · '.number_format(($summary['verified_redundant_bytes'] ?? 0) / 1073741824, 3).' GB byte-verified redundancy'],
+                ['Approved reclaim', number_format(($summary['approved_reclaim_bytes'] ?? 0) / 1073741824, 3).' GB safe after review'],
+            ] as [$label, $value])
+                <div class="rounded-xl bg-white p-5 shadow-sm ring-1 ring-gray-950/5 dark:bg-gray-900 dark:ring-white/10">
+                    <div class="text-xs font-medium uppercase tracking-wide text-gray-500">{{ $label }}</div>
+                    <div class="mt-2 text-2xl font-semibold text-gray-950 dark:text-white">{{ $value }}</div>
+                </div>
+            @endforeach
+        </div>
+
+        <div class="rounded-xl bg-white p-5 shadow-sm ring-1 ring-gray-950/5 dark:bg-gray-900 dark:ring-white/10">
+            <div class="flex flex-wrap items-start justify-between gap-4">
+                <div>
+                    <h2 class="font-semibold text-gray-950 dark:text-white">Read-only bucket inventory</h2>
+                    @if ($latestRun)
+                        <p class="mt-1 text-sm text-gray-600 dark:text-gray-300">
+                            Run #{{ $latestRun['id'] }} · {{ str_replace('_', ' ', $latestRun['status']) }}
+                            · prefix {{ $latestRun['prefix'] ?: 'bucket root' }}
+                            · {{ number_format($latestRun['object_count']) }} objects
+                            · {{ number_format($latestRun['total_bytes'] / 1073741824, 2) }} GB
+                            · {{ number_format($latestRun['pages_scanned']) }} S3 pages
+                        </p>
+                        @if ($latestRun['failure_reason'])
+                            <p class="mt-1 text-sm text-danger-600">{{ $latestRun['failure_reason'] }}</p>
+                        @endif
+                    @else
+                        <p class="mt-1 text-sm text-gray-500">No complete inventory exists yet.</p>
+                    @endif
+                </div>
+                <x-filament::button
+                    wire:click="startInventory"
+                    wire:loading.attr="disabled"
+                    wire:target="startInventory"
+                    wire:confirm="Start a read-only Contabo inventory? This lists and indexes metadata; it does not modify or delete objects."
+                >
+                    <span wire:loading.remove wire:target="startInventory">Scan bucket</span>
+                    <span wire:loading wire:target="startInventory">Queuing…</span>
+                </x-filament::button>
+            </div>
+            <p class="mt-3 text-xs text-gray-500">
+                “Unresolved” means no authoritative link has been found. It does not mean orphaned. HLS segments are counted for billing but grouped below as one media package.
+            </p>
+        </div>
+
+        <div class="grid gap-4 xl:grid-cols-3">
+            @foreach (['role' => 'Storage by media role', 'layout' => 'Storage by key layout', 'lifecycle' => 'Storage by lifecycle'] as $breakdownKey => $heading)
+                <div class="rounded-xl bg-white p-5 shadow-sm ring-1 ring-gray-950/5 dark:bg-gray-900 dark:ring-white/10">
+                    <h2 class="font-semibold text-gray-950 dark:text-white">{{ $heading }}</h2>
+                    <div class="mt-3 space-y-2">
+                        @forelse ($breakdowns[$breakdownKey] ?? [] as $row)
+                            <div class="flex items-center justify-between gap-3 border-b border-gray-100 py-2 text-xs last:border-0 dark:border-gray-800">
+                                <span>{{ str_replace('_', ' ', $row['label']) }} <span class="text-gray-400">({{ number_format($row['objects']) }})</span></span>
+                                <span class="font-medium">{{ number_format($row['bytes'] / 1073741824, 3) }} GB</span>
+                            </div>
+                        @empty
+                            <p class="text-sm text-gray-500">Run an inventory to calculate this breakdown.</p>
+                        @endforelse
+                    </div>
+                </div>
+            @endforeach
+        </div>
 
         <div class="rounded-xl bg-white p-5 shadow-sm ring-1 ring-gray-950/5 dark:bg-gray-900 dark:ring-white/10">
             <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
                 <label class="text-sm font-medium text-gray-950 dark:text-white">
                     Prefix
-                    <input wire:model="prefix" type="text" class="mt-1 block w-full rounded-lg border-gray-300 bg-white text-sm dark:border-gray-700 dark:bg-gray-950" />
+                    <input wire:model="prefix" type="text" placeholder="Root, media/, videos/…" class="mt-1 block w-full rounded-lg border-gray-300 bg-white text-sm dark:border-gray-700 dark:bg-gray-950" />
                 </label>
                 <label class="text-sm font-medium text-gray-950 dark:text-white">
-                    Filename
+                    Object or package
                     <input wire:model="search" type="search" class="mt-1 block w-full rounded-lg border-gray-300 bg-white text-sm dark:border-gray-700 dark:bg-gray-950" />
                 </label>
                 <label class="text-sm font-medium text-gray-950 dark:text-white">
@@ -26,9 +91,7 @@
                         <option value="all">All roles</option>
                         <option value="source_original">Original</option>
                         <option value="faststart_mp4">Fast Start MP4</option>
-                        <option value="hls_master">HLS master</option>
-                        <option value="hls_variant">HLS variant</option>
-                        <option value="hls_segment">HLS segment</option>
+                        <option value="hls_package">Any HLS package/object</option>
                         <option value="subtitle">Subtitle</option>
                         <option value="thumbnail">Thumbnail</option>
                         <option value="temporary">Temporary</option>
@@ -45,22 +108,22 @@
                     </select>
                 </label>
                 <label class="text-sm font-medium text-gray-950 dark:text-white">
-                    Association
+                    Lifecycle
                     <select wire:model="association" class="mt-1 block w-full rounded-lg border-gray-300 bg-white text-sm dark:border-gray-700 dark:bg-gray-950">
-                        <option value="all">All objects</option>
-                        <option value="portal">Portal-linked</option>
-                        <option value="nbx">NBX-linked</option>
-                        <option value="orphan">Orphan candidates</option>
+                        <option value="all">All packages</option>
+                        <option value="managed">NBX managed</option>
+                        <option value="portal">Portal-linked/candidate</option>
+                        <option value="processing">Active processing</option>
+                        <option value="failed_residue">Failed residue candidates</option>
+                        <option value="duplicates">Duplicate signature candidates</option>
+                        <option value="unresolved">Unresolved</option>
                     </select>
                 </label>
             </div>
             <div class="mt-4 flex flex-wrap gap-3">
-                <x-filament::button wire:click="applyFilters">Apply filters</x-filament::button>
-                <x-filament::button wire:click="refreshObjects" color="gray">Refresh</x-filament::button>
+                <x-filament::button wire:click="applyFilters" wire:loading.attr="disabled" wire:target="applyFilters">Apply filters</x-filament::button>
+                <x-filament::button wire:click="refreshObjects" color="gray">Refresh status</x-filament::button>
             </div>
-            <p class="mt-3 text-xs text-gray-500">
-                Results are cursor-paginated directly from Contabo. Deletions are blocked while processing or when a verified replacement is required.
-            </p>
         </div>
 
         <div class="overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-gray-950/5 dark:bg-gray-900 dark:ring-white/10">
@@ -68,74 +131,79 @@
                 <table class="min-w-full divide-y divide-gray-200 text-sm dark:divide-gray-700">
                     <thead class="bg-gray-50 dark:bg-gray-800">
                         <tr>
-                            <th class="px-4 py-3 text-left">Object</th>
-                            <th class="px-4 py-3 text-left">Role</th>
+                            <th class="px-4 py-3 text-left">Logical package</th>
+                            <th class="px-4 py-3 text-left">Contents</th>
                             <th class="px-4 py-3 text-left">Size</th>
-                            <th class="px-4 py-3 text-left">Associations</th>
-                            <th class="px-4 py-3 text-left">Modified</th>
+                            <th class="px-4 py-3 text-left">Ownership</th>
+                            <th class="px-4 py-3 text-left">Lifecycle</th>
                             <th class="px-4 py-3 text-right">Action</th>
                         </tr>
                     </thead>
                     <tbody class="divide-y divide-gray-100 dark:divide-gray-800">
                         @forelse ($objects as $object)
-                            <tr wire:key="storage-object-{{ sha1($object['key']) }}">
-                                <td class="max-w-xl px-4 py-3">
-                                    <div class="font-medium text-gray-950 dark:text-white">{{ $object['filename'] }}</div>
-                                    <div class="break-all text-xs text-gray-500">{{ $object['key'] }}</div>
+                            <tr wire:key="storage-package-{{ sha1($object['logical_asset_key']) }}">
+                                <td class="max-w-md px-4 py-3">
+                                    <div class="break-all font-medium text-gray-950 dark:text-white">{{ $object['logical_asset_key'] }}</div>
+                                    <div class="mt-1 text-xs text-gray-500">{{ str_replace('_', ' ', $object['storage_layout']) }} · {{ $object['last_modified'] ?: 'unknown date' }}</div>
                                 </td>
-                                <td class="whitespace-nowrap px-4 py-3">{{ str_replace('_', ' ', $object['media_role']) }}</td>
-                                <td class="whitespace-nowrap px-4 py-3">{{ number_format($object['size'] / 1048576, 2) }} MB</td>
                                 <td class="px-4 py-3 text-xs">
-                                    @if ($object['orphaned'])
-                                        <span class="font-semibold text-danger-600">Orphan candidate</span>
-                                    @else
-                                        <div>Portal: {{ implode(', ', $object['associated_portal_source_ids']) ?: '—' }}</div>
-                                        <div>NBX source: {{ implode(', ', $object['associated_media_source_ids']) ?: '—' }}</div>
-                                        <div>Job: {{ implode(', ', $object['processing_jobs']) ?: '—' }}</div>
+                                    <div>{{ number_format($object['object_count']) }} object(s)</div>
+                                    @if ($object['hls_object_count'])
+                                        <div>{{ number_format($object['hls_object_count']) }} HLS manifest/segment object(s)</div>
                                     @endif
+                                    <div class="mt-1 text-gray-500">{{ implode(', ', array_map(fn ($role) => str_replace('_', ' ', $role), $object['media_roles'])) }}</div>
                                 </td>
-                                <td class="whitespace-nowrap px-4 py-3 text-xs">{{ $object['last_modified'] ?: '—' }}</td>
+                                <td class="whitespace-nowrap px-4 py-3">{{ number_format($object['size_bytes'] / 1073741824, 3) }} GB</td>
+                                <td class="px-4 py-3 text-xs">
+                                    <div>NBX asset: {{ $object['media_asset_id'] ?: '—' }}</div>
+                                    <div>NBX source: {{ $object['media_source_id'] ?: '—' }}</div>
+                                    <div>Portal: {{ $object['portal_sourceable_id'] ?: '—' }}</div>
+                                </td>
+                                <td class="px-4 py-3 text-xs">
+                                    <span class="font-semibold {{ in_array($object['classification'], ['unresolved', 'nbx_unresolved']) ? 'text-warning-600' : ($object['classification'] === 'failed_residue_candidate' ? 'text-danger-600' : 'text-success-600') }}">
+                                        {{ str_replace('_', ' ', $object['classification']) }}
+                                    </span>
+                                    <div class="text-gray-500">{{ $object['confidence'] }} confidence</div>
+                                </td>
                                 <td class="whitespace-nowrap px-4 py-3 text-right">
                                     <x-filament::button
                                         size="sm"
-                                        color="danger"
-                                        wire:click="deleteObject(@js($object['key']))"
-                                        wire:confirm="Delete {{ $object['filename'] }}? NBX will verify replacements, reconcile Portal, disable downloads when this is the Fast Start MP4, and audit the action."
+                                        color="gray"
+                                        wire:click="requestCleanupReview(@js($object['logical_asset_key']))"
+                                        wire:loading.attr="disabled"
+                                        wire:target="requestCleanupReview"
+                                        wire:confirm="Create a cleanup review plan for this entire package? No object will be deleted."
                                     >
-                                        Delete safely
+                                        Review cleanup
                                     </x-filament::button>
                                 </td>
                             </tr>
                         @empty
                             <tr>
-                                <td colspan="6" class="px-4 py-10 text-center text-gray-500">No objects matched this page and filter.</td>
+                                <td colspan="6" class="px-4 py-10 text-center text-gray-500">No indexed packages matched these filters.</td>
                             </tr>
                         @endforelse
                     </tbody>
                 </table>
             </div>
             <div class="flex items-center justify-between border-t border-gray-200 px-4 py-3 dark:border-gray-700">
-                <x-filament::button wire:click="previousPage" color="gray" :disabled="empty($cursorHistory)">Previous</x-filament::button>
-                <span class="text-xs text-gray-500">{{ count($objects) }} objects on this page</span>
-                <x-filament::button wire:click="nextPage" color="gray" :disabled="!$nextCursor">Next</x-filament::button>
+                <x-filament::button wire:click="previousPage" color="gray" :disabled="$page <= 1">Previous</x-filament::button>
+                <span class="text-xs text-gray-500">Page {{ $page }} of {{ $totalPages }} · {{ number_format($totalGroups) }} packages</span>
+                <x-filament::button wire:click="nextPage" color="gray" :disabled="$page >= $totalPages">Next</x-filament::button>
             </div>
         </div>
 
         <div class="rounded-xl bg-white p-5 shadow-sm ring-1 ring-gray-950/5 dark:bg-gray-900 dark:ring-white/10">
-            <h2 class="text-base font-semibold text-gray-950 dark:text-white">Recent storage actions</h2>
+            <h2 class="text-base font-semibold text-gray-950 dark:text-white">Cleanup review plans</h2>
+            <p class="mt-1 text-xs text-gray-500">Creating a plan never deletes data. Execution is intentionally unavailable until associations and replacements have been reviewed.</p>
             <div class="mt-3 space-y-2 text-sm">
-                @forelse ($audits as $audit)
+                @forelse ($plans as $plan)
                     <div class="flex flex-wrap items-center justify-between gap-2 border-b border-gray-100 py-2 last:border-0 dark:border-gray-800">
-                        <span>{{ str_replace('_', ' ', $audit['action']) }} · {{ $audit['status'] }}</span>
-                        <span class="text-xs text-gray-500">
-                            {{ number_format(($audit['bytes_freed'] ?? 0) / 1048576, 2) }} MB
-                            @if ($audit['failure_reason'])
-                                · {{ $audit['failure_reason'] }}
-                            @endif
-                        </span>
+                        <a href="{{ $plan['url'] }}" class="font-medium text-primary-600 hover:underline">#{{ $plan['id'] }} · {{ $plan['logical_asset_key'] }} · {{ $plan['status'] }} · {{ $plan['risk_level'] }} risk</a>
+                        <span class="text-xs text-gray-500">{{ number_format($plan['object_count']) }} objects · {{ number_format($plan['total_bytes'] / 1073741824, 3) }} GB · review after {{ $plan['grace_expires_at'] }}</span>
                     </div>
                 @empty
-                    <p class="text-gray-500">No storage actions have been recorded.</p>
+                    <p class="text-gray-500">No cleanup reviews have been created.</p>
                 @endforelse
             </div>
         </div>

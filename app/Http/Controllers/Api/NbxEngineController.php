@@ -10,9 +10,9 @@ use App\Services\NbxEngineService;
 use App\Support\SafeRemoteMediaUrl;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
-use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 
@@ -539,7 +539,15 @@ class NbxEngineController extends Controller
         MediaSourceService $mediaSourceService
     ): JsonResponse {
         $validated = $request->validate([
-            'operation' => ['required', Rule::in(['retry', 'reprocess', 'generate_faststart', 'compress', 'generate_hls'])],
+            'operation' => ['required', Rule::in([
+                'retry',
+                'retry_storage',
+                'retry_portal_sync',
+                'reprocess',
+                'generate_faststart',
+                'compress',
+                'generate_hls',
+            ])],
             'idempotency_key' => ['nullable', 'string', 'max:128'],
             'compress_enabled' => ['nullable', 'boolean'],
             'faststart' => ['nullable', 'boolean'],
@@ -590,6 +598,7 @@ class NbxEngineController extends Controller
         $validated = $request->validate([
             'job_id' => ['nullable', 'string', 'max:100'],
             'source_id' => ['nullable', 'integer', 'min:1'],
+            'asset_id' => ['nullable', 'uuid'],
             'source_url' => ['nullable', 'string', 'max:4096'],
             'video_ref_type' => ['nullable', 'string', 'max:100'],
             'video_ref_id' => ['nullable', 'string', 'max:100'],

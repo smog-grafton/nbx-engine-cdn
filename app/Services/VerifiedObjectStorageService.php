@@ -28,75 +28,67 @@ class VerifiedObjectStorageService
      */
     public function copy(string $sourceDisk, string $sourcePath, string $targetDisk, string $targetPath): array
     {
-        $expectedBytes = (int) Storage::disk($sourceDisk)->size($sourcePath);
-        if ($expectedBytes <= 0) {
-            throw new \RuntimeException("Source artifact {$sourcePath} is empty.");
-        }
+        $sourceStream = $this->openStableSourceStream($sourceDisk, $sourcePath);
 
-        $contentType = $this->contentType($targetPath);
-        $existing = $this->head($targetDisk, $targetPath);
-        if (($existing['bytes'] ?? 0) === $expectedBytes) {
-            return [
-                'bytes' => $expectedBytes,
-                'content_type' => $contentType,
-                'etag' => $existing['etag'] ?? null,
-                'multipart' => (bool) ($existing['multipart'] ?? false),
-            ];
-        }
-
-        $multipartThreshold = max(
-            5 * 1024 * 1024,
-            (int) config('nbx.multipart_threshold_mb', 64) * 1024 * 1024,
-        );
-
-        if ($expectedBytes >= $multipartThreshold
-            && $this->isLocalDisk($sourceDisk)
-            && $this->isS3Disk($targetDisk)
-        ) {
-            $this->multipartUpload(
-                Storage::disk($sourceDisk)->path($sourcePath),
-                $targetDisk,
-                $targetPath,
-                $contentType,
-            );
-            $multipart = true;
-        } else {
-            $stream = Storage::disk($sourceDisk)->readStream($sourcePath);
-            if (! is_resource($stream)) {
-                throw new \RuntimeException("Could not open {$sourcePath} from {$sourceDisk}.");
+        try {
+            $stat = fstat($sourceStream);
+            $expectedBytes = is_array($stat) ? (int) ($stat['size'] ?? 0) : 0;
+            if ($expectedBytes <= 0) {
+                throw new \RuntimeException("Source artifact {$sourcePath} is empty.");
             }
 
-            try {
-                $stored = Storage::disk($targetDisk)->put($targetPath, $stream, [
+            $contentType = $this->contentType($targetPath);
+            $existing = $this->head($targetDisk, $targetPath);
+            if (($existing['bytes'] ?? 0) === $expectedBytes) {
+                return [
+                    'bytes' => $expectedBytes,
+                    'content_type' => $contentType,
+                    'etag' => $existing['etag'] ?? null,
+                    'multipart' => (bool) ($existing['multipart'] ?? false),
+                ];
+            }
+
+            $multipartThreshold = max(
+                5 * 1024 * 1024,
+                (int) config('nbx.multipart_threshold_mb', 64) * 1024 * 1024,
+            );
+
+            if ($expectedBytes >= $multipartThreshold && $this->isS3Disk($targetDisk)) {
+                rewind($sourceStream);
+                $this->multipartUpload($sourceStream, $targetDisk, $targetPath, $contentType);
+                $multipart = true;
+            } else {
+                rewind($sourceStream);
+                $stored = Storage::disk($targetDisk)->put($targetPath, $sourceStream, [
                     'visibility' => 'public',
                     'ContentType' => $contentType,
                 ]);
-            } finally {
-                fclose($stream);
+
+                if (! $stored) {
+                    throw new \RuntimeException("Could not store {$targetPath} on {$targetDisk}.");
+                }
+                $multipart = false;
             }
 
-            if (! $stored) {
-                throw new \RuntimeException("Could not store {$targetPath} on {$targetDisk}.");
+            $verified = $this->head($targetDisk, $targetPath);
+            if (($verified['bytes'] ?? 0) !== $expectedBytes) {
+                throw new \RuntimeException(sprintf(
+                    'Stored object verification failed for %s: expected %d bytes, found %d.',
+                    $targetPath,
+                    $expectedBytes,
+                    (int) ($verified['bytes'] ?? 0),
+                ));
             }
-            $multipart = false;
-        }
 
-        $verified = $this->head($targetDisk, $targetPath);
-        if (($verified['bytes'] ?? 0) !== $expectedBytes) {
-            throw new \RuntimeException(sprintf(
-                'Stored object verification failed for %s: expected %d bytes, found %d.',
-                $targetPath,
-                $expectedBytes,
-                (int) ($verified['bytes'] ?? 0),
-            ));
+            return [
+                'bytes' => $expectedBytes,
+                'content_type' => $contentType,
+                'etag' => $verified['etag'] ?? null,
+                'multipart' => $multipart,
+            ];
+        } finally {
+            fclose($sourceStream);
         }
-
-        return [
-            'bytes' => $expectedBytes,
-            'content_type' => $contentType,
-            'etag' => $verified['etag'] ?? null,
-            'multipart' => $multipart,
-        ];
     }
 
     /**
@@ -131,7 +123,10 @@ class VerifiedObjectStorageService
         }
     }
 
-    private function multipartUpload(string $absoluteSource, string $targetDisk, string $targetPath, string $contentType): void
+    /**
+     * @param  resource  $sourceStream
+     */
+    private function multipartUpload($sourceStream, string $targetDisk, string $targetPath, string $contentType): void
     {
         $client = Storage::disk($targetDisk)->getClient();
         $bucket = (string) config("filesystems.disks.{$targetDisk}.bucket");
@@ -141,7 +136,7 @@ class VerifiedObjectStorageService
         );
 
         try {
-            (new MultipartUploader($client, $absoluteSource, [
+            (new MultipartUploader($client, $sourceStream, [
                 'bucket' => $bucket,
                 'key' => $targetPath,
                 'part_size' => $partSize,
@@ -167,6 +162,28 @@ class VerifiedObjectStorageService
 
             throw $exception;
         }
+    }
+
+    /**
+     * Keep one file descriptor alive for the complete upload. On Unix the
+     * descriptor remains readable even if a legacy cleanup unlinks the path,
+     * eliminating the exists()/fopen() race seen on large multipart uploads.
+     *
+     * @return resource
+     */
+    private function openStableSourceStream(string $sourceDisk, string $sourcePath)
+    {
+        $stream = $this->isLocalDisk($sourceDisk)
+            ? @fopen(Storage::disk($sourceDisk)->path($sourcePath), 'rb')
+            : Storage::disk($sourceDisk)->readStream($sourcePath);
+
+        if (! is_resource($stream)) {
+            throw new \RuntimeException(
+                "Expected output artifact {$sourcePath} is missing or unreadable; final storage upload was not started."
+            );
+        }
+
+        return $stream;
     }
 
     private function isLocalDisk(string $disk): bool

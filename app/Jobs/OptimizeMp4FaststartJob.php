@@ -177,7 +177,7 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
                 $absoluteInput,
                 $absoluteOutput,
                 $source,
-                $maxHeight,
+                $needsDownscale ? $maxHeight : 0,
                 $duration,
             );
         }
@@ -396,9 +396,11 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             '-i',
             $absoluteInput,
             '-map',
-            '0:v:0',
+            '0:V:0',
             '-map',
-            '0:a?',
+            '0:a:0?',
+            '-sn',
+            '-dn',
             '-c:v',
             'copy',
             '-c:a',
@@ -435,9 +437,11 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             '-i',
             $absoluteInput,
             '-map',
-            '0:v:0',
+            '0:V:0',
             '-map',
-            '0:a?',
+            '0:a:0?',
+            '-sn',
+            '-dn',
             '-c:v',
             'copy',
             '-c:a',
@@ -485,9 +489,11 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             '-i',
             $absoluteInput,
             '-map',
-            '0:v:0',
+            '0:V:0',
             '-map',
-            '0:a?',
+            '0:a:0?',
+            '-sn',
+            '-dn',
             '-c:v',
             $videoCodec,
             '-preset',
@@ -510,10 +516,15 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             $parts[] = (string) $threads;
         }
 
-        if ($maxHeight > 0) {
-            $parts[] = '-vf';
-            $parts[] = "scale=-2:min({$maxHeight}\\,ih):force_original_aspect_ratio=decrease";
-        }
+        // libx264 with yuv420p requires even dimensions. The previous height-
+        // only condition left odd source dimensions untouched, producing
+        // "Error while opening encoder for output stream 0:0".
+        $parts[] = '-vf';
+        $parts[] = $maxHeight > 0
+            ? "scale={$maxHeight}:{$maxHeight}:force_original_aspect_ratio=decrease:force_divisible_by=2"
+            : 'scale=trunc(iw/2)*2:trunc(ih/2)*2';
+        $parts[] = '-max_muxing_queue_size';
+        $parts[] = '4096';
 
         $parts[] = $absoluteOutput;
 

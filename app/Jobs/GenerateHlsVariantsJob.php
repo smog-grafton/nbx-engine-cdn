@@ -3,10 +3,10 @@
 namespace App\Jobs;
 
 use App\Models\MediaSource;
-use App\Services\MediaBinaryDetector;
 use App\Services\FfmpegProcessRunner;
-use App\Services\NbxEngineService;
+use App\Services\MediaBinaryDetector;
 use App\Services\MediaSourceService;
+use App\Services\NbxEngineService;
 use App\Services\VideoProbeService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
@@ -19,7 +19,7 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Throwable;
 
-class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
+class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
 {
     use Dispatchable;
     use InteractsWithQueue;
@@ -40,13 +40,13 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
 
     public function uniqueId(): string
     {
-        return 'optimization:hls:' . $this->sourceId . ':' . ($this->attemptId ?: 'legacy');
+        return 'optimization:hls:'.$this->sourceId.':'.($this->attemptId ?: 'legacy');
     }
 
     public function middleware(): array
     {
         $locks = [
-            (new WithoutOverlapping('optimization:source:' . $this->sourceId))
+            (new WithoutOverlapping('optimization:source:'.$this->sourceId))
                 ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 25200)))
                 ->dontRelease(),
         ];
@@ -90,6 +90,7 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
                 'hls_enabled' => false,
                 'reason' => 'HLS generation is disabled.',
             ]);
+
             return;
         }
 
@@ -107,6 +108,7 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
             app(\App\Services\NbxWebhookDispatcher::class)->dispatch($source, 'job.partially_completed', [
                 'reason' => 'HLS generation skipped because input file is missing.',
             ]);
+
             return;
         }
 
@@ -122,6 +124,7 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
             app(\App\Services\NbxWebhookDispatcher::class)->dispatch($source, 'job.partially_completed', [
                 'reason' => 'HLS generation failed: FFmpeg binary not found.',
             ]);
+
             return;
         }
 
@@ -147,11 +150,13 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
 
             if ($height === 1080 && ! (bool) config('nbx.allow_1080p', false)) {
                 $skipped[$label] = '1080p is disabled by NBX_ALLOW_1080P.';
+
                 return false;
             }
 
             if (is_int($sourceHeight) && $sourceHeight > 0 && $height > $sourceHeight) {
                 $skipped[$label] = "Source height {$sourceHeight}p is below requested {$height}p; no upscaling.";
+
                 return false;
             }
 
@@ -172,6 +177,7 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
             app(\App\Services\NbxWebhookDispatcher::class)->dispatch($source, 'job.partially_completed', [
                 'reason' => $skipped !== [] ? 'All requested HLS profiles were skipped.' : 'No HLS profiles were requested.',
             ]);
+
             return;
         }
 
@@ -189,7 +195,7 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
 
             $label = (string) $profile['label'];
             $height = (int) $profile['height'];
-            app(NbxEngineService::class)->markNbxStatus($source->fresh() ?? $source, 'encoding_' . $label);
+            app(NbxEngineService::class)->markNbxStatus($source->fresh() ?? $source, 'encoding_'.$label);
             $source->update([
                 'processing_stage' => 'hls_'.$label,
                 'processing_stage_progress' => 0,
@@ -198,12 +204,12 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
                 'last_progress_at' => now(),
             ]);
 
-            $variantPath = $hlsBasePath . '/' . $label;
-            $variantAbsolute = $hlsBaseAbsolute . '/' . $label;
+            $variantPath = $hlsBasePath.'/'.$label;
+            $variantAbsolute = $hlsBaseAbsolute.'/'.$label;
             Storage::disk($disk)->makeDirectory($variantPath);
 
-            $playlistAbsolute = $variantAbsolute . '/index.m3u8';
-            $segmentPattern = $variantAbsolute . '/seg_%05d.ts';
+            $playlistAbsolute = $variantAbsolute.'/index.m3u8';
+            $segmentPattern = $variantAbsolute.'/seg_%05d.ts';
 
             [$exitCode, $error] = $this->runHlsTranscode(
                 $ffmpeg,
@@ -225,6 +231,7 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
                     'source_height' => $sourceHeight,
                     'error' => $error,
                 ]);
+
                 continue;
             }
 
@@ -234,7 +241,7 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
                 'height' => $height,
                 'width' => null,
                 'bandwidth' => (int) $profile['bitrate'],
-                'path' => $variantPath . '/index.m3u8',
+                'path' => $variantPath.'/index.m3u8',
             ];
         }
 
@@ -252,12 +259,13 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
             app(\App\Services\NbxWebhookDispatcher::class)->dispatch($source, 'job.partially_completed', [
                 'reason' => 'HLS generation failed for all requested profiles.',
             ]);
+
             return;
         }
 
         usort($generated, fn (array $a, array $b): int => (int) $b['height'] <=> (int) $a['height']);
 
-        $masterPath = $hlsBasePath . '/master.m3u8';
+        $masterPath = $hlsBasePath.'/master.m3u8';
         $masterAbsolute = Storage::disk($disk)->path($masterPath);
         $masterLines = ['#EXTM3U', '#EXT-X-VERSION:3'];
         foreach ($generated as $variant) {
@@ -267,10 +275,10 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
                 (int) round((16 / 9) * (int) $variant['height']),
                 (int) $variant['height']
             );
-            $masterLines[] = basename(dirname((string) $variant['path'])) . '/index.m3u8';
+            $masterLines[] = basename(dirname((string) $variant['path'])).'/index.m3u8';
         }
 
-        @file_put_contents($masterAbsolute, implode("\n", $masterLines) . "\n");
+        @file_put_contents($masterAbsolute, implode("\n", $masterLines)."\n");
         if (! is_file($masterAbsolute)) {
             $source->update([
                 'optimize_status' => 'ready',
@@ -283,6 +291,7 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
             app(\App\Services\NbxWebhookDispatcher::class)->dispatch($source, 'job.partially_completed', [
                 'reason' => 'HLS master playlist generation failed.',
             ]);
+
             return;
         }
 
@@ -322,7 +331,7 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
         if ($requested === []) {
             foreach ((array) config('cdn.hls_profiles', ['480']) as $profile) {
                 $key = strtolower(trim((string) $profile));
-                $requested[str_ends_with($key, 'p') ? $key : ($key . 'p')] = true;
+                $requested[str_ends_with($key, 'p') ? $key : ($key.'p')] = true;
             }
         }
 
@@ -344,7 +353,7 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
     }
 
     /**
-     * @param array{label:string,height:int,bitrate:int,maxrate:string,bufsize:string,audio_bitrate:string,crf:int} $profile
+     * @param  array{label:string,height:int,bitrate:int,maxrate:string,bufsize:string,audio_bitrate:string,crf:int}  $profile
      * @return array{0:int,1:string}
      */
     private function runHlsTranscode(
@@ -372,11 +381,13 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
             '-i',
             $inputAbsolute,
             '-map',
-            '0:v:0',
+            '0:V:0',
             '-map',
             '0:a:0?',
+            '-sn',
+            '-dn',
             '-vf',
-            "scale=-2:{$height}:force_original_aspect_ratio=decrease",
+            "scale=-2:{$height}:force_original_aspect_ratio=decrease:force_divisible_by=2",
             '-c:v',
             'libx264',
             '-preset',
@@ -450,7 +461,7 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
     }
 
     /**
-     * @param array<string, string> $skipped
+     * @param  array<string, string>  $skipped
      */
     private function storeSkipped(MediaSource $source, array $skipped): void
     {
@@ -497,7 +508,7 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
     }
 
     /**
-     * @param array<string, string> $skipped
+     * @param  array<string, string>  $skipped
      */
     private function dispatchSkippedWebhooks(MediaSource $source, array $skipped): void
     {
@@ -507,7 +518,7 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
                 continue;
             }
 
-            app(\App\Services\NbxWebhookDispatcher::class)->dispatch($source, 'job.hls.' . $quality . '.skipped', [
+            app(\App\Services\NbxWebhookDispatcher::class)->dispatch($source, 'job.hls.'.$quality.'.skipped', [
                 'quality' => (string) $label,
                 'reason' => $reason,
             ]);
@@ -515,7 +526,7 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
     }
 
     /**
-     * @param array<int, array<string, mixed>> $generated
+     * @param  array<int, array<string, mixed>>  $generated
      */
     private function dispatchGeneratedWebhooks(MediaSource $source, array $generated): void
     {
@@ -526,7 +537,7 @@ class GenerateHlsVariantsJob implements ShouldQueue, ShouldBeUnique
                 continue;
             }
 
-            app(\App\Services\NbxWebhookDispatcher::class)->dispatch($source, 'job.hls.' . $quality . '.completed', [
+            app(\App\Services\NbxWebhookDispatcher::class)->dispatch($source, 'job.hls.'.$quality.'.completed', [
                 'quality' => $label,
                 'path' => $profile['path'] ?? null,
             ]);

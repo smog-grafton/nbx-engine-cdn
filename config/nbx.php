@@ -42,6 +42,7 @@ return [
     'multipart_part_size_mb' => (int) env('NBX_MULTIPART_PART_SIZE_MB', 32),
     'multipart_concurrency' => (int) env('NBX_MULTIPART_CONCURRENCY', 2),
     'storage_browser_page_size' => (int) env('NBX_STORAGE_BROWSER_PAGE_SIZE', 50),
+    'storage_inventory_queue' => (string) env('NBX_STORAGE_INVENTORY_QUEUE', 'media-maintenance'),
 
     'ssrf' => [
         'blocked_hosts' => array_values(array_filter(array_map(

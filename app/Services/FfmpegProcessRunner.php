@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\MediaSource;
+use Illuminate\Support\Facades\Log;
 use Symfony\Component\Process\Exception\ProcessTimedOutException;
 use Symfony\Component\Process\Process;
 
@@ -19,9 +20,17 @@ class FfmpegProcessRunner
         $process = new Process($command);
         $process->setTimeout($timeout);
         $process->setIdleTimeout(max(120, $heartbeatEvery * 12));
+        $commandSummary = $this->sanitizedCommand($command);
+        Log::info('Starting FFmpeg media stage', [
+            'source_id' => $source->id,
+            'asset_id' => $source->media_asset_id,
+            'attempt_id' => $source->processing_attempt_id,
+            'stage' => $stage,
+            'command' => $commandSummary,
+        ]);
         $process->start();
 
-        $diagnostics = '';
+        $diagnostics = "FFmpeg command: {$commandSummary}";
         $progressBuffer = '';
         $lastHeartbeat = 0.0;
         $stageProgress = 0;
@@ -64,6 +73,30 @@ class FfmpegProcessRunner
         $this->heartbeat($source, $stage, $exitCode === 0 ? 100 : $stageProgress, $diagnostics);
 
         return [$exitCode, $diagnostics];
+    }
+
+    /**
+     * @param  array<int, string>  $command
+     */
+    private function sanitizedCommand(array $command): string
+    {
+        return implode(' ', array_map(static function (string $argument): string {
+            $sanitized = preg_replace(
+                '~(https?://)([^/@\s]+):([^/@\s]+)@~i',
+                '$1[redacted]@',
+                $argument,
+            ) ?: $argument;
+            if (filter_var($sanitized, FILTER_VALIDATE_URL)) {
+                $parts = parse_url($sanitized);
+                $sanitized = ($parts['scheme'] ?? 'https').'://'.($parts['host'] ?? '')
+                    .(isset($parts['port']) ? ':'.$parts['port'] : '')
+                    .($parts['path'] ?? '');
+            }
+
+            return str_contains($sanitized, ' ') || $sanitized === ''
+                ? '"'.str_replace('"', '\\"', $sanitized).'"'
+                : $sanitized;
+        }, $command));
     }
 
     /**

@@ -181,7 +181,8 @@ class NbxEngineService
         if (isset($actions[$actionKey]) && ($actions[$actionKey]['status'] ?? null) !== 'failed') {
             return $source->fresh() ?? $source;
         }
-        $wasFinalStorageFailure = str_contains(strtolower((string) $source->failure_reason), 'final storage');
+        $wasFinalStorageFailure = str_contains(strtolower((string) $source->failure_reason), 'final storage')
+            || ! empty($nbx['finalization_error']);
 
         $requested = (array) ($nbx['requested'] ?? []);
         foreach ([
@@ -235,9 +236,22 @@ class NbxEngineService
             );
 
         try {
-            if ($operation === 'retry' && $hasLocalOptimized && $wasFinalStorageFailure) {
+            $hasRemoteOptimized = $this->validFinalArtifact(
+                (array) data_get($sourceMetadata, 'nbx.final_artifacts.faststart', []),
+                'faststart',
+            );
+            if (in_array($operation, ['retry', 'retry_storage'], true)
+                && $wasFinalStorageFailure
+                && ($hasLocalOptimized || $hasRemoteOptimized)
+            ) {
                 $source->update(['status' => 'ready', 'optimize_status' => 'ready']);
                 $source = $this->finalizeStorageIfNeeded($source->fresh() ?? $source);
+            } elseif ($operation === 'retry_portal_sync') {
+                $source = $this->refreshOutputMetadata($source->fresh() ?? $source);
+                app(NbxWebhookDispatcher::class)->dispatch($source, 'job.completed', [
+                    'stage' => 'portal_sync',
+                    'sync_only' => true,
+                ]);
             } elseif ($operation === 'retry' && ($sourceMetadata['nbx']['input_type'] ?? null) === 'telegram') {
                 $telegramUrl = (string) ($sourceMetadata['telegram_url'] ?? '');
                 if ($telegramUrl === '') {
@@ -405,6 +419,14 @@ class NbxEngineService
             return $this->refreshOutputMetadata($source);
         }
 
+        $source->update([
+            'processing_stage' => 'final_storage_upload',
+            'processing_stage_progress' => 0,
+            'processing_heartbeat_at' => now(),
+            'progress_percent' => max(85, min(95, (int) ($source->progress_percent ?? 85))),
+            'last_progress_at' => now(),
+        ]);
+        $source = $source->fresh() ?? $source;
         $roles = ['faststart', 'hls'];
         if ($this->shouldRetainOriginal($source)) {
             array_unshift($roles, 'original');
@@ -419,10 +441,39 @@ class NbxEngineService
             && ! empty($publishedMetadata['nbx']['finalization_error'])) {
             return $this->refreshOutputMetadata($source);
         }
+        $publishedNbx = (array) ($publishedMetadata['nbx'] ?? []);
+        $missingArtifact = $this->requiredArtifactError($publishedNbx);
+        if ($missingArtifact !== null) {
+            return $this->failFinalization(
+                $source,
+                $missingArtifact,
+                $publishedMetadata,
+                $publishedNbx,
+                $target,
+                $currentDisk,
+            );
+        }
+
+        $source->update([
+            'processing_stage' => 'remote_verification',
+            'processing_stage_progress' => 100,
+            'processing_heartbeat_at' => now(),
+            'progress_percent' => 98,
+            'last_progress_at' => now(),
+        ]);
+        $source = $source->fresh() ?? $source;
 
         if (! (bool) config('nbx.keep_local_work_files', false)) {
             $this->cleanupLocalWorkFiles($source, $currentDisk);
         }
+
+        $source->update([
+            'processing_stage' => 'ready',
+            'processing_stage_progress' => 100,
+            'processing_heartbeat_at' => now(),
+            'progress_percent' => 100,
+            'last_progress_at' => now(),
+        ]);
 
         return $this->refreshOutputMetadata($source->fresh() ?? $source);
     }
@@ -534,7 +585,6 @@ class NbxEngineService
         $source->update([
             'failure_reason' => null,
             'last_error' => null,
-            'optimize_error' => null,
             'is_active' => true,
             'source_metadata' => $metadata,
         ]);
@@ -553,6 +603,7 @@ class NbxEngineService
             'storage_target' => $target,
             'work_storage_disk' => $currentDisk,
             'finalization_error' => $message,
+            'error_code' => 'STORAGE_UPLOAD_FAILED',
             'failed_at' => now()->toIso8601String(),
         ]);
 
@@ -561,8 +612,13 @@ class NbxEngineService
             'failure_reason' => ($hasVerifiedProgressive ? 'Final storage upload partially failed: ' : 'Final storage upload failed: ').$message,
             'last_error' => $message,
             'is_active' => $hasVerifiedProgressive,
-            'optimize_status' => 'failed',
-            'optimize_error' => 'Final storage upload failed: '.$message,
+            'optimize_status' => $source->is_faststart ? 'ready' : $source->optimize_status,
+            'processing_stage' => 'failed',
+            'processing_stage_progress' => null,
+            'processing_heartbeat_at' => now(),
+            'processing_diagnostics' => 'Final storage upload failed: '.$message,
+            'progress_percent' => min(95, (int) ($source->progress_percent ?? 90)),
+            'last_progress_at' => now(),
             'source_metadata' => $metadata,
         ]);
 
@@ -614,6 +670,7 @@ class NbxEngineService
     public function discoveryPayload(MediaSource $source, MediaSourceService $mediaSourceService): array
     {
         $source = $this->refreshOutputMetadata($source);
+        $failure = app(ProcessingFailurePresenter::class)->forSource($source);
         $playback = $mediaSourceService->buildPlaybackManifest($source);
         $metadata = (array) ($source->source_metadata ?? []);
         $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
@@ -640,9 +697,18 @@ class NbxEngineService
             'processing_stage' => $source->processing_stage,
             'processing_stage_progress' => $source->processing_stage_progress,
             'processing_heartbeat_at' => $source->processing_heartbeat_at?->toIso8601String(),
-            'processing_diagnostics' => $source->processing_stage === 'failed' ? $source->processing_diagnostics : null,
+            // Full commands and filesystem paths stay in NBX logs/admin only.
+            // Portal and creator clients receive the safe failure contract below.
+            'processing_diagnostics' => null,
+            'diagnostics_available' => $source->processing_stage === 'failed'
+                && filled($source->processing_diagnostics),
             'progress_percent' => $source->progress_percent,
-            'failure_reason' => $source->failure_reason ?: $source->optimize_error,
+            'failure_reason' => $failure['message'] ?? null,
+            'error_code' => $failure['code'] ?? null,
+            'safe_message' => $failure['message'] ?? null,
+            'support_reference' => $failure['support_reference'] ?? null,
+            'retryable' => $failure['retryable'] ?? false,
+            'action_required' => $failure['action_required'] ?? false,
             'storage_disk' => $source->storage_disk,
             'storage_target' => $nbx['storage_target'] ?? null,
             'default_storage' => (string) config('nbx.default_storage', 'contabo'),
@@ -684,6 +750,13 @@ class NbxEngineService
 
         if (! empty($criteria['source_id'])) {
             return MediaSource::with('asset')->find((int) $criteria['source_id']);
+        }
+
+        if (! empty($criteria['asset_id'])) {
+            return MediaSource::with('asset')
+                ->where('media_asset_id', (string) $criteria['asset_id'])
+                ->latest('id')
+                ->first();
         }
 
         if (! empty($criteria['source_url'])) {
@@ -869,6 +942,39 @@ class NbxEngineService
                 Storage::disk($disk)->delete($path);
             }
         }
+    }
+
+    private function requiredArtifactError(array $nbx): ?string
+    {
+        $requested = (array) ($nbx['requested'] ?? []);
+        $artifacts = (array) ($nbx['final_artifacts'] ?? []);
+
+        $faststart = (array) ($artifacts['faststart'] ?? []);
+        if (($requested['faststart'] ?? true) && ! $this->artifactIsRemotelyVerified($faststart, 'faststart')) {
+            return 'Verified Fast Start output is missing; local cleanup was not started.';
+        }
+
+        $requestedHls = (array) ($requested['hls'] ?? []);
+        $hlsExpected = (bool) ($requested['allow_hls_streaming'] ?? true)
+            && collect($requestedHls)->contains(static fn (mixed $enabled): bool => (bool) $enabled);
+        $hlsMaster = (array) ($artifacts['hls_master'] ?? []);
+        if ($hlsExpected && ! $this->artifactIsRemotelyVerified($hlsMaster, 'hls_master')) {
+            return 'Requested HLS package is not verified in final storage; local retry artifacts were preserved.';
+        }
+
+        return null;
+    }
+
+    private function artifactIsRemotelyVerified(array $artifact, string $role): bool
+    {
+        return $this->validFinalArtifact($artifact, $role)
+            && ! empty($artifact['disk'])
+            && ! empty($artifact['key'])
+            && app(VerifiedObjectStorageService::class)->verify(
+                (string) $artifact['disk'],
+                (string) $artifact['key'],
+                (int) ($artifact['bytes'] ?? 0),
+            );
     }
 
     private function sourceList(MediaSource $source, array $nbx, array $playback): array
