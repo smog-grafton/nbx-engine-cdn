@@ -161,4 +161,112 @@ class NbxPipelineContractTest extends TestCase
             Storage::disk('contabo')->assertExists('videos/job/original/movie.mov');
         }
     }
+
+    public function test_discovery_returns_safe_failure_contract_without_local_paths(): void
+    {
+        $asset = MediaAsset::query()->create([
+            'type' => 'movie',
+            'title' => 'Safe failure',
+            'status' => 'failed',
+            'visibility' => 'unlisted',
+        ]);
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'remote_fetch',
+            'status' => 'failed',
+            'processing_stage' => 'failed',
+            'failure_reason' => 'Final storage upload failed: fopen(/var/www/html/storage/private/movie.mp4): No such file',
+            'processing_diagnostics' => 'ffmpeg -i /var/www/html/storage/private/movie.mp4',
+            'external_job_id' => 'safe-failure-contract',
+            'source_metadata' => [
+                'provider' => 'nbx_engine',
+                'nbx' => [
+                    'status' => 'failed',
+                    'error_code' => 'STORAGE_UPLOAD_FAILED',
+                ],
+            ],
+        ]);
+
+        $payload = app(NbxEngineService::class)->discoveryPayload(
+            $source,
+            app(\App\Services\MediaSourceService::class),
+        );
+
+        $this->assertSame('STORAGE_UPLOAD_FAILED', $payload['error_code']);
+        $this->assertTrue($payload['retryable']);
+        $this->assertNotEmpty($payload['support_reference']);
+        $this->assertStringNotContainsString('/var/www', $payload['failure_reason']);
+        $this->assertNull($payload['processing_diagnostics']);
+        $this->assertTrue($payload['diagnostics_available']);
+    }
+
+    public function test_final_storage_failure_preserves_output_and_retry_storage_does_not_reencode(): void
+    {
+        config()->set('filesystems.disks.contabo.bucket', 'test-bucket');
+        config()->set('filesystems.disks.contabo.endpoint', 'https://objects.example');
+        config()->set('filesystems.disks.contabo.key', null);
+        config()->set('filesystems.disks.contabo.secret', null);
+        foreach (['client_id', 'client_secret', 'username', 'password', 'user_id', 'object_storage_id'] as $key) {
+            config()->set("services.contabo_api.{$key}", null);
+        }
+        $asset = MediaAsset::query()->create([
+            'type' => 'movie',
+            'title' => 'Retry final storage',
+            'status' => 'ready',
+            'visibility' => 'public',
+        ]);
+        $optimizedPath = "media/{$asset->id}/150/movie_play.mp4";
+        Storage::disk('public')->put($optimizedPath, 'verified-faststart-output');
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'remote_fetch',
+            'storage_disk' => 'public',
+            'storage_path' => "media/{$asset->id}/150/movie-original.mp4",
+            'optimized_path' => $optimizedPath,
+            'mime_type' => 'video/mp4',
+            'status' => 'ready',
+            'optimize_status' => 'ready',
+            'is_faststart' => true,
+            'is_active' => true,
+            'external_job_id' => 'retry-storage-job',
+            'source_metadata' => [
+                'provider' => 'nbx_engine',
+                'nbx' => [
+                    'status' => 'processing',
+                    'storage_target' => 'contabo',
+                    'requested' => [
+                        'faststart' => true,
+                        'allow_downloads' => true,
+                        'allow_hls_streaming' => false,
+                        'hls' => ['480p' => false, '720p' => false, '1080p' => false],
+                    ],
+                ],
+            ],
+        ]);
+
+        $failed = app(NbxEngineService::class)->finalizeStorageIfNeeded($source);
+
+        $this->assertSame('failed', $failed->processing_stage);
+        $this->assertSame('ready', $failed->optimize_status);
+        $this->assertLessThan(100, $failed->progress_percent);
+        Storage::disk('public')->assertExists($optimizedPath);
+
+        config()->set('filesystems.disks.contabo.key', 'test-key');
+        config()->set('filesystems.disks.contabo.secret', 'test-secret');
+        $retried = app(NbxEngineService::class)->performAction(
+            $failed,
+            'retry_storage',
+            ['idempotency_key' => 'retry-storage-contract'],
+            app(\App\Services\MediaSourceService::class),
+        );
+
+        $this->assertSame('ready', $retried->status);
+        $this->assertSame('ready', $retried->processing_stage);
+        $this->assertSame(100, $retried->progress_percent);
+        $this->assertSame(
+            'videos/nbx/retry-storage-job/faststart/movie_play.mp4',
+            data_get($retried->source_metadata, 'nbx.final_artifacts.faststart.key'),
+        );
+        Storage::disk('contabo')->assertExists('videos/nbx/retry-storage-job/faststart/movie_play.mp4');
+    }
 }

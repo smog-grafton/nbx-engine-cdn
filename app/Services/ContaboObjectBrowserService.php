@@ -3,10 +3,12 @@
 namespace App\Services;
 
 use App\Models\MediaSource;
+use App\Models\StorageInventoryObject;
 use App\Models\StorageObjectReference;
 use Aws\Exception\AwsException;
 use Aws\Exception\CredentialsException;
 use Illuminate\Filesystem\AwsS3V3Adapter;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 use RuntimeException;
 
@@ -50,51 +52,85 @@ class ContaboObjectBrowserService
             }
         }
 
-        $params = [
-            'Bucket' => $bucket,
-            'Prefix' => $prefix,
-            'MaxKeys' => $limit,
-        ];
-        if ($cursor) {
-            $params['ContinuationToken'] = $cursor;
-        }
-        try {
-            $result = $storage->getClient()->listObjectsV2($params);
-        } catch (CredentialsException $exception) {
-            throw new RuntimeException(
-                'Contabo S3 credentials are unavailable. Configure CONTABO_ACCESS_KEY_ID and CONTABO_SECRET_ACCESS_KEY (or their CONTABO_OBJECT_STORAGE_* aliases).',
-                previous: $exception,
-            );
-        } catch (AwsException $exception) {
-            $code = $exception->getAwsErrorCode();
-            throw new RuntimeException(
-                'Contabo object listing failed'.($code ? " ({$code})" : '').'. Verify the bucket, region, endpoint, and S3 key permissions.',
-                previous: $exception,
-            );
-        }
         $rows = [];
-        foreach ((array) ($result['Contents'] ?? []) as $object) {
-            $key = (string) ($object['Key'] ?? '');
-            if (! $this->matches($key, $search, $role, $extension)) {
-                continue;
+        $nextCursor = null;
+        $isTruncated = false;
+        $pageCount = 0;
+        $continuation = $cursor && ! str_starts_with($cursor, 'key:')
+            ? $cursor
+            : null;
+        $startAfter = $cursor && str_starts_with($cursor, 'key:')
+            ? $this->decodeKeyCursor($cursor)
+            : null;
+        do {
+            $params = [
+                'Bucket' => $bucket,
+                'Prefix' => $prefix,
+                // Filters are not applied by S3. Read a larger metadata page
+                // and stop at the requested number of matching rows.
+                'MaxKeys' => ($search || ($role && $role !== 'all') || ($extension && $extension !== 'all') || ($association && $association !== 'all'))
+                    ? 1000
+                    : $limit,
+            ];
+            if ($continuation) {
+                $params['ContinuationToken'] = $continuation;
+            } elseif ($startAfter) {
+                $params['StartAfter'] = $startAfter;
             }
-            $row = $this->row(
-                $disk,
-                $bucket,
-                $key,
-                (int) ($object['Size'] ?? 0),
-                $object['LastModified'] ?? null,
-                isset($object['ETag']) ? trim((string) $object['ETag'], '"') : null,
-            );
-            if ($this->matchesAssociation($row, $association)) {
+            try {
+                $result = $storage->getClient()->listObjectsV2($params);
+            } catch (CredentialsException $exception) {
+                throw new RuntimeException(
+                    'Contabo S3 credentials are unavailable. Configure CONTABO_ACCESS_KEY_ID and CONTABO_SECRET_ACCESS_KEY (or their CONTABO_OBJECT_STORAGE_* aliases).',
+                    previous: $exception,
+                );
+            } catch (AwsException $exception) {
+                $code = $exception->getAwsErrorCode();
+                throw new RuntimeException(
+                    'Contabo object listing failed'.($code ? " ({$code})" : '').'. Verify the bucket, region, endpoint, and S3 key permissions.',
+                    previous: $exception,
+                );
+            }
+            $contents = (array) ($result['Contents'] ?? []);
+            foreach ($contents as $index => $object) {
+                $key = (string) ($object['Key'] ?? '');
+                if (! $this->matches($key, $search, $role, $extension)) {
+                    continue;
+                }
+                $row = $this->row(
+                    $disk,
+                    $bucket,
+                    $key,
+                    (int) ($object['Size'] ?? 0),
+                    $object['LastModified'] ?? null,
+                    isset($object['ETag']) ? trim((string) $object['ETag'], '"') : null,
+                );
+                if (! $this->matchesAssociation($row, $association)) {
+                    continue;
+                }
                 $rows[] = $row;
+                if (count($rows) >= $limit) {
+                    $hasUnprocessedObjects = $index < count($contents) - 1;
+                    $isTruncated = $hasUnprocessedObjects || (bool) ($result['IsTruncated'] ?? false);
+                    $nextCursor = $isTruncated ? $this->encodeKeyCursor($key) : null;
+                    break 2;
+                }
             }
-        }
+            $continuation = isset($result['NextContinuationToken'])
+                ? (string) $result['NextContinuationToken']
+                : null;
+            $startAfter = null;
+            $isTruncated = (bool) ($result['IsTruncated'] ?? false);
+            $nextCursor = $continuation;
+            $pageCount++;
+            // Keep interactive API calls bounded. The indexed inventory is the
+            // authoritative interface for whole-bucket search and reporting.
+        } while ($isTruncated && $continuation && $pageCount < 25);
 
         return [
             'objects' => $rows,
-            'next_cursor' => isset($result['NextContinuationToken']) ? (string) $result['NextContinuationToken'] : null,
-            'is_truncated' => (bool) ($result['IsTruncated'] ?? false),
+            'next_cursor' => $nextCursor,
+            'is_truncated' => $isTruncated,
         ];
     }
 
@@ -112,10 +148,12 @@ class ContaboObjectBrowserService
         $offset = max(0, (int) ($cursor ?: 0));
         $files = Storage::disk($disk)->allFiles($prefix);
         sort($files);
-        $page = array_slice($files, $offset, $limit);
-
         $rows = [];
-        foreach ($page as $key) {
+        $nextOffset = null;
+        foreach ($files as $index => $key) {
+            if ($index < $offset) {
+                continue;
+            }
             if (! $this->matches($key, $search, $role, $extension)) {
                 continue;
             }
@@ -129,13 +167,17 @@ class ContaboObjectBrowserService
             );
             if ($this->matchesAssociation($row, $association)) {
                 $rows[] = $row;
+                if (count($rows) >= $limit) {
+                    $nextOffset = $index + 1;
+                    break;
+                }
             }
         }
 
         return [
             'objects' => $rows,
-            'next_cursor' => $offset + $limit < count($files) ? (string) ($offset + $limit) : null,
-            'is_truncated' => $offset + $limit < count($files),
+            'next_cursor' => $nextOffset !== null && $nextOffset < count($files) ? (string) $nextOffset : null,
+            'is_truncated' => $nextOffset !== null && $nextOffset < count($files),
         ];
     }
 
@@ -185,6 +227,12 @@ class ContaboObjectBrowserService
             ->filter()
             ->unique()
             ->values();
+        $confirmedOrphan = Schema::hasTable('storage_inventory_objects')
+            && StorageInventoryObject::query()
+                ->where('object_hash', hash('sha256', $disk.'|'.$bucket.'|'.$key))
+                ->where('classification', 'orphan_confirmed')
+                ->whereNull('missing_since')
+                ->exists();
 
         return [
             'key' => $key,
@@ -205,7 +253,7 @@ class ContaboObjectBrowserService
             'associated_portal_source_ids' => $references->pluck('portal_source_id')->filter()->unique()->values()->all(),
             'portal_reference_count' => $references->whereNotNull('portal_source_id')->count(),
             'processing_jobs' => $jobs->all(),
-            'orphaned' => $references->isEmpty() && $sources->isEmpty(),
+            'orphaned' => $confirmedOrphan,
             'disk' => $disk,
             'bucket' => $bucket,
         ];
@@ -213,10 +261,30 @@ class ContaboObjectBrowserService
 
     private function safePrefix(string $prefix): string
     {
-        $prefix = app(StorageReferenceService::class)->normalizeObjectKey($prefix);
-        $allowed = trim((string) config('services.contabo_object_storage.path_prefix', 'videos'), '/');
+        $requested = trim($prefix);
+        $prefix = app(StorageReferenceService::class)->normalizeObjectKey($requested);
+        if ($requested !== '' && $prefix === '') {
+            throw new RuntimeException('The requested storage prefix is invalid.');
+        }
 
-        return $prefix === '' ? $allowed : (str_starts_with($prefix, $allowed) ? $prefix : $allowed);
+        return $prefix;
+    }
+
+    private function encodeKeyCursor(string $key): string
+    {
+        return 'key:'.rtrim(strtr(base64_encode($key), '+/', '-_'), '=');
+    }
+
+    private function decodeKeyCursor(string $cursor): ?string
+    {
+        $encoded = substr($cursor, 4);
+        $padding = strlen($encoded) % 4;
+        if ($padding > 0) {
+            $encoded .= str_repeat('=', 4 - $padding);
+        }
+        $decoded = base64_decode(strtr($encoded, '-_', '+/'), true);
+
+        return is_string($decoded) && $decoded !== '' ? $decoded : null;
     }
 
     private function matches(string $key, ?string $search, ?string $role, ?string $extension): bool

@@ -4,9 +4,12 @@ namespace App\Services;
 
 use App\Models\MediaSource;
 use App\Models\StorageActionAudit;
+use App\Models\StorageCleanupPlanItem;
+use App\Models\StorageInventoryObject;
 use App\Models\StorageObjectReference;
 use Illuminate\Filesystem\AwsS3V3Adapter;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 
 class StorageDeletionService
@@ -106,6 +109,42 @@ class StorageDeletionService
                 ->orWhere('hls_master_path', $key);
         })->exists()) {
             throw new \RuntimeException('Object deletion refused: NBX source metadata still references it.');
+        }
+        if (! Schema::hasTable('storage_inventory_objects') || ! Schema::hasTable('storage_cleanup_plan_items')) {
+            throw new \RuntimeException('Object deletion refused: the reconciled storage inventory is not installed.');
+        }
+        $bucket = (string) config("filesystems.disks.{$disk}.bucket", '');
+        $inventoryObject = StorageInventoryObject::query()
+            ->where('object_hash', hash('sha256', $disk.'|'.$bucket.'|'.$key))
+            ->where('classification', 'orphan_confirmed')
+            ->whereNull('missing_since')
+            ->first();
+        if (! $inventoryObject) {
+            throw new \RuntimeException('Object deletion refused: this object has not been explicitly confirmed as an orphan.');
+        }
+        if ($inventoryObject->duplicate_evidence === 'sha256') {
+            $retainedDuplicate = StorageInventoryObject::query()
+                ->whereKeyNot($inventoryObject->id)
+                ->where('content_sha256', $inventoryObject->content_sha256)
+                ->where('size_bytes', $inventoryObject->size_bytes)
+                ->where('duplicate_evidence', 'sha256')
+                ->where('classification', '!=', 'orphan_confirmed')
+                ->whereNull('missing_since')
+                ->exists();
+            if (! $retainedDuplicate) {
+                throw new \RuntimeException('Object deletion refused: no retained SHA-256-identical replacement remains.');
+            }
+        }
+        $approvedItem = StorageCleanupPlanItem::query()
+            ->where('storage_inventory_object_id', $inventoryObject->id)
+            ->where('status', 'approved')
+            ->whereHas('plan', fn ($query) => $query
+                ->whereIn('status', ['confirmed', 'queued'])
+                ->whereNotNull('confirmed_at')
+                ->where('grace_expires_at', '<=', now()))
+            ->exists();
+        if (! $approvedItem) {
+            throw new \RuntimeException('Object deletion refused: an approved cleanup plan and completed grace period are required.');
         }
 
         $idempotencyKey = $idempotencyKey ?: hash('sha256', 'delete_orphan|'.$disk.'|'.$key);

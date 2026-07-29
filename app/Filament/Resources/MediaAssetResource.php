@@ -4,6 +4,7 @@ namespace App\Filament\Resources;
 
 use App\Filament\Resources\MediaAssetResource\Pages;
 use App\Filament\Resources\MediaAssetResource\RelationManagers\MediaSourcesRelationManager;
+use App\Filament\Resources\MediaAssetResource\RelationManagers\StorageInventoryObjectsRelationManager;
 use App\Models\MediaAsset;
 use Filament\Forms;
 use Filament\Forms\Form;
@@ -117,6 +118,7 @@ class MediaAssetResource extends Resource
     {
         return [
             MediaSourcesRelationManager::class,
+            StorageInventoryObjectsRelationManager::class,
         ];
     }
 
@@ -130,4 +132,3 @@ class MediaAssetResource extends Resource
         ];
     }
 }
-

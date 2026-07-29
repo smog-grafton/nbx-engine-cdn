@@ -41,27 +41,61 @@ class VideoProbeService
         $streams = is_array($payload['streams'] ?? null) ? $payload['streams'] : [];
         $format = is_array($payload['format'] ?? null) ? $payload['format'] : [];
         $video = null;
+        $attachedVideo = null;
         $audio = null;
+        $videoStreamCount = 0;
+        $audioStreamCount = 0;
+        $subtitleStreamCount = 0;
         foreach ($streams as $stream) {
             if (! is_array($stream)) {
                 continue;
             }
-            if (($stream['codec_type'] ?? null) === 'video' && $video === null) {
-                $video = $stream;
+            if (($stream['codec_type'] ?? null) === 'video') {
+                $videoStreamCount++;
+                $isAttachedPicture = (bool) data_get($stream, 'disposition.attached_pic', false);
+                if ($isAttachedPicture && $attachedVideo === null) {
+                    $attachedVideo = $stream;
+                } elseif (! $isAttachedPicture && $video === null) {
+                    $video = $stream;
+                }
             }
-            if (($stream['codec_type'] ?? null) === 'audio' && $audio === null) {
-                $audio = $stream;
+            if (($stream['codec_type'] ?? null) === 'audio') {
+                $audioStreamCount++;
+                if ($audio === null) {
+                    $audio = $stream;
+                }
+            }
+            if (($stream['codec_type'] ?? null) === 'subtitle') {
+                $subtitleStreamCount++;
             }
         }
+        $diagnosticVideo = $video ?? $attachedVideo;
 
         return array_filter([
             'container' => isset($format['format_name']) ? (string) $format['format_name'] : null,
             'video_codec' => is_array($video) ? (string) ($video['codec_name'] ?? '') ?: null : null,
             'audio_codec' => is_array($audio) ? (string) ($audio['codec_name'] ?? '') ?: null : null,
             'pixel_format' => is_array($video) ? (string) ($video['pix_fmt'] ?? '') ?: null : null,
+            'video_profile' => is_array($video) ? (string) ($video['profile'] ?? '') ?: null : null,
+            'video_level' => is_array($video) && isset($video['level']) ? (int) $video['level'] : null,
+            'bits_per_raw_sample' => is_array($video) && is_numeric($video['bits_per_raw_sample'] ?? null)
+                ? (int) $video['bits_per_raw_sample']
+                : null,
+            'color_space' => is_array($video) ? (string) ($video['color_space'] ?? '') ?: null : null,
+            'color_transfer' => is_array($video) ? (string) ($video['color_transfer'] ?? '') ?: null : null,
+            'color_primaries' => is_array($video) ? (string) ($video['color_primaries'] ?? '') ?: null : null,
             'audio_channels' => is_array($audio) && isset($audio['channels']) ? (int) $audio['channels'] : null,
             'has_video' => $video !== null,
             'has_audio' => $audio !== null,
+            'has_attached_picture' => $attachedVideo !== null,
+            'video_stream_count' => $videoStreamCount,
+            'audio_stream_count' => $audioStreamCount,
+            'subtitle_stream_count' => $subtitleStreamCount,
+            'selected_video_stream_index' => is_array($video) && isset($video['index']) ? (int) $video['index'] : null,
+            'selected_audio_stream_index' => is_array($audio) && isset($audio['index']) ? (int) $audio['index'] : null,
+            'diagnostic_video_stream_index' => is_array($diagnosticVideo) && isset($diagnosticVideo['index'])
+                ? (int) $diagnosticVideo['index']
+                : null,
             'width' => is_array($video) && isset($video['width']) ? (int) $video['width'] : null,
             'height' => is_array($video) && isset($video['height']) ? (int) $video['height'] : null,
             'duration' => isset($format['duration']) ? (float) $format['duration'] : null,

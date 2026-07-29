@@ -28,5 +28,9 @@ class MediaAsset extends Model
     {
         return $this->hasMany(MediaSource::class);
     }
-}
 
+    public function storageInventoryObjects(): HasMany
+    {
+        return $this->hasMany(StorageInventoryObject::class, 'media_asset_id');
+    }
+}
