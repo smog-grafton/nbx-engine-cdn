@@ -543,6 +543,7 @@ class NbxEngineController extends Controller
                 'retry',
                 'retry_storage',
                 'retry_portal_sync',
+                'reconcile',
                 'reprocess',
                 'generate_faststart',
                 'compress',

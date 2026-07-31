@@ -246,6 +246,8 @@ class NbxEngineService
             ) {
                 $source->update(['status' => 'ready', 'optimize_status' => 'ready']);
                 $source = $this->finalizeStorageIfNeeded($source->fresh() ?? $source);
+            } elseif ($operation === 'reconcile') {
+                $source = $this->reconcilePublishedArtifacts($source->fresh() ?? $source);
             } elseif ($operation === 'retry_portal_sync') {
                 $source = $this->refreshOutputMetadata($source->fresh() ?? $source);
                 app(NbxWebhookDispatcher::class)->dispatch($source, 'job.completed', [
@@ -592,38 +594,157 @@ class NbxEngineService
         return $source->fresh() ?? $source;
     }
 
+    /**
+     * Rebuild final-artifact metadata from objects which already exist. This
+     * method never copies, encodes, deletes, or renames media.
+     */
+    public function reconcilePublishedArtifacts(MediaSource $source): MediaSource
+    {
+        $source = $source->fresh() ?? $source;
+        $metadata = (array) ($source->source_metadata ?? []);
+        $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
+        $target = (string) ($nbx['storage_target'] ?? config('nbx.default_storage', 'contabo'));
+        if ($target !== 'contabo') {
+            return $this->refreshOutputMetadata($source);
+        }
+
+        $credentials = app(ContaboStorageCredentialService::class);
+        if (! $credentials->ensureRuntimeDiskCredentials()) {
+            throw new \RuntimeException($credentials->configurationError());
+        }
+
+        $existing = is_array($nbx['final_artifacts'] ?? null) ? $nbx['final_artifacts'] : [];
+        $prefix = $this->finalStoragePrefix($source);
+        $candidates = $this->artifactCandidateKeys($prefix, $existing);
+        $artifacts = $existing;
+        $proof = is_array($metadata['probe'] ?? null) ? $metadata['probe'] : [];
+        $verifiedRoles = [];
+
+        foreach (['original', 'faststart', 'hls_master'] as $role) {
+            foreach ($candidates[$role] as $key) {
+                $previous = is_array($existing[$role] ?? null) && ($existing[$role]['key'] ?? null) === $key
+                    ? $existing[$role]
+                    : [];
+                $artifact = $this->verifiedExistingArtifact('contabo', $key, $role, $previous, $proof);
+                if ($artifact === null) {
+                    continue;
+                }
+
+                $artifacts[$role] = $artifact;
+                $verifiedRoles[] = $role;
+                if ($role === 'hls_master' && ! $source->hls_master_path) {
+                    $source->hls_master_path = $key;
+                }
+                break;
+            }
+        }
+
+        $nbx['final_artifacts'] = $artifacts;
+        $missingArtifact = $this->requiredArtifactError($nbx);
+        $hasFaststart = $this->artifactIsRemotelyVerified((array) ($artifacts['faststart'] ?? []), 'faststart');
+        $hasHls = $this->artifactIsRemotelyVerified((array) ($artifacts['hls_master'] ?? []), 'hls_master');
+        $original = (array) ($artifacts['original'] ?? []);
+        $hasPlayableOriginal = $this->artifactIsRemotelyVerified($original, 'original')
+            && in_array(strtolower((string) pathinfo((string) ($original['key'] ?? ''), PATHINFO_EXTENSION)), ['mp4', 'm4v'], true)
+            && $this->probeProvesPlayable((array) ($original['probe'] ?? $proof));
+        $hasPlayableOutput = $hasFaststart || $hasHls || $hasPlayableOriginal;
+        $processingComplete = (bool) ($nbx['processing_complete'] ?? false)
+            || $source->status === 'ready'
+            || ($source->is_faststart && $source->optimize_status === 'ready')
+            || $this->hasStoredArtifact($nbx);
+        $publicationStatus = $missingArtifact === null
+            ? 'complete'
+            : ($hasPlayableOutput ? 'partial' : ($verifiedRoles === [] ? 'missing' : 'attention_required'));
+
+        $nbx = array_merge($nbx, [
+            'final_artifacts' => $artifacts,
+            'final_storage_disk' => 'contabo',
+            'processing_complete' => $processingComplete,
+            'storage_verified' => $verifiedRoles !== [],
+            'publication_status' => $publicationStatus,
+            'reconciled_at' => now()->toIso8601String(),
+            'reconciled_roles' => array_values(array_unique($verifiedRoles)),
+        ]);
+        if ($missingArtifact === null) {
+            unset($nbx['finalization_error'], $nbx['failed_at'], $nbx['error_code']);
+        } else {
+            $nbx['finalization_error'] = $missingArtifact;
+            $nbx['error_code'] = $hasPlayableOutput ? 'PUBLICATION_PARTIAL' : 'PLAYBACK_OUTPUT_MISSING';
+        }
+        $metadata['provider'] = 'nbx_engine';
+        $metadata['nbx'] = $nbx;
+
+        $source->fill([
+            'status' => $processingComplete ? 'ready' : $source->status,
+            'is_active' => $hasPlayableOutput,
+            'failure_reason' => $missingArtifact === null
+                ? null
+                : ($hasPlayableOutput
+                    ? 'A playable source is available, but another requested format still needs publication.'
+                    : 'Stored media was found, but no verified playback output is published yet.'),
+            'last_error' => $missingArtifact,
+            'processing_stage' => $missingArtifact === null ? 'ready' : 'publication_attention',
+            'processing_stage_progress' => 100,
+            'processing_heartbeat_at' => now(),
+            'processing_diagnostics' => $missingArtifact,
+            'progress_percent' => $processingComplete ? 100 : $source->progress_percent,
+            'last_progress_at' => now(),
+            'source_metadata' => $metadata,
+        ])->save();
+
+        $fresh = $this->refreshOutputMetadata($source->fresh() ?? $source);
+        app(NbxWebhookDispatcher::class)->dispatch($fresh, 'job.reconciled', [
+            'publication_status' => $publicationStatus,
+            'verified_roles' => array_values(array_unique($verifiedRoles)),
+            'processing_complete' => $processingComplete,
+        ]);
+
+        return $fresh;
+    }
+
     private function failFinalization(MediaSource $source, string $message, array $metadata, array $nbx, string $target, string $currentDisk): MediaSource
     {
         $faststart = (array) ($nbx['final_artifacts']['faststart'] ?? []);
         $hasVerifiedProgressive = $this->validFinalArtifact($faststart, 'faststart')
             && ! empty($faststart['bytes']);
-        $status = $hasVerifiedProgressive ? 'partially_completed' : 'failed';
+        $processingComplete = $this->hasCompletedLocalOutput($source, $nbx)
+            || $this->hasStoredArtifact($nbx);
+        $status = $hasVerifiedProgressive
+            ? 'partially_completed'
+            : ($processingComplete ? 'publication_pending' : 'failed');
         $metadata['nbx'] = array_merge($nbx, [
             'status' => $status,
             'storage_target' => $target,
             'work_storage_disk' => $currentDisk,
             'finalization_error' => $message,
-            'error_code' => 'STORAGE_UPLOAD_FAILED',
+            'processing_complete' => $processingComplete,
+            'storage_verified' => $hasVerifiedProgressive,
+            'publication_status' => $hasVerifiedProgressive ? 'partial' : 'pending',
+            'error_code' => $processingComplete ? 'PUBLICATION_PENDING' : 'STORAGE_UPLOAD_FAILED',
             'failed_at' => now()->toIso8601String(),
         ]);
 
         $source->update([
-            'status' => $hasVerifiedProgressive ? 'ready' : 'failed',
-            'failure_reason' => ($hasVerifiedProgressive ? 'Final storage upload partially failed: ' : 'Final storage upload failed: ').$message,
+            'status' => ($hasVerifiedProgressive || $processingComplete) ? 'ready' : 'failed',
+            'failure_reason' => $processingComplete
+                ? 'Media processing completed, but final publication needs attention: '.$message
+                : 'Final storage upload failed: '.$message,
             'last_error' => $message,
             'is_active' => $hasVerifiedProgressive,
             'optimize_status' => $source->is_faststart ? 'ready' : $source->optimize_status,
-            'processing_stage' => 'failed',
-            'processing_stage_progress' => null,
+            'processing_stage' => $processingComplete ? 'publication_pending' : 'failed',
+            'processing_stage_progress' => $processingComplete ? 100 : null,
             'processing_heartbeat_at' => now(),
-            'processing_diagnostics' => 'Final storage upload failed: '.$message,
+            'processing_diagnostics' => ($processingComplete ? 'Publication pending: ' : 'Final storage upload failed: ').$message,
             'progress_percent' => min(95, (int) ($source->progress_percent ?? 90)),
             'last_progress_at' => now(),
             'source_metadata' => $metadata,
         ]);
 
         $fresh = $source->fresh() ?? $source;
-        app(NbxWebhookDispatcher::class)->dispatch($fresh, $hasVerifiedProgressive ? 'job.partially_completed' : 'job.failed', [
+        app(NbxWebhookDispatcher::class)->dispatch($fresh, $hasVerifiedProgressive
+            ? 'job.partially_completed'
+            : ($processingComplete ? 'job.publication_pending' : 'job.failed'), [
             'stage' => 'final_storage',
             'message' => $message,
         ]);
@@ -711,6 +832,10 @@ class NbxEngineService
             'action_required' => $failure['action_required'] ?? false,
             'storage_disk' => $source->storage_disk,
             'storage_target' => $nbx['storage_target'] ?? null,
+            'processing_complete' => (bool) ($nbx['processing_complete'] ?? false),
+            'storage_verified' => (bool) ($nbx['storage_verified'] ?? false),
+            'publication_status' => $nbx['publication_status'] ?? null,
+            'publication_error' => $nbx['finalization_error'] ?? null,
             'default_storage' => (string) config('nbx.default_storage', 'contabo'),
             'original_url' => $this->artifactUrl($nbx, 'original'),
             'faststart_mp4_url' => $playback['mp4_play_url'] ?? null,
@@ -1179,6 +1304,229 @@ class NbxEngineService
         }
 
         return $outputs;
+    }
+
+    private function hasCompletedLocalOutput(MediaSource $source, array $nbx): bool
+    {
+        $disk = (string) ($source->storage_disk ?: config('nbx.work_storage', config('cdn.disk', 'public')));
+        $requested = (array) ($nbx['requested'] ?? []);
+
+        if ($source->is_faststart
+            && $source->optimize_status === 'ready'
+            && is_string($source->optimized_path)
+            && strtolower((string) pathinfo($source->optimized_path, PATHINFO_EXTENSION)) === 'mp4'
+            && $this->safeExists($disk, $source->optimized_path)
+        ) {
+            return true;
+        }
+        if ($source->hls_master_path && $this->safeExists($disk, (string) $source->hls_master_path)) {
+            return true;
+        }
+
+        return ! (bool) ($requested['faststart'] ?? true)
+            && is_string($source->storage_path)
+            && $this->safeExists($disk, $source->storage_path);
+    }
+
+    private function hasStoredArtifact(array $nbx): bool
+    {
+        foreach (['original', 'faststart', 'hls_master'] as $role) {
+            $artifact = (array) data_get($nbx, 'final_artifacts.'.$role, []);
+            $disk = (string) ($artifact['disk'] ?? '');
+            $key = (string) ($artifact['key'] ?? '');
+            if ($disk !== '' && $key !== '' && app(VerifiedObjectStorageService::class)->head($disk, $key)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function finalStoragePrefix(MediaSource $source): string
+    {
+        $prefix = trim((string) config('services.contabo_object_storage.path_prefix', 'videos'), '/');
+        $job = $source->external_job_id ?: ('source-'.$source->id);
+        $safeJob = Str::slug($job) ?: ('source-'.$source->id);
+
+        return trim($prefix.'/nbx/'.$safeJob, '/');
+    }
+
+    /**
+     * @return array{original:array<int,string>,faststart:array<int,string>,hls_master:array<int,string>}
+     */
+    private function artifactCandidateKeys(string $prefix, array $existing): array
+    {
+        $candidates = ['original' => [], 'faststart' => [], 'hls_master' => []];
+        foreach (array_keys($candidates) as $role) {
+            $key = data_get($existing, $role.'.key');
+            if (is_string($key) && trim($key) !== '') {
+                $candidates[$role][] = ltrim($key, '/');
+            }
+        }
+
+        try {
+            foreach (Storage::disk('contabo')->files($prefix.'/original') as $key) {
+                $candidates['original'][] = ltrim((string) $key, '/');
+            }
+            foreach (Storage::disk('contabo')->files($prefix.'/faststart') as $key) {
+                $candidates['faststart'][] = ltrim((string) $key, '/');
+            }
+            foreach (Storage::disk('contabo')->allFiles($prefix.'/hls') as $key) {
+                if (str_ends_with(strtolower((string) $key), '.m3u8')
+                    && str_contains(strtolower(basename((string) $key)), 'master')) {
+                    $candidates['hls_master'][] = ltrim((string) $key, '/');
+                }
+            }
+        } catch (\Throwable $exception) {
+            throw new \RuntimeException('Final storage could not be inspected. Retry after the storage connection is restored.', 0, $exception);
+        }
+
+        foreach ($candidates as $role => $keys) {
+            $candidates[$role] = array_values(array_unique(array_filter($keys)));
+        }
+
+        return $candidates;
+    }
+
+    private function verifiedExistingArtifact(
+        string $disk,
+        string $key,
+        string $role,
+        array $previous,
+        array $sourceProbe
+    ): ?array {
+        $head = app(VerifiedObjectStorageService::class)->head($disk, $key);
+        if (! is_array($head) || (int) ($head['bytes'] ?? 0) <= 0) {
+            return null;
+        }
+        $previousBytes = (int) ($previous['bytes'] ?? 0);
+        if ($previousBytes > 0 && $previousBytes !== (int) $head['bytes']) {
+            return null;
+        }
+
+        $extension = strtolower((string) pathinfo($key, PATHINFO_EXTENSION));
+        $inspection = [];
+        if ($role === 'faststart') {
+            if ($extension !== 'mp4') {
+                return null;
+            }
+            $inspection = $this->inspectProgressiveObject($disk, $key);
+            if (! ($inspection['is_mp4'] ?? false) || ! ($inspection['fast_start'] ?? false)) {
+                return null;
+            }
+        } elseif ($role === 'hls_master') {
+            if ($extension !== 'm3u8' || ! $this->isHlsManifest($disk, $key)) {
+                return null;
+            }
+        } elseif (! in_array($extension, ['mp4', 'm4v', 'mov', 'mkv', 'webm', 'avi'], true)) {
+            return null;
+        }
+
+        try {
+            $url = Storage::disk($disk)->url($key);
+        } catch (\Throwable) {
+            return null;
+        }
+        if (! is_string($url) || trim($url) === '') {
+            return null;
+        }
+
+        $probe = $sourceProbe;
+        if ($role === 'faststart' && ! $this->probeProvesPlayable($probe)) {
+            $probe = app(VideoProbeService::class)->probeRemote($url);
+        }
+        if ($role === 'faststart' && ! $this->probeProvesPlayable($probe)) {
+            return null;
+        }
+
+        return array_merge($previous, [
+            'role' => $role,
+            'disk' => $disk,
+            'key' => $key,
+            'url' => trim($url),
+            'bytes' => (int) $head['bytes'],
+            'mime_type' => $this->artifactMimeType($key),
+            'etag' => $head['etag'] ?? null,
+            'multipart' => (bool) ($head['multipart'] ?? false),
+            'verified' => true,
+            'verified_at' => now()->toIso8601String(),
+            'reconciled_at' => now()->toIso8601String(),
+            'inspection' => $inspection,
+            'probe' => $probe,
+        ]);
+    }
+
+    /**
+     * Inspect enough of the object to prove MP4 identity and that the moov atom
+     * precedes media data. Closing the stream after eight MiB avoids fetching a
+     * complete movie during reconciliation.
+     *
+     * @return array{is_mp4:bool,fast_start:bool,bytes_inspected:int}
+     */
+    private function inspectProgressiveObject(string $disk, string $key): array
+    {
+        $stream = null;
+        try {
+            $stream = Storage::disk($disk)->readStream($key);
+            if (! is_resource($stream)) {
+                return ['is_mp4' => false, 'fast_start' => false, 'bytes_inspected' => 0];
+            }
+            $buffer = stream_get_contents($stream, 8 * 1024 * 1024);
+            if (! is_string($buffer)) {
+                return ['is_mp4' => false, 'fast_start' => false, 'bytes_inspected' => 0];
+            }
+            $ftyp = strpos($buffer, 'ftyp');
+            $moov = strpos($buffer, 'moov');
+            $mdat = strpos($buffer, 'mdat');
+            $isMp4 = $ftyp !== false && $ftyp <= 32;
+
+            return [
+                'is_mp4' => $isMp4,
+                'fast_start' => $isMp4 && $moov !== false && ($mdat === false || $moov < $mdat),
+                'bytes_inspected' => strlen($buffer),
+            ];
+        } catch (\Throwable) {
+            return ['is_mp4' => false, 'fast_start' => false, 'bytes_inspected' => 0];
+        } finally {
+            if (is_resource($stream)) {
+                fclose($stream);
+            }
+        }
+    }
+
+    private function isHlsManifest(string $disk, string $key): bool
+    {
+        $stream = null;
+        try {
+            $stream = Storage::disk($disk)->readStream($key);
+            $header = is_resource($stream) ? stream_get_contents($stream, 4096) : false;
+
+            return is_string($header) && str_starts_with(ltrim($header), '#EXTM3U');
+        } catch (\Throwable) {
+            return false;
+        } finally {
+            if (is_resource($stream)) {
+                fclose($stream);
+            }
+        }
+    }
+
+    private function probeProvesPlayable(array $probe): bool
+    {
+        return (bool) ($probe['has_video'] ?? false)
+            && (float) ($probe['duration'] ?? $probe['duration_seconds'] ?? 0) > 0;
+    }
+
+    private function artifactMimeType(string $key): string
+    {
+        return match (strtolower((string) pathinfo($key, PATHINFO_EXTENSION))) {
+            'mp4', 'm4v' => 'video/mp4',
+            'mov' => 'video/quicktime',
+            'mkv' => 'video/x-matroska',
+            'webm' => 'video/webm',
+            'm3u8' => 'application/vnd.apple.mpegurl',
+            default => 'application/octet-stream',
+        };
     }
 
     private function validFinalArtifact(array $artifact, string $role): bool
