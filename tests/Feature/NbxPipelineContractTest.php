@@ -246,7 +246,10 @@ class NbxPipelineContractTest extends TestCase
 
         $failed = app(NbxEngineService::class)->finalizeStorageIfNeeded($source);
 
-        $this->assertSame('failed', $failed->processing_stage);
+        $this->assertSame('publication_pending', $failed->processing_stage);
+        $this->assertSame('ready', $failed->status);
+        $this->assertSame('publication_pending', data_get($failed->source_metadata, 'nbx.status'));
+        $this->assertTrue((bool) data_get($failed->source_metadata, 'nbx.processing_complete'));
         $this->assertSame('ready', $failed->optimize_status);
         $this->assertLessThan(100, $failed->progress_percent);
         Storage::disk('public')->assertExists($optimizedPath);
@@ -268,5 +271,119 @@ class NbxPipelineContractTest extends TestCase
             data_get($retried->source_metadata, 'nbx.final_artifacts.faststart.key'),
         );
         Storage::disk('contabo')->assertExists('videos/nbx/retry-storage-job/faststart/movie_play.mp4');
+    }
+
+    public function test_reconcile_restores_a_missing_public_url_without_reprocessing(): void
+    {
+        config()->set('filesystems.disks.contabo.key', 'test-key');
+        config()->set('filesystems.disks.contabo.secret', 'test-secret');
+        $asset = MediaAsset::query()->create([
+            'type' => 'episode',
+            'title' => 'Already processed episode',
+            'status' => 'ready',
+            'visibility' => 'public',
+        ]);
+        $key = 'videos/nbx/reconcile-url-job/faststart/episode_play.mp4';
+        $mp4 = "\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2\x00\x00\x00\x08moov\x00\x00\x00\x08mdat";
+        Storage::disk('contabo')->put($key, $mp4);
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'remote_fetch',
+            'status' => 'failed',
+            'optimize_status' => 'ready',
+            'is_faststart' => true,
+            'progress_percent' => 85,
+            'processing_stage' => 'failed',
+            'external_job_id' => 'reconcile-url-job',
+            'is_active' => false,
+            'source_metadata' => [
+                'provider' => 'nbx_engine',
+                'probe' => ['has_video' => true, 'has_audio' => true, 'duration_seconds' => 2700],
+                'nbx' => [
+                    'status' => 'failed',
+                    'storage_target' => 'contabo',
+                    'requested' => [
+                        'faststart' => true,
+                        'allow_hls_streaming' => false,
+                        'hls' => ['480p' => false, '720p' => false, '1080p' => false],
+                    ],
+                    'final_artifacts' => [
+                        'faststart' => [
+                            'disk' => 'contabo',
+                            'key' => $key,
+                            'bytes' => strlen($mp4),
+                        ],
+                    ],
+                ],
+            ],
+        ]);
+
+        $reconciled = app(NbxEngineService::class)->reconcilePublishedArtifacts($source);
+
+        $this->assertSame('ready', $reconciled->status);
+        $this->assertTrue($reconciled->is_active);
+        $this->assertSame('ready', $reconciled->processing_stage);
+        $this->assertSame(100, $reconciled->progress_percent);
+        $this->assertSame('complete', data_get($reconciled->source_metadata, 'nbx.publication_status'));
+        $this->assertNotEmpty(data_get($reconciled->source_metadata, 'nbx.final_artifacts.faststart.url'));
+        $this->assertTrue((bool) data_get($reconciled->source_metadata, 'nbx.final_artifacts.faststart.inspection.fast_start'));
+        $this->assertCount(1, Storage::disk('contabo')->allFiles('videos/nbx/reconcile-url-job'));
+
+        $again = app(NbxEngineService::class)->reconcilePublishedArtifacts($reconciled);
+        $this->assertSame(
+            data_get($reconciled->source_metadata, 'nbx.final_artifacts.faststart.url'),
+            data_get($again->source_metadata, 'nbx.final_artifacts.faststart.url'),
+        );
+        $this->assertCount(1, Storage::disk('contabo')->allFiles('videos/nbx/reconcile-url-job'));
+    }
+
+    public function test_reconcile_does_not_mislabel_a_legacy_mkv_as_faststart_mp4(): void
+    {
+        config()->set('filesystems.disks.contabo.key', 'test-key');
+        config()->set('filesystems.disks.contabo.secret', 'test-secret');
+        $asset = MediaAsset::query()->create([
+            'type' => 'episode',
+            'title' => 'Legacy mislabeled package',
+            'status' => 'ready',
+            'visibility' => 'public',
+        ]);
+        $originalKey = 'videos/nbx/legacy-mkv-job/original/episode.mkv';
+        $faststartKey = 'videos/nbx/legacy-mkv-job/faststart/episode.mkv';
+        Storage::disk('contabo')->put($originalKey, 'same-matroska-bytes');
+        Storage::disk('contabo')->put($faststartKey, 'same-matroska-bytes');
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'remote_fetch',
+            'status' => 'failed',
+            'optimize_status' => 'ready',
+            'is_faststart' => true,
+            'progress_percent' => 85,
+            'external_job_id' => 'legacy-mkv-job',
+            'is_active' => false,
+            'source_metadata' => [
+                'provider' => 'nbx_engine',
+                'probe' => ['has_video' => true, 'duration_seconds' => 2400, 'container' => 'matroska,webm'],
+                'nbx' => [
+                    'status' => 'failed',
+                    'storage_target' => 'contabo',
+                    'requested' => [
+                        'faststart' => true,
+                        'allow_hls_streaming' => false,
+                        'hls' => ['480p' => false, '720p' => false, '1080p' => false],
+                    ],
+                ],
+            ],
+        ]);
+
+        $reconciled = app(NbxEngineService::class)->reconcilePublishedArtifacts($source);
+
+        $this->assertSame('ready', $reconciled->status);
+        $this->assertFalse($reconciled->is_active);
+        $this->assertSame('publication_attention', $reconciled->processing_stage);
+        $this->assertSame(100, $reconciled->progress_percent);
+        $this->assertSame('attention_required', data_get($reconciled->source_metadata, 'nbx.publication_status'));
+        $this->assertNotEmpty(data_get($reconciled->source_metadata, 'nbx.final_artifacts.original.url'));
+        $this->assertNull(data_get($reconciled->source_metadata, 'nbx.final_artifacts.faststart.url'));
+        $this->assertNull(app(\App\Services\MediaSourceService::class)->buildMp4PlayUrl($reconciled));
     }
 }

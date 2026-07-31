@@ -321,7 +321,7 @@ class MediaSourcesRelationManager extends RelationManager
                     ->color(fn (string $state): string => match ($state) {
                         'ready' => 'success',
                         'failed' => 'danger',
-                        'downloading', 'processing', 'proxying', 'uploading' => 'warning',
+                        'downloading', 'processing', 'proxying', 'uploading', 'publication_pending' => 'warning',
                         default => 'info',
                     }),
                 Tables\Columns\IconColumn::make('is_active')
@@ -720,6 +720,35 @@ class MediaSourcesRelationManager extends RelationManager
                             ->success()
                             ->title('Status refreshed')
                             ->send();
+                    }),
+                Tables\Actions\Action::make('reconcile_publication')
+                    ->label('Verify storage & repair URL')
+                    ->icon('heroicon-o-shield-check')
+                    ->visible(function (MediaSource $record): bool {
+                        $metadata = (array) ($record->source_metadata ?? []);
+
+                        return ($metadata['provider'] ?? null) === 'nbx_engine' || isset($metadata['nbx']);
+                    })
+                    ->requiresConfirmation()
+                    ->modalHeading('Verify existing storage package')
+                    ->modalDescription('Checks the files already stored for this job and restores verified URLs. It does not encode, copy, rename, or delete media.')
+                    ->action(function (MediaSource $record): void {
+                        try {
+                            $result = app(NbxEngineService::class)->reconcilePublishedArtifacts($record);
+                            app(MediaSourceService::class)->refreshAssetStatus($result->asset);
+                            $publicationStatus = (string) data_get($result->source_metadata, 'nbx.publication_status', 'checked');
+                            Notification::make()
+                                ->success()
+                                ->title('Storage verification finished')
+                                ->body('Publication status: '.str_replace('_', ' ', $publicationStatus).'. Verified URLs were synchronized.')
+                                ->send();
+                        } catch (\Throwable $exception) {
+                            Notification::make()
+                                ->danger()
+                                ->title('Storage verification could not finish')
+                                ->body($exception->getMessage())
+                                ->send();
+                        }
                     }),
                 Tables\Actions\Action::make('retry_import')
                     ->label('Retry import now')
