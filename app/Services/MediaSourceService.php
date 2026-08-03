@@ -953,11 +953,15 @@ class MediaSourceService
             return;
         }
 
-        // Never move progress backwards.
+        // Never move progress backwards, but keep the byte heartbeat moving even
+        // while a large transfer remains within the same visible percentage.
         $currentPercent = (int) ($fresh->progress_percent ?? 0);
-        if ($percent <= $currentPercent) {
+        $currentBytes = (int) ($fresh->bytes_downloaded ?? 0);
+        if ($percent < $currentPercent || ($percent === $currentPercent && $safeDownloaded <= $currentBytes)) {
             return;
         }
+
+        $percent = max($percent, $currentPercent);
 
         $fresh->forceFill([
             'status' => $status ?? $fresh->status,

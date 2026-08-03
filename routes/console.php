@@ -266,7 +266,9 @@ Artisan::command('cdn:reconcile {--minutes=30}', function (MediaSourceService $m
         }
 
         if ($source->source_type === 'remote_fetch' && $source->source_url) {
-            $mediaSourceService->queueRemoteImport($source);
+            // Preserve the lease id so a stale proxy/worker handoff cannot block
+            // the coordinator from resuming its existing partial file.
+            $mediaSourceService->queueRemoteImport($source, true);
             $requeued++;
         } else {
             $source->update([

@@ -5,6 +5,7 @@ namespace App\Jobs;
 use App\Models\MediaSource;
 use App\Services\MediaSourceService;
 use App\Services\NbxEngineService;
+use App\Services\ResumableRemoteFetcher;
 use App\Services\VideoProbeService;
 use App\Support\SafeRemoteMediaUrl;
 use Illuminate\Bus\Queueable;
@@ -52,7 +53,7 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
         ];
     }
 
-    public function handle(MediaSourceService $mediaSourceService): void
+    public function handle(MediaSourceService $mediaSourceService, ResumableRemoteFetcher $remoteFetcher): void
     {
         $source = MediaSource::with('asset')->find($this->sourceId);
 
@@ -112,45 +113,26 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
 
         $storagePath = null;
         $absolutePath = null;
+        $downloadCommitted = false;
 
         try {
             app(NbxEngineService::class)->markNbxStatus($source, 'fetching');
-            $contentLength = null;
-            $contentType = null;
-            try {
-                $headResponse = Http::connectTimeout(30)
-                    ->timeout(45)
-                    ->withHeaders([
-                        'User-Agent' => 'NaraboxCDNImporter/1.0',
-                        'Accept' => '*/*',
-                    ])
-                    ->withOptions($this->safeRedirectOptions())
-                    ->head($sourceUrl);
-                if ($headResponse->successful()) {
-                    $lengthHeader = $headResponse->header('Content-Length');
-                    if (is_numeric($lengthHeader)) {
-                        $contentLength = max(0, (int) $lengthHeader);
-                    }
-
-                    $headerContentType = $headResponse->header('Content-Type');
-                    if (is_string($headerContentType) && $headerContentType !== '') {
-                        $contentType = trim(strtolower(explode(';', $headerContentType)[0]));
-                    }
-                }
-            } catch (\Throwable) {
-                $contentLength = null;
-                $contentType = null;
-            }
+            // A tiny GET probe is intentional. Scripted download endpoints often
+            // answer HEAD differently, while a validated 206 proves resume support.
+            $fetchProbe = $remoteFetcher->probe($sourceUrl);
+            $contentLength = $fetchProbe->expectedSize;
+            $contentType = $fetchProbe->contentType;
 
             $filename = $this->resolveRemoteFilename($sourceUrl, $source->id, $contentType);
             $storagePath = sprintf('media/%s/%d/%s', $source->media_asset_id, $source->id, $filename);
             $workDisk = (string) config('nbx.work_storage', $mediaSourceService->storageDisk());
             $absolutePath = Storage::disk($workDisk)->path($storagePath);
+            $partialPath = $absolutePath.'.part';
 
             Storage::disk($workDisk)->makeDirectory(dirname($storagePath));
 
             $source->update([
-                'status' => 'processing',
+                'status' => 'downloading',
                 'bytes_total' => $contentLength,
             ]);
 
@@ -197,38 +179,53 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
                     $source->fresh(),
                     $downloaded,
                     $total,
-                    'processing'
+                    'downloading'
                 );
             };
 
-            try {
-                $this->downloadRemoteFile(
-                    $sourceUrl,
-                    $absolutePath,
-                    $downloadProgress,
-                    $source
-                );
-            } catch (\Throwable $downloadError) {
-                if (! $this->shouldUseProxyFallback($downloadError)) {
-                    throw $downloadError;
+            $existingSize = is_file($absolutePath) ? (int) filesize($absolutePath) : 0;
+            if ($contentLength !== null && $contentLength > 0 && $existingSize === $contentLength) {
+                $downloadCommitted = true;
+                $downloadProgress($contentLength, $existingSize);
+            } else {
+                try {
+                    $remoteFetcher->download(
+                        $source,
+                        $sourceUrl,
+                        $partialPath,
+                        $downloadProgress,
+                        $fetchProbe,
+                    );
+                } catch (\Throwable $downloadError) {
+                    if (! $this->shouldUseProxyFallback($downloadError)) {
+                        throw $downloadError;
+                    }
+
+                    $source->update([
+                        'status' => 'proxying',
+                        'failure_reason' => null,
+                        'last_error' => $downloadError->getMessage(),
+                        'last_attempt_host' => parse_url((string) $source->source_url, PHP_URL_HOST) ?: null,
+                        'last_progress_at' => now(),
+                    ]);
+                    $remoteFetcher->markAwaitingFallback($source, $downloadError->getMessage());
+
+                    $this->requestExternalFallback($source, $filename, $contentType, $contentLength, $downloadError);
+                    $mediaSourceService->refreshAssetStatus($source->asset);
+
+                    return;
                 }
 
+                if (! is_file($partialPath) || filesize($partialPath) <= 0) {
+                    throw new \RuntimeException('Downloaded partial file is empty.');
+                }
                 if (is_file($absolutePath)) {
                     @unlink($absolutePath);
                 }
-
-                $source->update([
-                    'status' => 'proxying',
-                    'failure_reason' => null,
-                    'last_error' => $downloadError->getMessage(),
-                    'last_attempt_host' => parse_url((string) $source->source_url, PHP_URL_HOST) ?: null,
-                    'last_progress_at' => now(),
-                ]);
-
-                $this->requestExternalFallback($source, $filename, $contentType, $contentLength, $downloadError);
-                $mediaSourceService->refreshAssetStatus($source->asset);
-
-                return;
+                if (! rename($partialPath, $absolutePath)) {
+                    throw new \RuntimeException('Downloaded file could not be committed from its resumable checkpoint.');
+                }
+                $downloadCommitted = true;
             }
 
             if (! is_file($absolutePath) || filesize($absolutePath) <= 0) {
@@ -237,35 +234,15 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
 
             $mimeType = @mime_content_type($absolutePath) ?: 'application/octet-stream';
             $size = (int) filesize($absolutePath);
-            if ($contentLength !== null && $contentLength > 0 && $size > 0) {
-                // Allow a tolerance for providers that slightly mis-report Content-Length,
-                // especially on large files – only treat as truncated if we are clearly short.
-                $toleranceBytes = max((int) ($contentLength * 0.02), 5 * 1024 * 1024); // 2% or 5MB
-                if ($size + $toleranceBytes < $contentLength) {
-                    if (is_file($absolutePath)) {
-                        @unlink($absolutePath);
-                    }
-
-                    $source->update([
-                        'status' => 'proxying',
-                        'failure_reason' => null,
-                        'last_error' => sprintf('remote_truncated: downloaded %d of %d bytes (expected %d)', $size, $contentLength, $contentLength),
-                        'last_attempt_host' => parse_url((string) $source->source_url, PHP_URL_HOST) ?: null,
-                        'last_progress_at' => now(),
-                    ]);
-
-                    $this->requestExternalFallback(
-                        $source,
-                        $filename,
-                        $contentType,
-                        $contentLength,
-                        new \RuntimeException('remote_truncated')
-                    );
-                    $mediaSourceService->refreshAssetStatus($source->asset);
-
-                    return;
-                }
+            if ($contentLength !== null && $contentLength > 0 && $size !== $contentLength) {
+                throw new \RuntimeException(sprintf(
+                    'remote_truncated: downloaded %d of %d bytes',
+                    $size,
+                    $contentLength
+                ));
             }
+
+            $source->update(['status' => 'processing', 'last_progress_at' => now()]);
             $preferredExtension = $this->extensionFromMimeType($mimeType);
             $currentExtension = strtolower((string) pathinfo($storagePath, PATHINFO_EXTENSION));
             $knownVideoExtensions = ['mp4', 'm4v', 'mov', 'mkv', 'webm', 'avi', 'mpeg', 'mpg', 'ts', 'm2ts'];
@@ -334,7 +311,7 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
             // A ready source belongs to the optimization pipeline. If a
             // synchronous dispatch fails, deleting it here races FFmpeg and
             // destroys an otherwise valid intake.
-            if ($source->status !== 'ready' && is_string($absolutePath) && is_file($absolutePath)) {
+            if (! $downloadCommitted && $source->status !== 'ready' && is_string($absolutePath) && is_file($absolutePath)) {
                 @unlink($absolutePath);
             }
 
@@ -460,91 +437,13 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
             || str_contains($message, 'operation timed out')
             || str_contains($message, 'failed writing body')
             || str_contains($message, 'unexpected eof')
+            || str_contains($message, 'remote range')
+            || str_contains($message, 'range returned')
+            || str_contains($message, 'ignored range')
+            || str_contains($message, 'content-range')
+            || str_contains($message, 'resumable download')
             || str_contains($message, "couldn't connect to server")
             || str_contains($message, 'failed to connect');
-    }
-
-    private function downloadRemoteFile(string $url, string $absolutePath, callable $progress, MediaSource $source): void
-    {
-        SafeRemoteMediaUrl::assertAllowed($url);
-
-        $attempts = [
-            [
-                'label' => 'default-network',
-                'options' => [],
-            ],
-            [
-                'label' => 'force-ipv4',
-                'options' => ['force_ip_resolve' => 'v4'],
-            ],
-            [
-                'label' => 'force-ipv6',
-                'options' => ['force_ip_resolve' => 'v6'],
-            ],
-        ];
-
-        $lastError = null;
-
-        foreach ($attempts as $attempt) {
-            $curlConnectTime = null;
-            try {
-                Http::connectTimeout(60)
-                    ->timeout(7200)
-                    ->retry(2, 1200)
-                    ->withHeaders([
-                        'User-Agent' => 'NaraboxCDNImporter/1.0',
-                        'Accept' => '*/*',
-                    ])
-                    ->withOptions(array_merge([
-                        'sink' => $absolutePath,
-                        'progress' => $progress,
-                        'allow_redirects' => $this->safeRedirectOptions()['allow_redirects'],
-                        'on_stats' => function ($stats) use (&$curlConnectTime): void {
-                            if (method_exists($stats, 'getHandlerStats')) {
-                                $handlerStats = (array) $stats->getHandlerStats();
-                                $curlConnectTime = isset($handlerStats['connect_time']) ? (float) $handlerStats['connect_time'] : null;
-                            }
-                        },
-                    ], $attempt['options']))
-                    ->get($url)
-                    ->throw();
-
-                return;
-            } catch (\Throwable $error) {
-                $lastError = $error;
-
-                Log::warning('Remote download attempt failed', [
-                    'source_id' => $source->id,
-                    'asset_id' => $source->media_asset_id,
-                    'attempt' => $attempt['label'],
-                    'host' => parse_url($url, PHP_URL_HOST) ?: null,
-                    'curl_errno' => $this->extractCurlErrno($error),
-                    'connect_time' => $curlConnectTime,
-                    'error' => $error->getMessage(),
-                ]);
-
-                if (! $this->shouldUseProxyFallback($error)) {
-                    throw $error;
-                }
-            }
-        }
-
-        if ($lastError) {
-            throw $lastError;
-        }
-    }
-
-    private function safeRedirectOptions(): array
-    {
-        return [
-            'allow_redirects' => [
-                'max' => max(0, (int) config('nbx.ssrf.max_redirects', 5)),
-                'strict' => true,
-                'on_redirect' => static function ($request, $response, $uri): void {
-                    SafeRemoteMediaUrl::assertAllowed((string) $uri);
-                },
-            ],
-        ];
     }
 
     private function requestExternalFallback(
@@ -641,16 +540,5 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
             $error = is_array($body) ? ($body['error'] ?? null) : null;
             throw new \RuntimeException((string) ($error ?: ('Portal proxy request failed with status '.$response->status())));
         }
-    }
-
-    private function extractCurlErrno(\Throwable $throwable): ?int
-    {
-        $message = $throwable->getMessage();
-
-        if (preg_match('/cURL error\s+(\d+)/i', $message, $matches) === 1) {
-            return (int) $matches[1];
-        }
-
-        return null;
     }
 }

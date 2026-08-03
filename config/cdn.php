@@ -19,6 +19,16 @@ return [
     'optimization_dashboard_batch_limit' => (int) env('CDN_OPTIMIZATION_DASHBOARD_BATCH_LIMIT', 10),
     'api_token_touch_interval_seconds' => (int) env('CDN_API_TOKEN_TOUCH_INTERVAL_SECONDS', 300),
 
+    // Remote sources are fetched as small, verified byte ranges. One MiB is
+    // deliberately conservative for PHP/Cloudflare download scripts that close
+    // larger responses early; completed bytes survive every retry.
+    'remote_fetch_chunk_bytes' => (int) env('CDN_REMOTE_FETCH_CHUNK_BYTES', 1048576),
+    'remote_fetch_part_attempts' => (int) env('CDN_REMOTE_FETCH_PART_ATTEMPTS', 20),
+    'remote_fetch_retry_wait_ms' => (int) env('CDN_REMOTE_FETCH_RETRY_WAIT_MS', 1000),
+    'remote_fetch_probe_timeout' => (int) env('CDN_REMOTE_FETCH_PROBE_TIMEOUT', 45),
+    'remote_fetch_chunk_timeout' => (int) env('CDN_REMOTE_FETCH_CHUNK_TIMEOUT', 90),
+    'remote_fetch_user_agent' => (string) env('CDN_REMOTE_FETCH_USER_AGENT', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'),
+
     'default_import_mode' => in_array(env('CDN_DEFAULT_IMPORT_MODE', 'queue'), ['now', 'queue'], true)
         ? env('CDN_DEFAULT_IMPORT_MODE', 'queue')
         : 'queue',
