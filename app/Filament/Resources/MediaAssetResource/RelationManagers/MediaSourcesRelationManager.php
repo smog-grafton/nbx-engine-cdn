@@ -278,12 +278,12 @@ class MediaSourcesRelationManager extends RelationManager
                 ->disabled()
                 ->dehydrated(false)
                 ->rows(2)
-                ->visible(fn (?MediaSource $record): bool => (bool) $record?->failure_reason),
+                ->visible(fn (?MediaSource $record): bool => $record?->status === 'failed' && filled($record->failure_reason)),
             Forms\Components\Textarea::make('last_error')
                 ->disabled()
                 ->dehydrated(false)
                 ->rows(3)
-                ->visible(fn (?MediaSource $record): bool => (bool) $record?->last_error),
+                ->visible(fn (?MediaSource $record): bool => $record?->status === 'failed' && filled($record->last_error)),
         ]);
     }
 

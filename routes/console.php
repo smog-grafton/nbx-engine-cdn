@@ -252,16 +252,37 @@ Artisan::command('cdn:reconcile {--minutes=30}', function (MediaSourceService $m
     foreach ($staleSources as $source) {
         /** @var MediaSource $source */
         if ($source->storage_path && $source->storage_disk) {
-            $exists = \Illuminate\Support\Facades\Storage::disk($source->storage_disk)->exists($source->storage_path);
+            $disk = \Illuminate\Support\Facades\Storage::disk($source->storage_disk);
+            $exists = $disk->exists($source->storage_path);
             if ($exists) {
-                $source->update([
-                    'status' => 'ready',
-                    'failure_reason' => null,
-                ]);
-                $mediaSourceService->refreshAssetStatus($source->asset);
-                $restoredReady++;
+                $storedSize = (int) $disk->size($source->storage_path);
+                $expectedSize = (int) ($source->bytes_total ?: $source->file_size_bytes ?: 0);
 
-                continue;
+                // Existence alone is not completion. A truncated object must be
+                // re-fetched instead of being promoted to ready.
+                if ($storedSize <= 0 || ($expectedSize > 0 && $storedSize !== $expectedSize)) {
+                    $source->update([
+                        'last_error' => $storedSize <= 0
+                            ? 'Stored import is empty; resumable fetch will retry it.'
+                            : "Stored import size mismatch: found {$storedSize} bytes, expected {$expectedSize}.",
+                    ]);
+                } else {
+                    $source->update([
+                        'status' => 'ready',
+                        'failure_reason' => null,
+                        'last_error' => null,
+                        'progress_percent' => 100,
+                        'bytes_downloaded' => $storedSize,
+                        'bytes_total' => $expectedSize > 0 ? $expectedSize : $storedSize,
+                        'file_size_bytes' => $storedSize,
+                        'last_progress_at' => now(),
+                        'completed_at' => now(),
+                    ]);
+                    $mediaSourceService->refreshAssetStatus($source->asset);
+                    $restoredReady++;
+
+                    continue;
+                }
             }
         }
 

@@ -153,6 +153,85 @@ class CdnLoadHardeningTest extends TestCase
         $this->assertSame('https://cdn.example.com/media-hls/'.$asset->id.'/'.$source->id.'/720p/index.m3u8', $manifest['qualities'][1]['url']);
     }
 
+    public function test_reconciler_finalizes_a_complete_stored_import_and_clears_stale_errors(): void
+    {
+        config()->set('cdn.disk', 'public');
+
+        $asset = MediaAsset::query()->create([
+            'type' => 'movie',
+            'title' => 'Completed import with stale state',
+            'status' => 'importing',
+            'visibility' => 'unlisted',
+        ]);
+        $path = 'media/'.$asset->id.'/15/movie.mp4';
+        Storage::disk('public')->put($path, str_repeat('x', 2048));
+
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'remote_fetch',
+            'source_url' => 'https://example.com/movie.mp4',
+            'storage_disk' => 'public',
+            'storage_path' => $path,
+            'status' => 'processing',
+            'failure_reason' => 'Old failure message.',
+            'last_error' => 'Old cURL error.',
+            'progress_percent' => 100,
+            'bytes_downloaded' => 2048,
+            'bytes_total' => 2048,
+            'last_progress_at' => now()->subHour(),
+            'is_active' => true,
+        ]);
+        MediaSource::withoutTimestamps(fn () => $source->forceFill(['updated_at' => now()->subHour()])->saveQuietly());
+
+        Artisan::call('cdn:reconcile', ['--minutes' => 30]);
+
+        $source->refresh();
+        $this->assertSame('ready', $source->status);
+        $this->assertSame(100, $source->progress_percent);
+        $this->assertSame(2048, $source->file_size_bytes);
+        $this->assertNull($source->failure_reason);
+        $this->assertNull($source->last_error);
+        $this->assertNotNull($source->completed_at);
+        $this->assertSame('ready', $asset->fresh()->status);
+    }
+
+    public function test_reconciler_does_not_finalize_a_truncated_stored_import(): void
+    {
+        config()->set('cdn.disk', 'public');
+        config()->set('queue.default', 'database');
+
+        $asset = MediaAsset::query()->create([
+            'type' => 'movie',
+            'title' => 'Truncated stored import',
+            'status' => 'importing',
+            'visibility' => 'unlisted',
+        ]);
+        $path = 'media/'.$asset->id.'/16/movie.mp4';
+        Storage::disk('public')->put($path, str_repeat('x', 1024));
+
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'remote_fetch',
+            'source_url' => 'https://example.com/movie.mp4',
+            'storage_disk' => 'public',
+            'storage_path' => $path,
+            'status' => 'processing',
+            'progress_percent' => 100,
+            'bytes_downloaded' => 1024,
+            'bytes_total' => 2048,
+            'last_progress_at' => now()->subHour(),
+            'is_active' => true,
+        ]);
+        MediaSource::withoutTimestamps(fn () => $source->forceFill(['updated_at' => now()->subHour()])->saveQuietly());
+
+        Artisan::call('cdn:reconcile', ['--minutes' => 30]);
+
+        $source->refresh();
+        $this->assertSame('pending', $source->status);
+        $this->assertNull($source->completed_at);
+        $this->assertDatabaseCount('jobs', 1);
+    }
+
     public function test_import_endpoint_normalizes_bracketed_m4v_source_urls(): void
     {
         config()->set('queue.default', 'database');
