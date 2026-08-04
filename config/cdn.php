@@ -14,6 +14,12 @@ return [
     'ffmpeg_heartbeat_seconds' => (int) env('CDN_FFMPEG_HEARTBEAT_SECONDS', 10),
     'ffmpeg_diagnostics_max_bytes' => (int) env('CDN_FFMPEG_DIAGNOSTICS_MAX_BYTES', 12000),
     'ffmpeg_threads' => (int) env('CDN_FFMPEG_THREADS', 0),
+    // ffprobe previously had no timeout anywhere in the codebase and could
+    // hang a worker indefinitely on a large/borderline-corrupt file.
+    'ffprobe_timeout_seconds' => (int) env('CDN_FFPROBE_TIMEOUT_SECONDS', 120),
+    // Floor reserved on top of the estimated requirement by LocalDiskSpaceGuard
+    // before a download/transcode/HLS stage is allowed to start.
+    'disk_space_reserve_bytes' => (int) env('CDN_DISK_SPACE_RESERVE_BYTES', 1073741824),
     'admin_sources_polling_interval' => (string) env('CDN_ADMIN_SOURCES_POLLING_INTERVAL', '15s'),
     'admin_queue_stats_polling_interval' => (string) env('CDN_ADMIN_QUEUE_STATS_POLLING_INTERVAL', '60s'),
     'optimization_dashboard_batch_limit' => (int) env('CDN_OPTIMIZATION_DASHBOARD_BATCH_LIMIT', 10),

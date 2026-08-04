@@ -3,6 +3,8 @@
 namespace App\Jobs;
 
 use App\Models\MediaSource;
+use App\Services\InsufficientDiskSpaceException;
+use App\Services\LocalDiskSpaceGuard;
 use App\Services\MediaSourceService;
 use App\Services\NbxEngineService;
 use App\Services\ResumableRemoteFetcher;
@@ -44,12 +46,24 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
         return 'remote-import:'.$this->sourceId;
     }
 
+    /**
+     * Bound how long a lock-blocked dispatch keeps retrying, independent of
+     * $tries. See OptimizeMp4FaststartJob::retryUntil() for why this matters:
+     * dontRelease() previously meant a worker crash mid-download during a
+     * >1GB fetch left this lock held for up to expireAfter (default 4h),
+     * during which every automatic and manual retry silently no-op'd.
+     */
+    public function retryUntil(): \DateTimeInterface
+    {
+        return now()->addHours(12);
+    }
+
     public function middleware(): array
     {
         return [
             (new WithoutOverlapping('remote-import:'.$this->sourceId))
                 ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 14400)))
-                ->dontRelease(),
+                ->releaseAfter(300),
         ];
     }
 
@@ -130,6 +144,27 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
             $partialPath = $absolutePath.'.part';
 
             Storage::disk($workDisk)->makeDirectory(dirname($storagePath));
+
+            if ($contentLength > 0) {
+                try {
+                    app(LocalDiskSpaceGuard::class)->ensureAvailable(
+                        $absolutePath,
+                        $contentLength,
+                        "download of source #{$source->id} ({$contentLength} bytes)"
+                    );
+                } catch (InsufficientDiskSpaceException $spaceError) {
+                    $source->update([
+                        'status' => 'failed',
+                        'failure_reason' => $spaceError->getMessage(),
+                        'last_error' => $spaceError->getMessage(),
+                        'completed_at' => now(),
+                    ]);
+                    app(NbxEngineService::class)->markNbxStatus($source->fresh() ?? $source, 'failed', $spaceError->getMessage());
+                    $mediaSourceService->refreshAssetStatus($source->asset);
+
+                    return;
+                }
+            }
 
             $source->update([
                 'status' => 'downloading',

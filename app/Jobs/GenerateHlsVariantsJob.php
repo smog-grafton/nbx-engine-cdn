@@ -43,12 +43,22 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
         return 'optimization:hls:'.$this->sourceId.':'.($this->attemptId ?: 'legacy');
     }
 
+    /**
+     * Bound how long a lock-blocked dispatch keeps retrying, independent of
+     * $tries. See OptimizeMp4FaststartJob::retryUntil() for why this matters.
+     */
+    public function retryUntil(): \DateTimeInterface
+    {
+        return now()->addHours(12);
+    }
+
     public function middleware(): array
     {
         $locks = [
+            // releaseAfter (not dontRelease) — see OptimizeMp4FaststartJob.
             (new WithoutOverlapping('optimization:source:'.$this->sourceId))
                 ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 25200)))
-                ->dontRelease(),
+                ->releaseAfter(300),
         ];
 
         if ((bool) config('cdn.serialize_optimization_jobs', true)) {
@@ -183,6 +193,33 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
 
         $hlsBasePath = sprintf('media/%s/%d/hls', $source->media_asset_id, $source->id);
         $hlsBaseAbsolute = Storage::disk($disk)->path($hlsBasePath);
+
+        $inputSize = (int) (@filesize($inputAbsolute) ?: 0);
+        if ($inputSize > 0) {
+            // Each requested HLS rendition is roughly comparable in size to
+            // the source; scale the safety estimate by how many were asked for.
+            $estimated = app(\App\Services\LocalDiskSpaceGuard::class)->estimateTranscodeOutputBytes($inputSize) * max(1, count($profiles));
+            try {
+                app(\App\Services\LocalDiskSpaceGuard::class)->ensureAvailable(
+                    $hlsBaseAbsolute,
+                    $estimated,
+                    "HLS output (".count($profiles)." profile(s)) for source #{$source->id}"
+                );
+            } catch (\App\Services\InsufficientDiskSpaceException $spaceError) {
+                $source->update([
+                    'optimize_status' => 'failed',
+                    'optimize_error' => $spaceError->getMessage(),
+                    'processing_stage' => 'failed',
+                    'processing_stage_progress' => null,
+                    'processing_heartbeat_at' => now(),
+                    'processing_diagnostics' => $spaceError->getMessage(),
+                ]);
+                app(NbxEngineService::class)->markNbxStatus($source->fresh() ?? $source, 'failed', $spaceError->getMessage());
+
+                return;
+            }
+        }
+
         Storage::disk($disk)->deleteDirectory($hlsBasePath);
         Storage::disk($disk)->makeDirectory($hlsBasePath);
 

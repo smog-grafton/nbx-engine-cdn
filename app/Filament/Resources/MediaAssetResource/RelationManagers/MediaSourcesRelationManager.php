@@ -106,10 +106,30 @@ class MediaSourcesRelationManager extends RelationManager
                 ->schema([
                     Forms\Components\Select::make('storage_target')
                         ->label('Final storage')
-                        ->default((string) config('nbx.default_storage', 'contabo'))
-                        ->options(fn (): array => (bool) config('nbx.allow_local_storage', true)
-                            ? ['contabo' => 'Contabo Object Storage', 'local' => 'Local public disk']
-                            : ['contabo' => 'Contabo Object Storage'])
+                        ->default('auto')
+                        ->options(function (): array {
+                            $options = ['auto' => 'Automatic — Recommended'];
+                            foreach (app(\App\Services\Storage\StorageTargetRegistry::class)->all() as $target) {
+                                $options[$target->key] = $target->label;
+                            }
+                            if ((bool) config('nbx.allow_local_storage', true)) {
+                                $options['local'] = 'Local public disk';
+                            }
+
+                            return $options;
+                        })
+                        ->helperText(function (): string {
+                            try {
+                                $rows = app(\App\Services\Storage\AutomaticStorageSelector::class)->statusForAllTargets();
+                            } catch (\Throwable) {
+                                return '';
+                            }
+
+                            return implode('  ·  ', array_map(
+                                fn (array $r) => $r['label'].': '.$r['used_percent'].'% used'.($r['past_soft_limit'] ? ' ⚠ near limit' : ''),
+                                $rows
+                            ));
+                        })
                         ->required(),
                     Forms\Components\Toggle::make('faststart')
                         ->label('Faststart MP4')

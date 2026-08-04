@@ -4,6 +4,8 @@ namespace App\Services;
 
 use App\Models\MediaAsset;
 use App\Models\MediaSource;
+use App\Services\Storage\AutomaticStorageSelector;
+use App\Services\Storage\StorageTargetRegistry;
 use App\Support\SafeRemoteMediaUrl;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Log;
@@ -12,6 +14,70 @@ use Illuminate\Support\Str;
 
 class NbxEngineService
 {
+    /**
+     * Resolve the raw "storage_target" a caller sent (which may be "auto",
+     * a legacy "contabo" literal, a logical bucket key, or "local"/"public")
+     * into a CONCRETE key at job-creation time. This is deliberately done
+     * once, up front — resolving "auto" again later (at publish time) could
+     * pick a different bucket mid-job and split one job's outputs across
+     * two buckets, which is not allowed.
+     *
+     * Returns 'local'/'public' verbatim (non-Contabo storage), or a
+     * concrete logical bucket key (e.g. "contabo_nbx", "contabo_nb_nbx").
+     */
+    private function resolveInitialStorageTarget(array $data): string
+    {
+        $raw = (string) ($data['storage_target'] ?? config('nbx.default_storage', 'contabo'));
+
+        if (in_array($raw, ['local', 'public'], true)) {
+            return (bool) config('nbx.allow_local_storage', true) ? $raw : 'contabo';
+        }
+
+        $registry = app(StorageTargetRegistry::class);
+        $requestedKey = $registry->isAutoKey($raw) ? null : $registry->normalizeStoredKey($raw);
+
+        $inputBytes = isset($data['size_bytes']) ? (int) $data['size_bytes']
+            : (isset($data['file_size_bytes']) ? (int) $data['file_size_bytes'] : 0);
+        $selector = app(AutomaticStorageSelector::class);
+        $expectedBytes = $inputBytes > 0 ? $selector->estimateTranscodeOutputBytes($inputBytes) : 0;
+
+        return $selector->resolve($requestedKey, $expectedBytes)['target']->key;
+    }
+
+    private function storageTargetColumnValue(string $resolvedStorageTarget): ?string
+    {
+        return in_array($resolvedStorageTarget, ['local', 'public'], true) ? null : $resolvedStorageTarget;
+    }
+
+    /**
+     * Resolve an already-concrete storage_target (set once at job creation
+     * by resolveInitialStorageTarget) to its Laravel filesystem disk name.
+     *
+     * @return array{disk: string, is_contabo: bool, target_key: ?string}
+     */
+    private function resolveDiskForTarget(string $target): array
+    {
+        if (in_array($target, ['local', 'public'], true)) {
+            return ['disk' => 'public', 'is_contabo' => false, 'target_key' => null];
+        }
+
+        $registry = app(StorageTargetRegistry::class);
+
+        // Normally "auto" is resolved once at job creation (see
+        // resolveInitialStorageTarget) so a whole job's outputs land on one
+        // target. This is a defensive fallback for callers that bypassed
+        // that (e.g. an admin explicitly re-picking "Automatic" on retry).
+        if ($registry->isAutoKey($target)) {
+            $storageTarget = app(AutomaticStorageSelector::class)->resolveAutomatic(0)['target'];
+
+            return ['disk' => $storageTarget->disk, 'is_contabo' => true, 'target_key' => $storageTarget->key];
+        }
+
+        $storageTarget = $registry->findOrFail($registry->normalizeStoredKey($target));
+
+        return ['disk' => $storageTarget->disk, 'is_contabo' => true, 'target_key' => $storageTarget->key];
+    }
+
     public function createRemoteJob(array $data, MediaSourceService $mediaSourceService): MediaSource
     {
         $sourceUrl = SafeRemoteMediaUrl::assertAllowed((string) ($data['source_url'] ?? ''));
@@ -20,6 +86,10 @@ class NbxEngineService
         }
 
         $inputType = ($data['input_type'] ?? null) === 'object_storage' ? 'object_storage' : 'remote_fetch';
+        // Resolve "auto"/legacy storage_target to a concrete key ONCE, up
+        // front, so this job's outputs all land on one target regardless of
+        // how long processing takes or how usage changes meanwhile.
+        $data['storage_target'] = $this->resolveInitialStorageTarget($data);
         $asset = MediaAsset::create([
             'type' => (string) ($data['asset_type'] ?? 'generic'),
             'title' => (string) ($data['title'] ?? basename((string) parse_url($sourceUrl, PHP_URL_PATH)) ?: 'NBX Media'),
@@ -32,6 +102,7 @@ class NbxEngineService
             'media_asset_id' => $asset->id,
             'source_type' => 'remote_fetch',
             'source_url' => $sourceUrl,
+            'storage_target_key' => $this->storageTargetColumnValue($data['storage_target']),
             'status' => 'pending',
             'is_active' => true,
             'compress_enabled' => (bool) ($data['compress_enabled'] ?? false),
@@ -66,6 +137,7 @@ class NbxEngineService
             return $existing;
         }
 
+        $data['storage_target'] = $this->resolveInitialStorageTarget($data);
         $asset = MediaAsset::create([
             'type' => (string) ($data['asset_type'] ?? 'generic'),
             'title' => (string) ($data['title'] ?? 'Telegram media'),
@@ -85,6 +157,7 @@ class NbxEngineService
             'source_type' => 'remote_fetch',
             'source_url' => $telegramUrl,
             'storage_disk' => (string) config('nbx.work_storage', config('cdn.disk', 'public')),
+            'storage_target_key' => $this->storageTargetColumnValue($data['storage_target']),
             'status' => 'pending',
             'external_job_id' => (string) Str::uuid(),
             'idempotency_key' => $this->normalizedIdempotencyKey($data['idempotency_key'] ?? null),
@@ -110,6 +183,8 @@ class NbxEngineService
             return $existing;
         }
 
+        $data['size_bytes'] = $data['size_bytes'] ?? $file->getSize() ?: null;
+        $data['storage_target'] = $this->resolveInitialStorageTarget($data);
         $asset = MediaAsset::create([
             'type' => (string) ($data['asset_type'] ?? 'generic'),
             'title' => (string) ($data['title'] ?? pathinfo($file->getClientOriginalName(), PATHINFO_FILENAME)),
@@ -122,6 +197,7 @@ class NbxEngineService
             'media_asset_id' => $asset->id,
             'source_type' => 'upload',
             'storage_disk' => (string) config('nbx.work_storage', config('cdn.disk', 'public')),
+            'storage_target_key' => $this->storageTargetColumnValue($data['storage_target']),
             'status' => 'uploading',
             'progress_percent' => 0,
             'external_job_id' => (string) Str::uuid(),
@@ -406,18 +482,19 @@ class NbxEngineService
         }
         $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
         $target = (string) ($nbx['storage_target'] ?? config('nbx.default_storage', 'contabo'));
-        $targetDisk = $target === 'contabo' ? 'contabo' : ($target === 'local' ? 'public' : $target);
+        $resolvedTarget = $this->resolveDiskForTarget($target);
+        $targetDisk = $resolvedTarget['disk'];
         $currentDisk = $source->storage_disk ?: (string) config('cdn.disk', 'public');
 
         if ($targetDisk === '' || $source->status !== 'ready') {
             return $this->refreshOutputMetadata($source);
         }
 
-        if ($targetDisk !== 'contabo' && ! (bool) config('nbx.allow_local_storage', true)) {
+        if (! $resolvedTarget['is_contabo'] && ! (bool) config('nbx.allow_local_storage', true)) {
             return $this->refreshOutputMetadata($source);
         }
 
-        if ($targetDisk !== 'contabo') {
+        if (! $resolvedTarget['is_contabo']) {
             return $this->refreshOutputMetadata($source);
         }
 
@@ -489,15 +566,17 @@ class NbxEngineService
         $metadata = (array) ($source->source_metadata ?? []);
         $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
         $target = (string) ($nbx['storage_target'] ?? config('nbx.default_storage', 'contabo'));
-        $targetDisk = $target === 'contabo' ? 'contabo' : ($target === 'local' ? 'public' : $target);
+        $resolvedTarget = $this->resolveDiskForTarget($target);
+        $targetDisk = $resolvedTarget['disk'];
+        $finalDisk = $resolvedTarget['disk'];
         $currentDisk = $source->storage_disk ?: (string) config('cdn.disk', 'public');
 
-        if ($source->status !== 'ready' || $targetDisk !== 'contabo') {
+        if ($source->status !== 'ready' || ! $resolvedTarget['is_contabo']) {
             return $this->refreshOutputMetadata($source);
         }
 
         $contaboCredentials = app(ContaboStorageCredentialService::class);
-        if (! $contaboCredentials->ensureRuntimeDiskCredentials()) {
+        if (! $contaboCredentials->ensureRuntimeDiskCredentials($finalDisk)) {
             return $this->failFinalization($source, $contaboCredentials->configurationError(), $metadata, $nbx, $target, $currentDisk);
         }
 
@@ -513,7 +592,7 @@ class NbxEngineService
                 ]);
 
                 if ($originalPath) {
-                    $artifacts['original'] = $this->copyFinalArtifact($currentDisk, $originalPath, 'contabo', $this->finalObjectKey($source, 'original', $originalPath), 'original');
+                    $artifacts['original'] = $this->copyFinalArtifact($currentDisk, $originalPath, $finalDisk, $this->finalObjectKey($source, 'original', $originalPath), 'original');
                 }
             }
 
@@ -526,7 +605,7 @@ class NbxEngineService
                     : null;
 
                 if ($faststartPath) {
-                    $artifacts['faststart'] = $this->copyFinalArtifact($currentDisk, $faststartPath, 'contabo', $this->finalObjectKey($source, 'faststart', $faststartPath), 'faststart');
+                    $artifacts['faststart'] = $this->copyFinalArtifact($currentDisk, $faststartPath, $finalDisk, $this->finalObjectKey($source, 'faststart', $faststartPath), 'faststart');
                 } elseif (isset($artifacts['faststart']) && ! $this->validFinalArtifact((array) $artifacts['faststart'], 'faststart')) {
                     // A previous release could publish storage_path here before FFmpeg
                     // finished, which mislabeled MOV/MKV originals as optimized files.
@@ -539,7 +618,7 @@ class NbxEngineService
                 $hlsFiles = $this->hlsDirectoryFiles($source, $currentDisk);
                 foreach ($hlsFiles as $path) {
                     $relative = ltrim(substr($path, strlen($hlsBase)), '/');
-                    $artifact = $this->copyFinalArtifact($currentDisk, $path, 'contabo', $this->finalObjectKey($source, 'hls/'.$relative, $path), str_ends_with($path, '.m3u8') ? 'hls' : 'hls_segment');
+                    $artifact = $this->copyFinalArtifact($currentDisk, $path, $finalDisk, $this->finalObjectKey($source, 'hls/'.$relative, $path), str_ends_with($path, '.m3u8') ? 'hls' : 'hls_segment');
 
                     if ($path === $source->hls_master_path) {
                         $artifacts['hls_master'] = $artifact;
@@ -551,7 +630,7 @@ class NbxEngineService
                         }
 
                         $qualities[$index]['source_path'] = $path;
-                        $qualities[$index]['disk'] = 'contabo';
+                        $qualities[$index]['disk'] = $finalDisk;
                         $qualities[$index]['key'] = $artifact['key'];
                         $qualities[$index]['url'] = $artifact['url'];
                     }
@@ -577,7 +656,7 @@ class NbxEngineService
         $nbx = array_merge($nbx, [
             'storage_target' => $target,
             'work_storage_disk' => $currentDisk,
-            'final_storage_disk' => 'contabo',
+            'final_storage_disk' => $finalDisk,
             'final_artifacts' => $artifacts,
             'published_at' => now()->toIso8601String(),
         ]);
@@ -588,6 +667,7 @@ class NbxEngineService
             'failure_reason' => null,
             'last_error' => null,
             'is_active' => true,
+            'storage_target_key' => $resolvedTarget['target_key'],
             'source_metadata' => $metadata,
         ]);
 
@@ -604,18 +684,20 @@ class NbxEngineService
         $metadata = (array) ($source->source_metadata ?? []);
         $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
         $target = (string) ($nbx['storage_target'] ?? config('nbx.default_storage', 'contabo'));
-        if ($target !== 'contabo') {
+        $resolvedTarget = $this->resolveDiskForTarget($target);
+        $finalDisk = $resolvedTarget['disk'];
+        if (! $resolvedTarget['is_contabo']) {
             return $this->refreshOutputMetadata($source);
         }
 
         $credentials = app(ContaboStorageCredentialService::class);
-        if (! $credentials->ensureRuntimeDiskCredentials()) {
-            throw new \RuntimeException($credentials->configurationError());
+        if (! $credentials->ensureRuntimeDiskCredentials($finalDisk)) {
+            throw new \RuntimeException($credentials->configurationError($finalDisk));
         }
 
         $existing = is_array($nbx['final_artifacts'] ?? null) ? $nbx['final_artifacts'] : [];
         $prefix = $this->finalStoragePrefix($source);
-        $candidates = $this->artifactCandidateKeys($prefix, $existing);
+        $candidates = $this->artifactCandidateKeys($prefix, $existing, $finalDisk);
         $artifacts = $existing;
         $proof = is_array($metadata['probe'] ?? null) ? $metadata['probe'] : [];
         $verifiedRoles = [];
@@ -625,7 +707,7 @@ class NbxEngineService
                 $previous = is_array($existing[$role] ?? null) && ($existing[$role]['key'] ?? null) === $key
                     ? $existing[$role]
                     : [];
-                $artifact = $this->verifiedExistingArtifact('contabo', $key, $role, $previous, $proof);
+                $artifact = $this->verifiedExistingArtifact($finalDisk, $key, $role, $previous, $proof);
                 if ($artifact === null) {
                     continue;
                 }
@@ -658,7 +740,7 @@ class NbxEngineService
 
         $nbx = array_merge($nbx, [
             'final_artifacts' => $artifacts,
-            'final_storage_disk' => 'contabo',
+            'final_storage_disk' => $finalDisk,
             'processing_complete' => $processingComplete,
             'storage_verified' => $verifiedRoles !== [],
             'publication_status' => $publicationStatus,
@@ -677,6 +759,7 @@ class NbxEngineService
         $source->fill([
             'status' => $processingComplete ? 'ready' : $source->status,
             'is_active' => $hasPlayableOutput,
+            'storage_target_key' => $resolvedTarget['target_key'],
             'failure_reason' => $missingArtifact === null
                 ? null
                 : ($hasPlayableOutput
@@ -937,10 +1020,7 @@ class NbxEngineService
             $requested['hls']['1080p'] = false;
         }
 
-        $storageTarget = (string) ($data['storage_target'] ?? config('nbx.default_storage', 'contabo'));
-        if ($storageTarget !== 'contabo' && ! (bool) config('nbx.allow_local_storage', true)) {
-            $storageTarget = 'contabo';
-        }
+        $storageTarget = $this->resolveInitialStorageTarget($data);
 
         return [
             'provider' => 'nbx_engine',
@@ -1354,7 +1434,7 @@ class NbxEngineService
     /**
      * @return array{original:array<int,string>,faststart:array<int,string>,hls_master:array<int,string>}
      */
-    private function artifactCandidateKeys(string $prefix, array $existing): array
+    private function artifactCandidateKeys(string $prefix, array $existing, string $disk = 'contabo'): array
     {
         $candidates = ['original' => [], 'faststart' => [], 'hls_master' => []];
         foreach (array_keys($candidates) as $role) {
@@ -1365,13 +1445,13 @@ class NbxEngineService
         }
 
         try {
-            foreach (Storage::disk('contabo')->files($prefix.'/original') as $key) {
+            foreach (Storage::disk($disk)->files($prefix.'/original') as $key) {
                 $candidates['original'][] = ltrim((string) $key, '/');
             }
-            foreach (Storage::disk('contabo')->files($prefix.'/faststart') as $key) {
+            foreach (Storage::disk($disk)->files($prefix.'/faststart') as $key) {
                 $candidates['faststart'][] = ltrim((string) $key, '/');
             }
-            foreach (Storage::disk('contabo')->allFiles($prefix.'/hls') as $key) {
+            foreach (Storage::disk($disk)->allFiles($prefix.'/hls') as $key) {
                 if (str_ends_with(strtolower((string) $key), '.m3u8')
                     && str_contains(strtolower(basename((string) $key)), 'master')) {
                     $candidates['hls_master'][] = ltrim((string) $key, '/');

@@ -4,6 +4,8 @@ namespace App\Jobs;
 
 use App\Models\MediaSource;
 use App\Services\FfmpegProcessRunner;
+use App\Services\InsufficientDiskSpaceException;
+use App\Services\LocalDiskSpaceGuard;
 use App\Services\MediaBinaryDetector;
 use App\Services\MediaSourceService;
 use App\Services\NbxEngineService;
@@ -42,12 +44,29 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
         return 'optimization:faststart:'.$this->sourceId.':'.($this->attemptId ?: 'legacy');
     }
 
+    /**
+     * Bound how long a lock-blocked dispatch keeps retrying, independent of
+     * $tries (which stays at 1 — a single real execution attempt). Without
+     * this, a job that can never acquire its lock would requeue forever.
+     */
+    public function retryUntil(): \DateTimeInterface
+    {
+        return now()->addHours(12);
+    }
+
     public function middleware(): array
     {
         $locks = [
+            // releaseAfter (not dontRelease): if a worker crashes mid-run and
+            // leaves this lock held, a scheduled/manual retry dispatch must be
+            // requeued to try again later — not silently dropped. dontRelease()
+            // previously caused exactly that: every automated and manual retry
+            // attempt no-op'd until the multi-hour expireAfter lock happened to
+            // clear on its own, which is what made large-file jobs appear to
+            // need several manual reprocess attempts before one "stuck".
             (new WithoutOverlapping('optimization:source:'.$this->sourceId))
                 ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 25200)))
-                ->dontRelease(),
+                ->releaseAfter(300),
         ];
 
         if ((bool) config('cdn.serialize_optimization_jobs', true)) {
@@ -126,6 +145,21 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
         $optimizedPath = $this->buildOptimizedPath($source, $originalPath);
         $absoluteOutput = Storage::disk($disk)->path($optimizedPath);
         Storage::disk($disk)->makeDirectory(dirname($optimizedPath));
+
+        if ($inputSize > 0) {
+            try {
+                app(LocalDiskSpaceGuard::class)->ensureAvailable(
+                    $absoluteOutput,
+                    app(LocalDiskSpaceGuard::class)->estimateTranscodeOutputBytes($inputSize),
+                    "faststart/compress output for source #{$source->id}"
+                );
+            } catch (InsufficientDiskSpaceException $spaceError) {
+                $this->failOptimization($source, $spaceError->getMessage());
+
+                return;
+            }
+        }
+
         $processingStarted = microtime(true);
 
         $metadata = (array) ($source->source_metadata ?? []);

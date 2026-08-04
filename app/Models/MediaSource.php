@@ -16,6 +16,7 @@ class MediaSource extends Model
         'source_type',
         'source_url',
         'storage_disk',
+        'storage_target_key',
         'storage_path',
         'original_storage_path',
         'mime_type',

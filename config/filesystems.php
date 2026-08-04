@@ -76,6 +76,39 @@ return [
             'report' => false,
         ],
 
+        // Multi-bucket storage targets (see config/storage_targets.php).
+        // "contabo_nbx" is the legacy bucket ("nbx"); shares credentials with
+        // the "contabo" disk above by default.
+        'contabo_nbx' => [
+            'driver' => 's3',
+            'key' => env('CONTABO_NBX_ACCESS_KEY_ID') ?: env('CONTABO_ACCESS_KEY_ID') ?: env('CONTABO_OBJECT_STORAGE_ACCESS_KEY'),
+            'secret' => env('CONTABO_NBX_SECRET_ACCESS_KEY') ?: env('CONTABO_SECRET_ACCESS_KEY') ?: env('CONTABO_OBJECT_STORAGE_SECRET_KEY'),
+            'region' => env('CONTABO_NBX_REGION') ?: env('CONTABO_REGION') ?: env('CONTABO_OBJECT_STORAGE_REGION', 'usc1'),
+            'bucket' => env('CONTABO_NBX_BUCKET') ?: env('CONTABO_BUCKET') ?: env('CONTABO_OBJECT_STORAGE_BUCKET', 'nbx'),
+            'url' => env('CONTABO_NBX_PUBLIC_URL') ?: env('CONTABO_PUBLIC_URL') ?: env('CONTABO_OBJECT_STORAGE_PUBLIC_URL'),
+            'endpoint' => env('CONTABO_NBX_ENDPOINT') ?: env('CONTABO_ENDPOINT') ?: env('CONTABO_OBJECT_STORAGE_ENDPOINT', 'https://usc1.contabostorage.com'),
+            'use_path_style_endpoint' => (bool) env('CONTABO_NBX_USE_PATH_STYLE_ENDPOINT', env('CONTABO_USE_PATH_STYLE_ENDPOINT', true)),
+            'visibility' => env('CONTABO_OBJECT_STORAGE_VISIBILITY', 'public'),
+            'throw' => false,
+            'report' => false,
+        ],
+
+        // "contabo_nb_nbx" is the new, separate storage service/bucket
+        // ("nb-nbx"). Credentials are independent from "contabo_nbx".
+        'contabo_nb_nbx' => [
+            'driver' => 's3',
+            'key' => env('CONTABO_NB_NBX_ACCESS_KEY_ID'),
+            'secret' => env('CONTABO_NB_NBX_SECRET_ACCESS_KEY'),
+            'region' => env('CONTABO_NB_NBX_REGION', 'usc1'),
+            'bucket' => env('CONTABO_NB_NBX_BUCKET', 'nb-nbx'),
+            'url' => env('CONTABO_NB_NBX_PUBLIC_URL', 'https://usc1.contabostorage.com/nb-nbx'),
+            'endpoint' => env('CONTABO_NB_NBX_ENDPOINT', 'https://usc1.contabostorage.com'),
+            'use_path_style_endpoint' => (bool) env('CONTABO_NB_NBX_USE_PATH_STYLE_ENDPOINT', true),
+            'visibility' => env('CONTABO_OBJECT_STORAGE_VISIBILITY', 'public'),
+            'throw' => false,
+            'report' => false,
+        ],
+
     ],
 
     /*

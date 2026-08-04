@@ -2,6 +2,10 @@
 
 namespace App\Services;
 
+use Illuminate\Support\Facades\Log;
+use Symfony\Component\Process\Exception\ProcessTimedOutException;
+use Symfony\Component\Process\Process;
+
 class VideoProbeService
 {
     /**
@@ -40,27 +44,37 @@ class VideoProbeService
     {
         $remoteOptions = $remote ? ['-rw_timeout', '15000000', '-probesize', '8000000', '-analyzeduration', '8000000'] : [];
 
-        $cmd = implode(' ', [
-            escapeshellarg($ffprobe),
-            '-v',
-            'error',
+        $process = new Process([
+            $ffprobe,
+            '-v', 'error',
             ...$remoteOptions,
-            '-print_format',
-            'json',
+            '-print_format', 'json',
             '-show_format',
             '-show_streams',
-            escapeshellarg($target),
-            '2>&1',
+            $target,
         ]);
+        // A hung/stalled ffprobe on a huge or borderline-corrupt file must not
+        // block the queue worker indefinitely — unlike every other subprocess
+        // call in this codebase, this one previously had NO timeout at all,
+        // which was a likely contributor to intermittent large-file stalls.
+        $process->setTimeout((float) config('cdn.ffprobe_timeout_seconds', $remote ? 60 : 120));
 
-        $output = [];
-        $exitCode = 0;
-        @exec($cmd, $output, $exitCode);
-        if ($exitCode !== 0) {
+        try {
+            $process->run();
+        } catch (ProcessTimedOutException $exception) {
+            Log::warning('video_probe.timed_out', [
+                'target' => $remote ? $target : basename($target),
+                'timeout' => $process->getTimeout(),
+            ]);
+
             return [];
         }
 
-        $payload = json_decode(implode("\n", $output), true);
+        if (! $process->isSuccessful()) {
+            return [];
+        }
+
+        $payload = json_decode($process->getOutput(), true);
         if (! is_array($payload)) {
             return [];
         }

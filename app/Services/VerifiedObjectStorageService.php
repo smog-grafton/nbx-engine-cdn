@@ -5,6 +5,7 @@ namespace App\Services;
 use Aws\S3\Exception\S3MultipartUploadException;
 use Aws\S3\MultipartUploader;
 use Illuminate\Filesystem\AwsS3V3Adapter;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 
 class VerifiedObjectStorageService
@@ -52,33 +53,16 @@ class VerifiedObjectStorageService
                 5 * 1024 * 1024,
                 (int) config('nbx.multipart_threshold_mb', 64) * 1024 * 1024,
             );
+            $useMultipart = $expectedBytes >= $multipartThreshold && $this->isS3Disk($targetDisk);
 
-            if ($expectedBytes >= $multipartThreshold && $this->isS3Disk($targetDisk)) {
-                rewind($sourceStream);
-                $this->multipartUpload($sourceStream, $targetDisk, $targetPath, $contentType);
-                $multipart = true;
-            } else {
-                rewind($sourceStream);
-                $stored = Storage::disk($targetDisk)->put($targetPath, $sourceStream, [
-                    'visibility' => 'public',
-                    'ContentType' => $contentType,
-                ]);
-
-                if (! $stored) {
-                    throw new \RuntimeException("Could not store {$targetPath} on {$targetDisk}.");
-                }
-                $multipart = false;
-            }
-
-            $verified = $this->head($targetDisk, $targetPath);
-            if (($verified['bytes'] ?? 0) !== $expectedBytes) {
-                throw new \RuntimeException(sprintf(
-                    'Stored object verification failed for %s: expected %d bytes, found %d.',
-                    $targetPath,
-                    $expectedBytes,
-                    (int) ($verified['bytes'] ?? 0),
-                ));
-            }
+            [$verified, $multipart] = $this->uploadWithRetry(
+                $sourceStream,
+                $targetDisk,
+                $targetPath,
+                $contentType,
+                $expectedBytes,
+                $useMultipart,
+            );
 
             return [
                 'bytes' => $expectedBytes,
@@ -89,6 +73,100 @@ class VerifiedObjectStorageService
         } finally {
             fclose($sourceStream);
         }
+    }
+
+    /**
+     * Retry the upload+verify attempt with exponential backoff and jitter.
+     * Individual transient failures (network blips, S3 5xx) no longer fail
+     * the whole publish attempt outright.
+     *
+     * @param  resource  $sourceStream
+     * @return array{0: array{bytes:int,etag:?string,multipart:bool}, 1: bool}
+     */
+    private function uploadWithRetry(
+        $sourceStream,
+        string $targetDisk,
+        string $targetPath,
+        string $contentType,
+        int $expectedBytes,
+        bool $useMultipart,
+    ): array {
+        $maxAttempts = max(1, (int) config('nbx.multipart_max_attempts', 4));
+        $baseMs = max(100, (int) config('nbx.multipart_retry_base_ms', 1000));
+        $lastException = null;
+
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            if ($attempt > 1) {
+                if (@rewind($sourceStream) === false) {
+                    // The source stream can't be re-read from the start (e.g. a
+                    // non-seekable remote readStream); retrying would silently
+                    // upload a truncated/corrupt object, which is worse than
+                    // failing loudly.
+                    throw new \RuntimeException(
+                        "Cannot retry the upload of {$targetPath}: the source stream is not rewindable.",
+                        0,
+                        $lastException,
+                    );
+                }
+
+                $delayMs = (int) ($baseMs * (2 ** ($attempt - 2)));
+                $delayMs += random_int(0, (int) ($delayMs * 0.25) + 1);
+                usleep($delayMs * 1000);
+
+                Log::info('verified_object_storage.upload_retry', [
+                    'target_disk' => $targetDisk,
+                    'target_path' => $targetPath,
+                    'attempt' => $attempt,
+                    'max_attempts' => $maxAttempts,
+                ]);
+            } else {
+                @rewind($sourceStream);
+            }
+
+            try {
+                if ($useMultipart) {
+                    $this->multipartUpload($sourceStream, $targetDisk, $targetPath, $contentType);
+                    $multipart = true;
+                } else {
+                    $stored = Storage::disk($targetDisk)->put($targetPath, $sourceStream, [
+                        'visibility' => 'public',
+                        'ContentType' => $contentType,
+                    ]);
+
+                    if (! $stored) {
+                        throw new \RuntimeException("Could not store {$targetPath} on {$targetDisk}.");
+                    }
+                    $multipart = false;
+                }
+
+                $verified = $this->head($targetDisk, $targetPath);
+                if (($verified['bytes'] ?? 0) !== $expectedBytes) {
+                    throw new \RuntimeException(sprintf(
+                        'Stored object verification failed for %s: expected %d bytes, found %d.',
+                        $targetPath,
+                        $expectedBytes,
+                        (int) ($verified['bytes'] ?? 0),
+                    ));
+                }
+
+                return [$verified, $multipart];
+            } catch (\Throwable $exception) {
+                $lastException = $exception;
+                Log::warning('verified_object_storage.upload_attempt_failed', [
+                    'target_disk' => $targetDisk,
+                    'target_path' => $targetPath,
+                    'attempt' => $attempt,
+                    'max_attempts' => $maxAttempts,
+                    'error' => $exception->getMessage(),
+                ]);
+            }
+        }
+
+        throw new \RuntimeException(
+            "Final storage upload of {$targetPath} failed after {$maxAttempts} attempts: ".$lastException?->getMessage(),
+            0,
+            $lastException,
+        );
     }
 
     /**

@@ -39,8 +39,14 @@ return [
     'work_dir' => (string) env('NBX_WORK_DIR', storage_path('app/nbx/work')),
     'output_dir' => (string) env('NBX_OUTPUT_DIR', storage_path('app/nbx/output')),
     'multipart_threshold_mb' => (int) env('NBX_MULTIPART_THRESHOLD_MB', 64),
-    'multipart_part_size_mb' => (int) env('NBX_MULTIPART_PART_SIZE_MB', 32),
+    'multipart_part_size_mb' => (int) env('MEDIA_MULTIPART_PART_SIZE_MB', env('NBX_MULTIPART_PART_SIZE_MB', 32)),
     'multipart_concurrency' => (int) env('NBX_MULTIPART_CONCURRENCY', 2),
+    // Retry/backoff for the final storage upload (single-put or multipart).
+    // A single transient network blip previously failed the whole publish
+    // attempt outright, pushing recovery back onto the (now-fixed) lock-
+    // starved manual-retry path instead of just retrying the upload.
+    'multipart_max_attempts' => max(1, (int) env('MEDIA_MULTIPART_MAX_ATTEMPTS', 4)),
+    'multipart_retry_base_ms' => max(100, (int) env('MEDIA_UPLOAD_RETRY_BASE_MS', 1000)),
     'storage_browser_page_size' => (int) env('NBX_STORAGE_BROWSER_PAGE_SIZE', 50),
     'storage_inventory_queue' => (string) env('NBX_STORAGE_INVENTORY_QUEUE', 'media-maintenance'),
 
