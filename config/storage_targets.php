@@ -51,7 +51,12 @@ return [
             'endpoint' => env('CONTABO_NB_NBX_ENDPOINT', 'https://usc1.contabostorage.com'),
             'region' => env('CONTABO_NB_NBX_REGION', 'usc1'),
             'bucket' => env('CONTABO_NB_NBX_BUCKET', 'nb-nbx'),
-            'public_url' => env('CONTABO_NB_NBX_PUBLIC_URL', 'https://usc1.contabostorage.com/nb-nbx'),
+            // Contabo's public object URLs require the tenant-ID-prefixed
+            // path form ("https://{endpoint}/{tenantId}:{bucket}/...") even
+            // for path-style buckets — the bare "/nb-nbx/..." form returns
+            // {"message":"Unauthorized"}. Confirmed against the actual
+            // nb-nbx service's tenant ID.
+            'public_url' => env('CONTABO_NB_NBX_PUBLIC_URL', 'https://usc1.contabostorage.com/5fa286e37e8b403abc5b60ba900a5c3d:nb-nbx'),
             'path_prefix' => env('CONTABO_NB_NBX_PATH_PREFIX', env('CONTABO_OBJECT_STORAGE_PATH_PREFIX', 'videos')),
             'enabled' => (bool) env('CONTABO_NB_NBX_ENABLED', true),
             'writable' => (bool) env('CONTABO_NB_NBX_WRITABLE', true),

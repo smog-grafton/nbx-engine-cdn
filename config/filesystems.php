@@ -101,7 +101,9 @@ return [
             'secret' => env('CONTABO_NB_NBX_SECRET_ACCESS_KEY'),
             'region' => env('CONTABO_NB_NBX_REGION', 'usc1'),
             'bucket' => env('CONTABO_NB_NBX_BUCKET', 'nb-nbx'),
-            'url' => env('CONTABO_NB_NBX_PUBLIC_URL', 'https://usc1.contabostorage.com/nb-nbx'),
+            // See config/storage_targets.php for why this needs the
+            // tenant-ID-prefixed form.
+            'url' => env('CONTABO_NB_NBX_PUBLIC_URL', 'https://usc1.contabostorage.com/5fa286e37e8b403abc5b60ba900a5c3d:nb-nbx'),
             'endpoint' => env('CONTABO_NB_NBX_ENDPOINT', 'https://usc1.contabostorage.com'),
             'use_path_style_endpoint' => (bool) env('CONTABO_NB_NBX_USE_PATH_STYLE_ENDPOINT', true),
             'visibility' => env('CONTABO_OBJECT_STORAGE_VISIBILITY', 'public'),
