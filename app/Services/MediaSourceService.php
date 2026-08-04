@@ -6,6 +6,7 @@ use App\Jobs\ImportRemoteMediaSourceJob;
 use App\Jobs\OptimizeMp4FaststartJob;
 use App\Models\MediaAsset;
 use App\Models\MediaSource;
+use App\Services\Storage\StorageTargetRegistry;
 use App\Support\MediaUrl;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Bus;
@@ -1239,7 +1240,9 @@ class MediaSourceService
         $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
 
         return ($metadata['provider'] ?? null) === 'nbx_engine'
-            && (string) ($nbx['storage_target'] ?? config('nbx.default_storage', 'contabo')) === 'contabo';
+            && app(StorageTargetRegistry::class)->isContaboFamily(
+                (string) ($nbx['storage_target'] ?? config('nbx.default_storage', 'contabo'))
+            );
     }
 
     private function nbxArtifactUrl(MediaSource $source, string $role): ?string

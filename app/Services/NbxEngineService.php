@@ -933,7 +933,7 @@ class NbxEngineService
             'original_retained' => $this->artifactUrl($nbx, 'original') !== null,
             'processing_revision' => $source->processing_revision,
             'unavailable' => $this->unavailableOutputs($nbx, $playback),
-            'local_work_path' => $source->storage_disk === 'contabo' ? null : $source->storage_path,
+            'local_work_path' => app(\App\Services\Storage\StorageTargetRegistry::class)->isContaboFamily($source->storage_disk) ? null : $source->storage_path,
             'local_public_url' => ($nbx['storage_target'] ?? null) === 'local' ? $mediaSourceService->buildPublicUrl($source) : null,
             'file_size_bytes' => $source->file_size_bytes,
             'duration_seconds' => $source->duration_seconds ?: ($probe['duration_seconds'] ?? null),
@@ -1129,7 +1129,11 @@ class NbxEngineService
 
     private function cleanupLocalWorkFiles(MediaSource $source, string $disk): void
     {
-        if ($disk === 'contabo') {
+        // Guard against deleting objects that live directly on a Contabo
+        // target rather than the local work disk (e.g. object_storage-type
+        // sources). An exact `=== 'contabo'` check stopped matching once
+        // per-target disks were named "contabo_nbx"/"contabo_nb_nbx".
+        if (app(\App\Services\Storage\StorageTargetRegistry::class)->isContaboFamily($disk)) {
             return;
         }
 

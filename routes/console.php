@@ -91,7 +91,12 @@ Artisan::command('nbx:health', function () {
     $contaboReady = $contabo->ensureRuntimeDiskCredentials();
     $localFinals = MediaSource::query()
         ->where('source_metadata->provider', 'nbx_engine')
-        ->where('source_metadata->nbx->storage_target', 'contabo')
+        // Match any Contabo-family target (legacy literal "contabo", or a
+        // concrete logical key like "contabo_nbx"/"contabo_nb_nbx") rather
+        // than the old literal-only match, which stopped matching once
+        // storage_target started resolving to a concrete logical key.
+        ->whereNotNull('source_metadata->nbx->storage_target')
+        ->whereNotIn('source_metadata->nbx->storage_target', ['local', 'public'])
         ->where(function ($query): void {
             $query->whereNull('source_metadata->nbx->final_artifacts->original->url')
                 ->whereNull('source_metadata->nbx->final_artifacts->faststart->url')
@@ -100,7 +105,12 @@ Artisan::command('nbx:health', function () {
         ->count();
     $badLocalUrls = MediaSource::query()
         ->where('source_metadata->provider', 'nbx_engine')
-        ->where('source_metadata->nbx->storage_target', 'contabo')
+        // Match any Contabo-family target (legacy literal "contabo", or a
+        // concrete logical key like "contabo_nbx"/"contabo_nb_nbx") rather
+        // than the old literal-only match, which stopped matching once
+        // storage_target started resolving to a concrete logical key.
+        ->whereNotNull('source_metadata->nbx->storage_target')
+        ->whereNotIn('source_metadata->nbx->storage_target', ['local', 'public'])
         ->latest('id')
         ->limit(200)
         ->get(['source_metadata'])
@@ -142,7 +152,12 @@ Artisan::command('nbx:publish-final-artifacts {--limit=50 : Maximum ready NBX so
     MediaSource::query()
         ->where('status', 'ready')
         ->where('source_metadata->provider', 'nbx_engine')
-        ->where('source_metadata->nbx->storage_target', 'contabo')
+        // Match any Contabo-family target (legacy literal "contabo", or a
+        // concrete logical key like "contabo_nbx"/"contabo_nb_nbx") rather
+        // than the old literal-only match, which stopped matching once
+        // storage_target started resolving to a concrete logical key.
+        ->whereNotNull('source_metadata->nbx->storage_target')
+        ->whereNotIn('source_metadata->nbx->storage_target', ['local', 'public'])
         ->where(function ($query): void {
             $query->whereNull('source_metadata->nbx->final_artifacts->original->url')
                 ->orWhereNull('source_metadata->nbx->final_artifacts->faststart->url');

@@ -148,10 +148,10 @@ class StorageInventoryService
 
         $verified = 0;
         foreach ($objects as $object) {
-            if ($object->storage_disk === 'contabo') {
+            if (app(\App\Services\Storage\StorageTargetRegistry::class)->isContaboFamily($object->storage_disk)) {
                 $credentials = app(ContaboStorageCredentialService::class);
-                if (! $credentials->ensureRuntimeDiskCredentials()) {
-                    throw new RuntimeException($credentials->configurationError());
+                if (! $credentials->ensureRuntimeDiskCredentials($object->storage_disk)) {
+                    throw new RuntimeException($credentials->configurationError($object->storage_disk));
                 }
             }
             $stream = Storage::disk($object->storage_disk)->readStream($object->object_key);

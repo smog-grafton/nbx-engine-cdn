@@ -72,6 +72,19 @@ class StorageTargetRegistry
     }
 
     /**
+     * True for any target that resolves to a real Contabo bucket (the
+     * legacy literal "contabo", or a concrete logical key like
+     * "contabo_nbx"/"contabo_nb_nbx"), as opposed to NBX's own local/public
+     * work disk. Use this instead of `=== 'contabo'` — since storage_target
+     * is now resolved to a concrete logical key at job-creation time, an
+     * exact-literal comparison against "contabo" never matches new jobs.
+     */
+    public function isContaboFamily(?string $key): bool
+    {
+        return ! in_array($key, [null, '', 'local', 'public'], true);
+    }
+
+    /**
      * Resolve any incoming key (including legacy literals like "contabo",
      * null, or "auto") down to a concrete stored key, WITHOUT performing
      * automatic selection. Use AutomaticStorageSelector for "auto".

@@ -9,6 +9,7 @@ use App\Services\LocalDiskSpaceGuard;
 use App\Services\MediaBinaryDetector;
 use App\Services\MediaSourceService;
 use App\Services\NbxEngineService;
+use App\Services\Storage\StorageTargetRegistry;
 use App\Services\VideoProbeService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
@@ -307,7 +308,13 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
         $wasNbxManaged = ($nbxMetadata['provider'] ?? null) === 'nbx_engine' || isset($nbxMetadata['nbx']);
         $requested = (array) ($nbxMetadata['nbx']['requested'] ?? []);
         $storageTarget = (string) ($nbxMetadata['nbx']['storage_target'] ?? config('nbx.default_storage', 'contabo'));
-        $deleteLocalOriginal = $storageTarget !== 'contabo' && ! $nbxService->shouldRetainOriginal($source);
+        // Must NOT delete the local original while it's still bound for a
+        // Contabo target (contabo_nbx / contabo_nb_nbx / legacy "contabo")
+        // and hasn't been copied there yet by publishAvailableArtifacts() —
+        // an exact-literal `!== 'contabo'` check here stopped matching once
+        // storage_target started resolving to a concrete logical key.
+        $deleteLocalOriginal = ! app(StorageTargetRegistry::class)->isContaboFamily($storageTarget)
+            && ! $nbxService->shouldRetainOriginal($source);
         $deletedOriginal = $this->maybeDeleteOriginalAfterOptimization(
             $source,
             $disk,
