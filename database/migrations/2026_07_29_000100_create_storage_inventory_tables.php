@@ -56,8 +56,14 @@ return new class extends Migration
             $table->text('classification_reason')->nullable();
             $table->json('metadata')->nullable();
             $table->foreignId('last_seen_run_id')->nullable()->constrained('storage_inventory_runs')->nullOnDelete();
-            $table->timestamp('first_seen_at');
-            $table->timestamp('last_seen_at')->index();
+            // useCurrent(): strict-mode MySQL (the MySQL 8 default) rejects a
+            // NOT NULL timestamp column with no default at CREATE TABLE time
+            // (error 1067). The application always overwrites both columns
+            // explicitly on every insert/upsert (StorageInventoryService::objectRow()),
+            // so this default is never actually relied on — it only exists
+            // to satisfy strict mode.
+            $table->timestamp('first_seen_at')->useCurrent();
+            $table->timestamp('last_seen_at')->useCurrent()->index();
             $table->timestamp('missing_since')->nullable()->index();
             $table->timestamps();
 

@@ -57,6 +57,60 @@
             </p>
         </div>
 
+        <div class="rounded-xl bg-white p-5 shadow-sm ring-1 ring-gray-950/5 dark:bg-gray-900 dark:ring-white/10">
+            <div class="flex flex-wrap items-start justify-between gap-4">
+                <div>
+                    <h2 class="font-semibold text-gray-950 dark:text-white">Catalog recovery from storage</h2>
+                    <p class="mt-1 text-sm text-gray-600 dark:text-gray-300">
+                        Recreates media_assets/media_sources rows for NBX job folders that exist in Contabo but have
+                        no matching database row — for recovering after the NBX database was lost.
+                    </p>
+                    @if ($latestRebuild)
+                        <p class="mt-2 text-sm text-gray-600 dark:text-gray-300">
+                            @if (($latestRebuild['status'] ?? null) === 'queued')
+                                Rebuild queued — refresh this page shortly for results.
+                            @elseif (($latestRebuild['status'] ?? null) === 'running')
+                                Rebuild in progress since {{ $latestRebuild['started_at'] ?? '' }}…
+                            @elseif (($latestRebuild['status'] ?? null) === 'completed')
+                                Last rebuild ({{ $latestRebuild['completed_at'] ?? '' }}): created {{ $latestRebuild['created'] ?? 0 }},
+                                skipped {{ $latestRebuild['skipped'] ?? 0 }} already-linked,
+                                {{ $latestRebuild['needs_review'] ?? 0 }} need review.
+                            @elseif (($latestRebuild['status'] ?? null) === 'failed')
+                                <span class="text-danger-600">Last rebuild failed: {{ $latestRebuild['failure_reason'] ?? 'unknown error' }}</span>
+                            @endif
+                        </p>
+                    @endif
+                    @if ($rebuildPreview)
+                        <p class="mt-2 text-sm text-gray-600 dark:text-gray-300">
+                            Preview: {{ collect($rebuildPreview['groups'])->where('outcome', 'would_create')->count() }} job folder(s)
+                            would be recreated, {{ collect($rebuildPreview['groups'])->where('outcome', 'already_exists')->count() }}
+                            already have a matching source.
+                        </p>
+                    @endif
+                </div>
+                <div class="flex flex-wrap gap-2">
+                    <x-filament::button
+                        wire:click="previewRebuild"
+                        wire:loading.attr="disabled"
+                        wire:target="previewRebuild"
+                        color="gray"
+                    >
+                        <span wire:loading.remove wire:target="previewRebuild">Preview rebuild (dry run)</span>
+                        <span wire:loading wire:target="previewRebuild">Previewing…</span>
+                    </x-filament::button>
+                    <x-filament::button
+                        wire:click="startRebuild"
+                        wire:loading.attr="disabled"
+                        wire:target="startRebuild"
+                        wire:confirm="Rebuild the NBX catalog from Contabo storage? This creates new media_assets/media_sources rows for every recoverable job folder that has no matching database row. It does not modify or delete storage objects."
+                    >
+                        <span wire:loading.remove wire:target="startRebuild">Rebuild catalog from storage</span>
+                        <span wire:loading wire:target="startRebuild">Queuing…</span>
+                    </x-filament::button>
+                </div>
+            </div>
+        </div>
+
         <div class="grid gap-4 xl:grid-cols-3">
             @foreach (['role' => 'Storage by media role', 'layout' => 'Storage by key layout', 'lifecycle' => 'Storage by lifecycle'] as $breakdownKey => $heading)
                 <div class="rounded-xl bg-white p-5 shadow-sm ring-1 ring-gray-950/5 dark:bg-gray-900 dark:ring-white/10">

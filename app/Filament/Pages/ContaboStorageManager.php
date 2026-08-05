@@ -3,15 +3,18 @@
 namespace App\Filament\Pages;
 
 use App\Filament\Resources\StorageCleanupPlanResource;
+use App\Jobs\RebuildCatalogFromStorageJob;
 use App\Models\StorageCleanupPlan;
 use App\Models\StorageCleanupPlanItem;
 use App\Models\StorageInventoryObject;
 use App\Models\StorageInventoryRun;
 use App\Models\User;
+use App\Services\CatalogRebuildService;
 use App\Services\StorageInventoryService;
 use Filament\Notifications\Notification;
 use Filament\Pages\Page;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Schema;
 
 class ContaboStorageManager extends Page
@@ -61,6 +64,12 @@ class ContaboStorageManager extends Page
     /** @var array<int,array<string,mixed>> */
     public array $plans = [];
 
+    /** @var array<string,mixed>|null */
+    public ?array $rebuildPreview = null;
+
+    /** @var array<string,mixed>|null */
+    public ?array $latestRebuild = null;
+
     public static function canAccess(): bool
     {
         $user = auth()->user();
@@ -71,6 +80,7 @@ class ContaboStorageManager extends Page
     public function mount(): void
     {
         $this->loadObjects();
+        $this->latestRebuild = Cache::get(RebuildCatalogFromStorageJob::CACHE_KEY);
     }
 
     public function applyFilters(): void
@@ -104,6 +114,49 @@ class ContaboStorageManager extends Page
                 ->persistent()
                 ->send();
         }
+    }
+
+    /**
+     * Disaster recovery: rebuild media_assets/media_sources for Contabo
+     * objects nbx itself owns but which have no matching database row
+     * (e.g. after the nbx database was lost and redeployed empty). This
+     * only reads storage_inventory_objects — run "Scan bucket" (or wait for
+     * the rebuild's own pre-scan) first if the inventory is stale.
+     */
+    public function previewRebuild(): void
+    {
+        $user = auth()->user();
+        abort_unless($user instanceof User && $user->canManageStorage('storage.reconcile'), 403);
+        try {
+            $this->rebuildPreview = app(CatalogRebuildService::class)->rebuild(dryRun: true);
+            $wouldCreate = collect($this->rebuildPreview['groups'])->where('outcome', 'would_create')->count();
+            $alreadyLinked = collect($this->rebuildPreview['groups'])->where('outcome', 'already_exists')->count();
+            Notification::make()
+                ->success()
+                ->title('Rebuild preview ready')
+                ->body("{$wouldCreate} job folder(s) would be recreated; {$alreadyLinked} already have a matching source. Nothing was written.")
+                ->send();
+        } catch (\Throwable $exception) {
+            Notification::make()
+                ->danger()
+                ->title('Rebuild preview failed')
+                ->body($exception->getMessage())
+                ->persistent()
+                ->send();
+        }
+    }
+
+    public function startRebuild(): void
+    {
+        $user = auth()->user();
+        abort_unless($user instanceof User && $user->canManageStorage('storage.reconcile'), 403);
+        RebuildCatalogFromStorageJob::dispatch();
+        $this->latestRebuild = ['status' => 'queued'];
+        Notification::make()
+            ->success()
+            ->title('Catalog rebuild queued')
+            ->body('This rescans every NBX-owned Contabo bucket and recreates rows for orphaned job folders. Refresh this page shortly to see the result summary.')
+            ->send();
     }
 
     public function nextPage(): void

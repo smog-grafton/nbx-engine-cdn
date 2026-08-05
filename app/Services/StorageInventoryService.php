@@ -8,6 +8,7 @@ use App\Models\StorageCleanupPlan;
 use App\Models\StorageInventoryObject;
 use App\Models\StorageInventoryRun;
 use App\Models\StorageObjectReference;
+use App\Services\Storage\StorageTargetRegistry;
 use Aws\Exception\AwsException;
 use Illuminate\Filesystem\AwsS3V3Adapter;
 use Illuminate\Support\Carbon;
@@ -17,21 +18,25 @@ use RuntimeException;
 
 class StorageInventoryService
 {
-    public function queue(string $prefix = ''): StorageInventoryRun
+    public function queue(string $prefix = '', string $diskKey = 'contabo'): StorageInventoryRun
     {
-        $run = $this->createRun($prefix);
+        $run = $this->createRun($prefix, $diskKey);
         ScanContaboStorageInventoryJob::dispatch($run->id);
 
         return $run;
     }
 
-    public function createRun(string $prefix = ''): StorageInventoryRun
+    /**
+     * @param  string  $diskKey  A Laravel filesystem disk name (e.g. "contabo",
+     *                           "contabo_nb_nbx"). Defaults to the legacy
+     *                           single-bucket disk to preserve existing
+     *                           callers (nbx:storage-inventory) unchanged.
+     */
+    public function createRun(string $prefix = '', string $diskKey = 'contabo'): StorageInventoryRun
     {
-        $disk = (string) config('services.contabo_object_storage.disk', 'contabo');
-
         return StorageInventoryRun::query()->create([
-            'storage_disk' => $disk,
-            'storage_bucket' => (string) config("filesystems.disks.{$disk}.bucket", ''),
+            'storage_disk' => $diskKey,
+            'storage_bucket' => (string) config("filesystems.disks.{$diskKey}.bucket", ''),
             'prefix' => app(StorageReferenceService::class)->normalizeObjectKey($prefix),
             'status' => 'queued',
         ]);
@@ -223,10 +228,10 @@ class StorageInventoryService
             return;
         }
 
-        if ($run->storage_disk === 'contabo') {
+        if (app(StorageTargetRegistry::class)->isContaboFamily($run->storage_disk)) {
             $credentials = app(ContaboStorageCredentialService::class);
-            if (! $credentials->ensureRuntimeDiskCredentials()) {
-                throw new RuntimeException($credentials->configurationError());
+            if (! $credentials->ensureRuntimeDiskCredentials($run->storage_disk)) {
+                throw new RuntimeException($credentials->configurationError($run->storage_disk));
             }
             $storage = Storage::disk($run->storage_disk);
         }
