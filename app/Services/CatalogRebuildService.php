@@ -57,13 +57,25 @@ class CatalogRebuildService
                 continue;
             }
 
-            [$source, $outcome] = $this->materialize($group);
-            $summary[$outcome === 'needs_review' ? 'needs_review' : 'created']++;
-            $summary['groups'][] = array_merge($group, [
-                'outcome' => $outcome,
-                'media_source_id' => $source->id,
-                'media_asset_id' => $source->media_asset_id,
-            ]);
+            try {
+                [$source, $outcome] = $this->materialize($group);
+                $summary[$outcome === 'needs_review' ? 'needs_review' : 'created']++;
+                $summary['groups'][] = array_merge($group, [
+                    'outcome' => $outcome,
+                    'media_source_id' => $source->id,
+                    'media_asset_id' => $source->media_asset_id,
+                ]);
+            } catch (\Throwable $exception) {
+                // One bad job folder (a storage read error, a malformed
+                // artifact, etc.) must never abort the other 200+ groups in
+                // the same run — this is a disaster-recovery batch, not an
+                // all-or-nothing transaction.
+                $summary['needs_review']++;
+                $summary['groups'][] = array_merge($group, [
+                    'outcome' => 'error',
+                    'error' => $exception->getMessage(),
+                ]);
+            }
         }
 
         return $summary;

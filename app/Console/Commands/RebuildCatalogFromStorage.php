@@ -48,8 +48,22 @@ class RebuildCatalogFromStorage extends Command
             return self::SUCCESS;
         }
 
+        $failures = collect($summary['groups'])->whereIn('outcome', ['error', 'needs_review']);
+        if ($failures->isNotEmpty()) {
+            $this->newLine();
+            $this->warn('Job folders that need attention:');
+            $this->table(
+                ['Job ID', 'Outcome', 'Reason'],
+                $failures->map(fn (array $group): array => [
+                    $group['job_id'],
+                    $group['outcome'],
+                    $group['error'] ?? '(no verified artifact found — see media_sources.failure_reason for this row)',
+                ])->all(),
+            );
+        }
+
         $this->info(sprintf(
-            'Created %d, skipped %d already-linked, %d need review (unverifiable/ambiguous — check their failure_reason).',
+            'Created %d, skipped %d already-linked, %d need review (see table above and/or media_sources.failure_reason).',
             $summary['created'],
             $summary['skipped'],
             $summary['needs_review'],
