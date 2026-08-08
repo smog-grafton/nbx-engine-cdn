@@ -394,23 +394,32 @@ class MediaController extends Controller
         $validated = $request->validate([
             'source_url' => ['required', 'url', 'max:4096'],
             'original_filename' => ['required', 'string', 'max:255'],
-            'asset_id' => ['required', 'string', 'uuid'],
-            'source_id' => ['required', 'integer', 'min:1'],
+            // Optional: an NBX-initiated dispatch (TelegramImportDispatchService)
+            // always supplies these. A link submitted directly from Telebot's
+            // own dashboard has no NBX asset/source to reference yet, so these
+            // are absent — locate-or-create takes over below instead of 422ing.
+            'asset_id' => ['nullable', 'string', 'uuid'],
+            'source_id' => ['nullable', 'integer', 'min:1'],
             'bytes_total' => ['nullable', 'integer', 'min:1'],
             'metadata' => ['nullable'],
         ]);
 
-        $source = MediaSource::with('asset')
-            ->whereKey((int) $validated['source_id'])
-            ->where('media_asset_id', (string) $validated['asset_id'])
-            ->firstOrFail();
-        $metadata = (array) ($source->source_metadata ?? []);
         $incoming = $validated['metadata'] ?? [];
         if (is_string($incoming) && $incoming !== '') {
             $decoded = json_decode($incoming, true);
             $incoming = is_array($decoded) ? $decoded : [];
         }
         $incoming = is_array($incoming) ? $incoming : [];
+
+        if (! empty($validated['asset_id']) && ! empty($validated['source_id'])) {
+            $source = MediaSource::with('asset')
+                ->whereKey((int) $validated['source_id'])
+                ->where('media_asset_id', (string) $validated['asset_id'])
+                ->firstOrFail();
+        } else {
+            $source = $nbx->findOrCreateTelegramSourceForHandoff($incoming, (string) $validated['original_filename']);
+        }
+        $metadata = (array) ($source->source_metadata ?? []);
 
         $handoffUrl = SafeRemoteMediaUrl::assertAllowed((string) $validated['source_url']);
         $handoffHash = hash('sha256', $handoffUrl);
