@@ -762,11 +762,18 @@ class MediaSourcesRelationManager extends RelationManager
                             $result = app(NbxEngineService::class)->reconcilePublishedArtifacts($record);
                             app(MediaSourceService::class)->refreshAssetStatus($result->asset);
                             $publicationStatus = (string) data_get($result->source_metadata, 'nbx.publication_status', 'checked');
-                            Notification::make()
-                                ->success()
-                                ->title('Storage verification finished')
-                                ->body('Publication status: '.str_replace('_', ' ', $publicationStatus).'. Verified URLs were synchronized.')
-                                ->send();
+                            // Previously always said "Verified URLs were
+                            // synchronized" even when publication_status
+                            // came back "missing" — i.e. nothing was found
+                            // to verify — which read as a contradiction.
+                            $body = match ($publicationStatus) {
+                                'complete' => 'A verified output was found in storage and its public URL was restored.',
+                                'partial' => 'Some, but not all, expected outputs were found and verified in storage.',
+                                'missing' => 'No verified output exists in storage yet — the job may still genuinely be processing/uploading, or it has not started publishing. Nothing was changed; try again shortly.',
+                                default => 'Publication status: '.str_replace('_', ' ', $publicationStatus).'.',
+                            };
+                            $notification = Notification::make()->title('Storage verification finished')->body($body);
+                            ($publicationStatus === 'missing' ? $notification->warning() : $notification->success())->send();
                         } catch (\Throwable $exception) {
                             Notification::make()
                                 ->danger()
@@ -797,6 +804,40 @@ class MediaSourcesRelationManager extends RelationManager
                                 ->body('Remote source imported successfully.')
                                 ->send();
                         }
+                    }),
+                Tables\Actions\Action::make('force_reimport_telegram')
+                    ->label('Force reimport from Telegram')
+                    ->icon('heroicon-o-exclamation-triangle')
+                    ->color('danger')
+                    ->visible(fn (MediaSource $record): bool => (string) data_get($record->source_metadata, 'nbx.input_type') === 'telegram'
+                        && (string) data_get($record->source_metadata, 'telegram_url') !== '')
+                    ->requiresConfirmation()
+                    ->modalHeading('Force a fresh refetch from Telegram?')
+                    ->modalDescription('Plain Retry can just replay Teletyde/Telebot\'s last cached result for this message. Use this instead when the underlying file is actually gone (e.g. after a redeploy) — it tells Telebot to bypass its own duplicate check and re-download from Telegram from scratch.')
+                    ->modalSubmitActionLabel('Force reimport')
+                    ->action(function (MediaSource $record): void {
+                        $telegramUrl = (string) data_get($record->source_metadata, 'telegram_url');
+                        $record->update([
+                            'source_type' => 'remote_fetch',
+                            'source_url' => $telegramUrl,
+                            'status' => 'pending',
+                            'optimize_status' => null,
+                            'failure_reason' => null,
+                            'last_error' => null,
+                        ]);
+                        $dispatched = app(TelegramImportDispatchService::class)->dispatch($record->fresh() ?? $record, force: true);
+                        app(NbxEngineService::class)->markNbxStatus(
+                            $record->fresh() ?? $record,
+                            $dispatched ? 'telegram_fetching' : 'waiting_for_capacity',
+                        );
+                        app(MediaSourceService::class)->refreshAssetStatus($record->fresh()->asset);
+
+                        $notification = Notification::make()
+                            ->title($dispatched ? 'Force reimport dispatched' : 'Telebot has no free capacity right now')
+                            ->body($dispatched
+                                ? 'Telebot was asked to refetch this Telegram link from scratch. Status will update as it progresses.'
+                                : 'The request was recorded; it will retry automatically once a Telebot slot frees up.');
+                        ($dispatched ? $notification->success() : $notification->warning())->send();
                     }),
                 Tables\Actions\Action::make('queue_optimization')
                     ->label('Queue for optimization')

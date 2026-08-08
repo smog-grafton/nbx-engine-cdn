@@ -546,6 +546,7 @@ class NbxEngineController extends Controller
                 'reconcile',
                 'reprocess',
                 'force_reprocess',
+                'force_reimport',
                 'generate_faststart',
                 'compress',
                 'generate_hls',

@@ -14,12 +14,13 @@ class TelebotClientService
             ->json();
     }
 
-    public function createJob(string $telegramUrl, array $metadata = []): array
+    public function createJob(string $telegramUrl, array $metadata = [], bool $force = false): array
     {
         return $this->request()
             ->post($this->url('/api/worker/jobs'), [
                 'link' => $telegramUrl,
                 'metadata' => $metadata,
+                'force' => $force,
             ])
             ->throw()
             ->json();

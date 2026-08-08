@@ -8,7 +8,7 @@ class TelegramImportDispatchService
 {
     public function __construct(private readonly TelebotClientService $telebot) {}
 
-    public function dispatch(MediaSource $source): bool
+    public function dispatch(MediaSource $source, bool $force = false): bool
     {
         $metadata = (array) ($source->source_metadata ?? []);
         $telegramUrl = trim((string) ($metadata['telegram_url'] ?? $source->source_url ?? ''));
@@ -54,7 +54,7 @@ class TelegramImportDispatchService
         ]);
 
         try {
-            $response = $this->telebot->createJob($telegramUrl, $telebotMetadata);
+            $response = $this->telebot->createJob($telegramUrl, $telebotMetadata, $force);
         } catch (\Throwable $exception) {
             $this->mergeMetadata($source, [
                 'telebot_status' => 'waiting_for_capacity',
