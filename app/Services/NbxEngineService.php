@@ -349,6 +349,31 @@ class NbxEngineService
             } elseif ($operation === 'retry' && in_array($source->source_type, ['remote_fetch', 'object_storage'], true)) {
                 $source->update(['status' => 'pending', 'optimize_status' => null]);
                 $mediaSourceService->queueRemoteImport($source->fresh() ?? $source, true);
+            } elseif ($operation === 'force_reimport' && ($sourceMetadata['nbx']['input_type'] ?? null) === 'telegram') {
+                // Unlike plain 'retry' (which can end up just replaying
+                // Telebot's cached result for this message — correct when
+                // NBX's copy is merely out of sync, but not when the
+                // underlying file is genuinely gone, e.g. a redeploy wiped
+                // local storage), this forces Telebot to bypass its own
+                // dedup and actually refetch from Telegram.
+                $telegramUrl = (string) ($sourceMetadata['telegram_url'] ?? '');
+                if ($telegramUrl === '') {
+                    throw new \RuntimeException('Force reimport is unavailable because the original Telegram URL is missing.');
+                }
+                $source->update([
+                    'source_type' => 'remote_fetch',
+                    'source_url' => $telegramUrl,
+                    'status' => 'pending',
+                    'optimize_status' => null,
+                ]);
+                $dispatched = app(TelegramImportDispatchService::class)->dispatch($source->fresh() ?? $source, force: true);
+                $source = $this->markNbxStatus(
+                    $source->fresh() ?? $source,
+                    $dispatched ? 'telegram_fetching' : 'waiting_for_capacity',
+                );
+            } elseif ($operation === 'force_reimport' && in_array($source->source_type, ['remote_fetch', 'object_storage'], true)) {
+                $source->update(['status' => 'pending', 'optimize_status' => null]);
+                $mediaSourceService->queueRemoteImport($source->fresh() ?? $source, true);
             } elseif (in_array($operation, ['retry', 'reprocess', 'generate_faststart', 'compress'], true)) {
                 $source->update(['status' => 'ready', 'optimize_status' => null]);
                 if (! $mediaSourceService->queuePlaybackProcessing($source->fresh() ?? $source)) {
