@@ -40,19 +40,16 @@ class ProcessHlsAfterFaststartJob implements ShouldBeUnique, ShouldQueue
 
     public function middleware(): array
     {
-        $locks = [
+        // No global/tiered concurrency lock here deliberately: this job
+        // does no FFmpeg work itself, only decides what to dispatch next,
+        // so it doesn't compete for the CPU-bound concurrency budget (see
+        // OptimizeMp4FaststartJob/GenerateHlsVariantsJob's ConcurrencyPool
+        // middleware for the jobs that actually run FFmpeg).
+        return [
             (new WithoutOverlapping('optimization:source:'.$this->sourceId))
                 ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 25200)))
                 ->dontRelease(),
         ];
-
-        if ((bool) config('cdn.serialize_optimization_jobs', true)) {
-            $locks[] = (new WithoutOverlapping('optimization:global'))
-                ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 25200)))
-                ->releaseAfter(30);
-        }
-
-        return $locks;
     }
 
     public function handle(MediaSourceService $mediaSourceService): void

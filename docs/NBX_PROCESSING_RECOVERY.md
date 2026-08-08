@@ -6,6 +6,8 @@
 DB_QUEUE_RETRY_AFTER=28800
 CDN_OPTIMIZATION_OVERLAP_LOCK_SECONDS=25200
 CDN_OPTIMIZATION_STALE_MINUTES=20
+CDN_TRANSCODE_CONCURRENCY=1
+CDN_REMUX_CONCURRENCY=3
 CDN_FFMPEG_TIMEOUT_SECONDS=21600
 CDN_FFMPEG_HEARTBEAT_SECONDS=10
 CDN_FFMPEG_DIAGNOSTICS_MAX_BYTES=12000
@@ -18,7 +20,26 @@ CDN_COMPRESS_SKIP_BITRATE_1080P=2200000
 
 `DB_QUEUE_RETRY_AFTER` must remain greater than the worker/job timeout. A value
 of `0` for `CDN_FFMPEG_THREADS` lets FFmpeg use the CPUs available to the
-container.
+container — keep `CDN_TRANSCODE_CONCURRENCY` at `1` unless threads are also
+capped per job, since one full-core encode can already saturate a small VPS.
+
+## How staleness detection actually decides "dead"
+
+`media:recover-stale-optimizations` no longer treats every old heartbeat as
+proof of death. Two guards were added because they were previously the two
+most common causes of a job being marked `failed` while FFmpeg kept running
+to completion in the background:
+
+1. A source still in the `queued` stage is never reaped — its heartbeat
+   reflects dispatch time, not a stuck process, and under
+   `CDN_SERIALIZE_OPTIMIZATION_JOBS=true` queue depth alone can exceed
+   `--stale-minutes` before a job ever gets its turn.
+2. Before reaping a source that HAS started, the command checks
+   `App\Services\ProcessingLiveness::isAlive()` — a short-TTL marker
+   (refreshed on every FFmpeg heartbeat and stage transition) that answers
+   "is a worker still genuinely touching this row?" independently of the
+   database heartbeat columns. Only a source with no fresh liveness marker
+   is actually reaped.
 
 ## Deploy
 

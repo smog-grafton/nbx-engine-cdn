@@ -23,12 +23,20 @@ class MediaSourceService
         return (string) config('cdn.disk', 'public');
     }
 
-    public function ensureLocalWorkFileForProcessing(MediaSource $source): ?MediaSource
+    /**
+     * @param  bool  $forceOriginal  Skip the "already have a local file"
+     *                                short-circuit and any already-derived
+     *                                (faststarted) candidate, restoring only
+     *                                from the true original. Used by Force
+     *                                Reprocess to guarantee a clean re-run
+     *                                rather than reprocessing a derivative.
+     */
+    public function ensureLocalWorkFileForProcessing(MediaSource $source, bool $forceOriginal = false): ?MediaSource
     {
         $source = $source->fresh() ?? $source;
         $disk = $source->storage_disk ?: $this->storageDisk();
 
-        if ($source->storage_path && $this->safeExists($disk, (string) $source->storage_path)) {
+        if (! $forceOriginal && $source->storage_path && $this->safeExists($disk, (string) $source->storage_path)) {
             return $source;
         }
 
@@ -48,14 +56,15 @@ class MediaSourceService
             [
                 // Older workers could finish and verify this deterministic
                 // output, then crash while reading the vanished input size
-                // before optimized_path was persisted.
-                'disk' => $inferredFaststartPath ? $disk : null,
-                'key' => $inferredFaststartPath,
+                // before optimized_path was persisted. Not a true original —
+                // excluded when forceOriginal is set.
+                'disk' => (! $forceOriginal && $inferredFaststartPath) ? $disk : null,
+                'key' => $forceOriginal ? null : $inferredFaststartPath,
                 'label' => 'inferred_orphan_faststart',
             ],
             [
-                'disk' => ($faststartArtifact['verified'] ?? false) ? ($faststartArtifact['disk'] ?? null) : null,
-                'key' => ($faststartArtifact['verified'] ?? false) ? ($faststartArtifact['key'] ?? null) : null,
+                'disk' => (! $forceOriginal && ($faststartArtifact['verified'] ?? false)) ? ($faststartArtifact['disk'] ?? null) : null,
+                'key' => (! $forceOriginal && ($faststartArtifact['verified'] ?? false)) ? ($faststartArtifact['key'] ?? null) : null,
                 'label' => 'nbx_verified_faststart',
             ],
             [
@@ -1074,6 +1083,7 @@ class MediaSourceService
                 'processing_stage' => 'queued',
                 'processing_stage_progress' => 0,
                 'processing_heartbeat_at' => now(),
+                'processing_attempt_started_at' => now(),
                 'processing_diagnostics' => null,
                 'progress_percent' => 0,
                 'last_progress_at' => now(),

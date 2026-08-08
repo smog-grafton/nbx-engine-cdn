@@ -5,6 +5,7 @@ namespace App\Console\Commands;
 use App\Models\MediaSource;
 use App\Services\MediaSourceService;
 use App\Services\NbxEngineService;
+use App\Services\ProcessingLiveness;
 use Illuminate\Console\Command;
 
 class RecoverStaleOptimizations extends Command
@@ -28,6 +29,14 @@ class RecoverStaleOptimizations extends Command
         $query = MediaSource::query()
             ->where('status', 'ready')
             ->whereIn('optimize_status', ['pending', 'processing'])
+            // A source still in 'queued' hasn't been picked up by a worker
+            // yet — its heartbeat reflects dispatch time, not a stuck
+            // process. Under CDN_SERIALIZE_OPTIMIZATION_JOBS=true, queue
+            // depth alone can exceed --stale-minutes long before the job
+            // ever starts; reaping it here just churns a fresh attempt to
+            // the back of the same queue. NULL is left reapable for rows
+            // predating this column.
+            ->where('processing_stage', '!=', 'queued')
             ->where(function ($query) use ($cutoff): void {
                 $query
                     ->where('processing_heartbeat_at', '<', $cutoff)
@@ -57,6 +66,19 @@ class RecoverStaleOptimizations extends Command
         $skipped = 0;
 
         foreach ($sources as $source) {
+            // Liveness check: OptimizeMp4FaststartJob/GenerateHlsVariantsJob
+            // refresh this short-TTL marker on every heartbeat and stage
+            // transition. If it's still fresh, the job is genuinely alive
+            // (e.g. past a slow non-heartbeating step, or just past the
+            // 'queued' stage boundary) and must not be declared failed out
+            // from under it — only a truly expired marker means dead.
+            if (ProcessingLiveness::isAlive($source->id)) {
+                $this->warn("Source #{$source->id}: still alive (liveness marker fresh); skipping.");
+                $skipped++;
+
+                continue;
+            }
+
             // Restore a durable original/mislabeled legacy artifact before it is
             // removed from playable output metadata.
             $source = $media->ensureLocalWorkFileForProcessing($source) ?: $source;
