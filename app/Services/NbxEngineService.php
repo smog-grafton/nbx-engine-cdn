@@ -137,6 +137,20 @@ class NbxEngineService
             return $existing;
         }
 
+        $source = $this->createTelegramSource($data, $telegramUrl, 'Waiting to dispatch to Teletyde.');
+
+        $dispatched = app(TelegramImportDispatchService::class)->dispatch($source);
+        $source = $this->markNbxStatus(
+            $source->fresh() ?? $source,
+            $dispatched ? 'telegram_fetching' : 'waiting_for_capacity',
+        );
+        app(NbxWebhookDispatcher::class)->dispatch($source, 'job.created');
+
+        return $source;
+    }
+
+    private function createTelegramSource(array $data, string $telegramUrl, string $initialTelebotMessage): MediaSource
+    {
         $data['storage_target'] = $this->resolveInitialStorageTarget($data);
         $asset = MediaAsset::create([
             'type' => (string) ($data['asset_type'] ?? 'generic'),
@@ -150,9 +164,9 @@ class NbxEngineService
         $metadata['telegram_url'] = $telegramUrl;
         $metadata['handoff_mode'] = 'source_url';
         $metadata['telebot_status'] = 'waiting_for_capacity';
-        $metadata['telebot_message'] = 'Waiting to dispatch to Teletyde.';
+        $metadata['telebot_message'] = $initialTelebotMessage;
 
-        $source = MediaSource::create([
+        return MediaSource::create([
             'media_asset_id' => $asset->id,
             'source_type' => 'remote_fetch',
             'source_url' => $telegramUrl,
@@ -166,15 +180,43 @@ class NbxEngineService
             'is_active' => true,
             'source_metadata' => $metadata,
         ]);
+    }
 
-        $dispatched = app(TelegramImportDispatchService::class)->dispatch($source);
-        $source = $this->markNbxStatus(
-            $source->fresh() ?? $source,
-            $dispatched ? 'telegram_fetching' : 'waiting_for_capacity',
+    /**
+     * Locate an existing Telegram-origin source for this exact message, or
+     * create one, when a Telebot handoff arrives with no NBX asset_id/
+     * source_id attached — e.g. a link submitted directly from Telebot's
+     * own dashboard rather than dispatched by NBX first. Never re-dispatches
+     * to Telebot: the caller already has the fetched file in hand.
+     */
+    public function findOrCreateTelegramSourceForHandoff(array $incoming, string $originalFilename): MediaSource
+    {
+        $chatId = $incoming['telegram_chat_id'] ?? null;
+        $messageId = $incoming['telegram_message_id'] ?? null;
+        if ($chatId !== null && $messageId !== null) {
+            $existing = MediaSource::query()
+                ->where('source_metadata->telegram_chat_id', $chatId)
+                ->where('source_metadata->telegram_message_id', $messageId)
+                ->latest('id')
+                ->first();
+            if ($existing) {
+                return $existing;
+            }
+        }
+
+        $telegramUrl = trim((string) ($incoming['telegram_url'] ?? ''));
+        if (! preg_match('~^https://t\.me/~i', $telegramUrl)) {
+            throw new \RuntimeException('No existing media source matched this Telegram message, and metadata.telegram_url was missing/invalid, so a new one could not be created.');
+        }
+
+        return $this->createTelegramSource(
+            [
+                'telegram_url' => $telegramUrl,
+                'title' => $incoming['title_guess'] ?: pathinfo($originalFilename, PATHINFO_FILENAME),
+            ],
+            $telegramUrl,
+            'Received directly from Telebot; NBX created a new media record for it.',
         );
-        app(NbxWebhookDispatcher::class)->dispatch($source, 'job.created');
-
-        return $source;
     }
 
     public function createUploadJob(array $data, UploadedFile $file, MediaSourceService $mediaSourceService): MediaSource

@@ -294,6 +294,46 @@ class MediaSourcesRelationManager extends RelationManager
                     return "{$status} - {$percent}% ({$downloaded} / {$total})";
                 })
                 ->visible(fn (?MediaSource $record): bool => (bool) $record),
+            Forms\Components\Actions::make([
+                Forms\Components\Actions\Action::make('force_reimport_telegram_modal')
+                    ->label('Force reimport from Telegram')
+                    ->icon('heroicon-o-exclamation-triangle')
+                    ->color('danger')
+                    ->visible(fn (Forms\Get $get, ?MediaSource $record): bool => (bool) $record
+                        && $get('source_type') === 'telegram'
+                        && (string) data_get($record?->source_metadata, 'telegram_url') !== '')
+                    ->requiresConfirmation()
+                    ->modalHeading('Force a fresh refetch from Telegram?')
+                    ->modalDescription('Plain "Refresh Telebot" only reads Telebot\'s current status — it can just show Telebot\'s last cached result for this message. Use this when the underlying file is actually gone (e.g. after a redeploy) and you need Telebot to bypass its own duplicate check and re-download from Telegram from scratch.')
+                    ->modalSubmitActionLabel('Force reimport')
+                    ->action(function (?MediaSource $record): void {
+                        if (! $record) {
+                            return;
+                        }
+                        $telegramUrl = (string) data_get($record->source_metadata, 'telegram_url');
+                        $record->update([
+                            'source_type' => 'remote_fetch',
+                            'source_url' => $telegramUrl,
+                            'status' => 'pending',
+                            'optimize_status' => null,
+                            'failure_reason' => null,
+                            'last_error' => null,
+                        ]);
+                        $dispatched = app(TelegramImportDispatchService::class)->dispatch($record->fresh() ?? $record, force: true);
+                        app(NbxEngineService::class)->markNbxStatus(
+                            $record->fresh() ?? $record,
+                            $dispatched ? 'telegram_fetching' : 'waiting_for_capacity',
+                        );
+                        app(MediaSourceService::class)->refreshAssetStatus($record->fresh()->asset);
+
+                        $notification = Notification::make()
+                            ->title($dispatched ? 'Force reimport dispatched' : 'Telebot has no free capacity right now')
+                            ->body($dispatched
+                                ? 'Telebot was asked to refetch this Telegram link from scratch. Reopen this source to see updated progress.'
+                                : 'The request was recorded; it will retry automatically once a Telebot slot frees up.');
+                        ($dispatched ? $notification->success() : $notification->warning())->send();
+                    }),
+            ]),
             Forms\Components\Textarea::make('failure_reason')
                 ->disabled()
                 ->dehydrated(false)
@@ -736,6 +776,44 @@ class MediaSourcesRelationManager extends RelationManager
                                 ->send();
                         }
                     }),
+                Tables\Actions\Action::make('force_reimport_telegram')
+                    ->label('Force reimport from Telegram')
+                    ->icon('heroicon-o-exclamation-triangle')
+                    ->color('danger')
+                    ->visible(function (MediaSource $record): bool {
+                        $metadata = (array) ($record->source_metadata ?? []);
+
+                        return ($metadata['source'] ?? null) === 'telegram'
+                            && (string) data_get($metadata, 'telegram_url') !== '';
+                    })
+                    ->requiresConfirmation()
+                    ->modalHeading('Force a fresh refetch from Telegram?')
+                    ->modalDescription('Plain "Refresh Telebot" only reads Telebot\'s current status — it can just show Telebot\'s last cached result for this message. Use this when the underlying file is actually gone (e.g. after a redeploy) and you need Telebot to bypass its own duplicate check and re-download from Telegram from scratch.')
+                    ->modalSubmitActionLabel('Force reimport')
+                    ->action(function (MediaSource $record): void {
+                        $telegramUrl = (string) data_get($record->source_metadata, 'telegram_url');
+                        $record->update([
+                            'source_type' => 'remote_fetch',
+                            'source_url' => $telegramUrl,
+                            'status' => 'pending',
+                            'optimize_status' => null,
+                            'failure_reason' => null,
+                            'last_error' => null,
+                        ]);
+                        $dispatched = app(TelegramImportDispatchService::class)->dispatch($record->fresh() ?? $record, force: true);
+                        app(NbxEngineService::class)->markNbxStatus(
+                            $record->fresh() ?? $record,
+                            $dispatched ? 'telegram_fetching' : 'waiting_for_capacity',
+                        );
+                        app(MediaSourceService::class)->refreshAssetStatus($record->fresh()->asset);
+
+                        $notification = Notification::make()
+                            ->title($dispatched ? 'Force reimport dispatched' : 'Telebot has no free capacity right now')
+                            ->body($dispatched
+                                ? 'Telebot was asked to refetch this Telegram link from scratch. Status will update as it progresses.'
+                                : 'The request was recorded; it will retry automatically once a Telebot slot frees up.');
+                        ($dispatched ? $notification->success() : $notification->warning())->send();
+                    }),
                 Tables\Actions\Action::make('refresh_status')
                     ->label('Refresh')
                     ->icon('heroicon-o-arrow-path')
@@ -804,40 +882,6 @@ class MediaSourcesRelationManager extends RelationManager
                                 ->body('Remote source imported successfully.')
                                 ->send();
                         }
-                    }),
-                Tables\Actions\Action::make('force_reimport_telegram')
-                    ->label('Force reimport from Telegram')
-                    ->icon('heroicon-o-exclamation-triangle')
-                    ->color('danger')
-                    ->visible(fn (MediaSource $record): bool => (string) data_get($record->source_metadata, 'nbx.input_type') === 'telegram'
-                        && (string) data_get($record->source_metadata, 'telegram_url') !== '')
-                    ->requiresConfirmation()
-                    ->modalHeading('Force a fresh refetch from Telegram?')
-                    ->modalDescription('Plain Retry can just replay Teletyde/Telebot\'s last cached result for this message. Use this instead when the underlying file is actually gone (e.g. after a redeploy) — it tells Telebot to bypass its own duplicate check and re-download from Telegram from scratch.')
-                    ->modalSubmitActionLabel('Force reimport')
-                    ->action(function (MediaSource $record): void {
-                        $telegramUrl = (string) data_get($record->source_metadata, 'telegram_url');
-                        $record->update([
-                            'source_type' => 'remote_fetch',
-                            'source_url' => $telegramUrl,
-                            'status' => 'pending',
-                            'optimize_status' => null,
-                            'failure_reason' => null,
-                            'last_error' => null,
-                        ]);
-                        $dispatched = app(TelegramImportDispatchService::class)->dispatch($record->fresh() ?? $record, force: true);
-                        app(NbxEngineService::class)->markNbxStatus(
-                            $record->fresh() ?? $record,
-                            $dispatched ? 'telegram_fetching' : 'waiting_for_capacity',
-                        );
-                        app(MediaSourceService::class)->refreshAssetStatus($record->fresh()->asset);
-
-                        $notification = Notification::make()
-                            ->title($dispatched ? 'Force reimport dispatched' : 'Telebot has no free capacity right now')
-                            ->body($dispatched
-                                ? 'Telebot was asked to refetch this Telegram link from scratch. Status will update as it progresses.'
-                                : 'The request was recorded; it will retry automatically once a Telebot slot frees up.');
-                        ($dispatched ? $notification->success() : $notification->warning())->send();
                     }),
                 Tables\Actions\Action::make('queue_optimization')
                     ->label('Queue for optimization')
