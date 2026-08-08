@@ -95,17 +95,47 @@ class MediaSourceService
                 continue;
             }
 
+            $expectedSize = $this->safeSize($candidateDisk, $candidateKey);
+
             $stream = Storage::disk($candidateDisk)->readStream($candidateKey);
             if (! is_resource($stream)) {
                 continue;
             }
 
+            // Write to a staging path first, not $workPath directly. A
+            // worker killed mid-copy (e.g. SIGKILLed during a deploy) used
+            // to leave a truncated file sitting exactly at $workPath, which
+            // the "already exists" short-circuit above would then trust
+            // blindly on every later call — FFmpeg would fail on it with a
+            // confusing "moov atom not found" / "Invalid data" error that
+            // gave no hint the real cause was an interrupted restore, not a
+            // genuinely bad source.
+            $stagingPath = $workPath.'.restoring-'.Str::random(8);
             try {
                 Storage::disk($workDisk)->makeDirectory(dirname($workPath));
-                Storage::disk($workDisk)->put($workPath, $stream);
+                Storage::disk($workDisk)->put($stagingPath, $stream);
             } finally {
-                fclose($stream);
+                if (is_resource($stream)) {
+                    fclose($stream);
+                }
             }
+
+            $actualSize = $this->safeSize($workDisk, $stagingPath);
+            if ($actualSize <= 0 || ($expectedSize > 0 && $actualSize !== $expectedSize)) {
+                Log::warning('Discarding incomplete restored work file (size mismatch after copy — likely an interrupted restore)', [
+                    'source_id' => $source->id,
+                    'asset_id' => $source->media_asset_id,
+                    'candidate' => $candidate['label'],
+                    'expected_size' => $expectedSize,
+                    'actual_size' => $actualSize,
+                ]);
+                Storage::disk($workDisk)->delete($stagingPath);
+
+                continue;
+            }
+
+            Storage::disk($workDisk)->delete($workPath);
+            Storage::disk($workDisk)->move($stagingPath, $workPath);
 
             if (! $this->safeExists($workDisk, $workPath)) {
                 continue;
@@ -1325,6 +1355,21 @@ class MediaSourceService
             report($throwable);
 
             return false;
+        }
+    }
+
+    private function safeSize(string $disk, ?string $path): int
+    {
+        if (! is_string($path) || trim($path) === '') {
+            return 0;
+        }
+
+        try {
+            return $this->safeExists($disk, $path) ? (int) Storage::disk($disk)->size($path) : 0;
+        } catch (\Throwable $throwable) {
+            report($throwable);
+
+            return 0;
         }
     }
 
