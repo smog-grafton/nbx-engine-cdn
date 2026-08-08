@@ -8,6 +8,15 @@ return [
     'import_queue' => (string) env('CDN_IMPORT_QUEUE', 'default'),
     'optimization_queue' => (string) env('CDN_OPTIMIZATION_QUEUE', 'optimization'),
     'serialize_optimization_jobs' => (bool) env('CDN_SERIALIZE_OPTIMIZATION_JOBS', true),
+    // Tiered concurrency budgets used in place of one global "1 at a time"
+    // lock when serialize_optimization_jobs is true. transcode_concurrency
+    // covers CPU-bound work (compression, HLS encoding — CDN_FFMPEG_THREADS=0
+    // lets a single libx264 encode already use every core, so keep this low
+    // on a small VPS). remux_concurrency covers cheap, I/O-bound fast-start
+    // copies, which barely touch the CPU and can safely run alongside a
+    // transcode. See App\Queue\Middleware\ConcurrencyPool.
+    'transcode_concurrency' => (int) env('CDN_TRANSCODE_CONCURRENCY', 1),
+    'remux_concurrency' => (int) env('CDN_REMUX_CONCURRENCY', 3),
     'optimization_overlap_lock_seconds' => (int) env('CDN_OPTIMIZATION_OVERLAP_LOCK_SECONDS', 25200),
     'optimization_stale_minutes' => (int) env('CDN_OPTIMIZATION_STALE_MINUTES', 20),
     'ffmpeg_timeout_seconds' => (int) env('CDN_FFMPEG_TIMEOUT_SECONDS', 21600),

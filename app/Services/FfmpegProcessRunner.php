@@ -10,6 +10,13 @@ use Symfony\Component\Process\Process;
 class FfmpegProcessRunner
 {
     /**
+     * Sentinel exit code meaning "this attempt was superseded mid-run; the
+     * process was stopped and no status was written." Never a real FFmpeg
+     * exit code, so callers can distinguish it from a genuine failure.
+     */
+    public const SUPERSEDED_EXIT_CODE = -1;
+
+    /**
      * @param  array<int, string>  $command
      * @return array{0:int,1:string}
      */
@@ -17,6 +24,11 @@ class FfmpegProcessRunner
     {
         $timeout = max(300, (int) config('cdn.ffmpeg_timeout_seconds', 21600));
         $heartbeatEvery = max(2, (int) config('cdn.ffmpeg_heartbeat_seconds', 10));
+        // Captured once: every write for this run is guarded against this
+        // exact attempt, so a superseded process (e.g. one a stale-recovery
+        // pass wrongly declared dead while it kept running) can never
+        // silently overwrite a fresher attempt's state. See heartbeat().
+        $attemptId = $source->processing_attempt_id;
         $process = new Process($command);
         $process->setTimeout($timeout);
         $process->setIdleTimeout(max(120, $heartbeatEvery * 12));
@@ -50,7 +62,17 @@ class FfmpegProcessRunner
 
                 $now = microtime(true);
                 if ($now - $lastHeartbeat >= $heartbeatEvery) {
-                    $this->heartbeat($source, $stage, $stageProgress, $diagnostics);
+                    if (! $this->heartbeat($source, $stage, $stageProgress, $diagnostics, $attemptId)) {
+                        Log::warning('FFmpeg attempt superseded by a newer attempt; stopping process without writing status', [
+                            'source_id' => $source->id,
+                            'asset_id' => $source->media_asset_id,
+                            'attempt_id' => $attemptId,
+                            'stage' => $stage,
+                        ]);
+                        $process->stop(5);
+
+                        return [self::SUPERSEDED_EXIT_CODE, $diagnostics];
+                    }
                     $lastHeartbeat = $now;
                 }
 
@@ -62,7 +84,7 @@ class FfmpegProcessRunner
             $diagnostics = $this->boundedDiagnostics(
                 $diagnostics."\nFFmpeg timed out after {$timeout} seconds: ".$exception->getMessage()
             );
-            $this->heartbeat($source, $stage, $stageProgress, $diagnostics);
+            $this->heartbeat($source, $stage, $stageProgress, $diagnostics, $attemptId);
 
             return [124, $diagnostics];
         }
@@ -70,7 +92,7 @@ class FfmpegProcessRunner
         $tail = $process->getIncrementalErrorOutput().$process->getIncrementalOutput();
         $diagnostics = $this->boundedDiagnostics($diagnostics.$tail);
         $exitCode = $process->getExitCode() ?? 1;
-        $this->heartbeat($source, $stage, $exitCode === 0 ? 100 : $stageProgress, $diagnostics);
+        $this->heartbeat($source, $stage, $exitCode === 0 ? 100 : $stageProgress, $diagnostics, $attemptId);
 
         return [$exitCode, $diagnostics];
     }
@@ -121,12 +143,17 @@ class FfmpegProcessRunner
         return [$remainder, $currentProgress];
     }
 
+    /**
+     * @return bool false when this attempt has been superseded (0 rows
+     *              matched processing_attempt_id) and the caller should stop.
+     */
     private function heartbeat(
         MediaSource $source,
         string $stage,
         int $stageProgress,
-        string $diagnostics
-    ): void {
+        string $diagnostics,
+        ?string $attemptId
+    ): bool {
         $overallProgress = match ($stage) {
             'faststarting' => 10 + (int) floor($stageProgress * 0.68),
             'compressing' => 10 + (int) floor($stageProgress * 0.68),
@@ -135,7 +162,12 @@ class FfmpegProcessRunner
                 : min(99, $stageProgress),
         };
 
-        MediaSource::query()->whereKey($source->id)->update([
+        $query = MediaSource::query()->whereKey($source->id);
+        if ($attemptId !== null) {
+            $query->where('processing_attempt_id', $attemptId);
+        }
+
+        $affected = $query->update([
             'processing_stage' => $stage,
             'processing_stage_progress' => max(0, min(100, $stageProgress)),
             'processing_heartbeat_at' => now(),
@@ -143,6 +175,12 @@ class FfmpegProcessRunner
             'progress_percent' => max(0, min(99, $overallProgress)),
             'last_progress_at' => now(),
         ]);
+        $stillCurrent = $attemptId === null || $affected > 0;
+        if ($stillCurrent) {
+            ProcessingLiveness::touch($source->id);
+        }
+
+        return $stillCurrent;
     }
 
     private function boundedDiagnostics(string $value): string

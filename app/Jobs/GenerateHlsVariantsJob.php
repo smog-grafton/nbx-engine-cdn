@@ -3,10 +3,12 @@
 namespace App\Jobs;
 
 use App\Models\MediaSource;
+use App\Queue\Middleware\ConcurrencyPool;
 use App\Services\FfmpegProcessRunner;
 use App\Services\MediaBinaryDetector;
 use App\Services\MediaSourceService;
 use App\Services\NbxEngineService;
+use App\Services\ProcessingLiveness;
 use App\Services\VideoProbeService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
@@ -62,9 +64,10 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
         ];
 
         if ((bool) config('cdn.serialize_optimization_jobs', true)) {
-            $locks[] = (new WithoutOverlapping('optimization:global'))
-                ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 25200)))
-                ->releaseAfter(30);
+            // HLS variant encoding is always a libx264 encode, regardless of
+            // compress_enabled — always the CPU-bound tier.
+            $lockSeconds = max(300, (int) config('cdn.optimization_overlap_lock_seconds', 25200));
+            $locks[] = new ConcurrencyPool('transcode', max(1, (int) config('cdn.transcode_concurrency', 1)), $lockSeconds);
         }
 
         return $locks;
@@ -86,6 +89,12 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
             return;
         }
 
+        ProcessingLiveness::touch($source->id);
+        $this->handleAttempt($source);
+    }
+
+    private function handleAttempt(MediaSource $source): void
+    {
         $nbx = app(NbxEngineService::class);
 
         if (! (bool) config('cdn.enable_hls', true)) {
@@ -206,15 +215,16 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
                     "HLS output (".count($profiles)." profile(s)) for source #{$source->id}"
                 );
             } catch (\App\Services\InsufficientDiskSpaceException $spaceError) {
-                $source->update([
+                if ($this->updateIfCurrentAttempt($source, [
                     'optimize_status' => 'failed',
                     'optimize_error' => $spaceError->getMessage(),
                     'processing_stage' => 'failed',
                     'processing_stage_progress' => null,
                     'processing_heartbeat_at' => now(),
                     'processing_diagnostics' => $spaceError->getMessage(),
-                ]);
-                app(NbxEngineService::class)->markNbxStatus($source->fresh() ?? $source, 'failed', $spaceError->getMessage());
+                ])) {
+                    app(NbxEngineService::class)->markNbxStatus($source->fresh() ?? $source, 'failed', $spaceError->getMessage());
+                }
 
                 return;
             }
@@ -259,6 +269,13 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
                 (float) ($probe['duration'] ?? $probe['duration_seconds'] ?? 0),
             );
 
+            if ($exitCode === FfmpegProcessRunner::SUPERSEDED_EXIT_CODE) {
+                // A newer attempt now owns this source; stop entirely
+                // rather than continuing to the next profile or writing
+                // any status for a row this attempt no longer owns.
+                return;
+            }
+
             if ($exitCode !== 0 || ! is_file($playlistAbsolute)) {
                 $skipped[$label] = $this->summarizeError($error);
                 Log::warning('HLS variant generation failed', [
@@ -284,13 +301,15 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
 
         if ($generated === []) {
             $this->storeSkipped($source, $skipped);
-            $source->update([
+            if (! $this->updateIfCurrentAttempt($source, [
                 'optimize_status' => 'ready',
                 'playback_type' => 'mp4',
                 'hls_master_path' => null,
                 'qualities_json' => [],
                 'optimize_error' => 'HLS generation failed for all requested profiles.',
-            ]);
+            ])) {
+                return;
+            }
             $source = $nbx->finalizeStorageIfNeeded($source->fresh() ?? $source);
             $this->dispatchSkippedWebhooks($source, $skipped);
             app(\App\Services\NbxWebhookDispatcher::class)->dispatch($source, 'job.partially_completed', [
@@ -317,13 +336,15 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
 
         @file_put_contents($masterAbsolute, implode("\n", $masterLines)."\n");
         if (! is_file($masterAbsolute)) {
-            $source->update([
+            if (! $this->updateIfCurrentAttempt($source, [
                 'optimize_status' => 'ready',
                 'playback_type' => 'mp4',
                 'hls_master_path' => null,
                 'qualities_json' => [],
                 'optimize_error' => 'HLS master playlist generation failed.',
-            ]);
+            ])) {
+                return;
+            }
             $source = $nbx->finalizeStorageIfNeeded($source->fresh() ?? $source);
             app(\App\Services\NbxWebhookDispatcher::class)->dispatch($source, 'job.partially_completed', [
                 'reason' => 'HLS master playlist generation failed.',
@@ -333,7 +354,7 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
         }
 
         $this->storeSkipped($source, $skipped);
-        $source->update([
+        if (! $this->updateIfCurrentAttempt($source, [
             'optimize_status' => $skipped === [] ? 'ready' : 'failed',
             'playback_type' => 'hls',
             'hls_master_path' => $masterPath,
@@ -344,7 +365,9 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
             'processing_heartbeat_at' => now(),
             'progress_percent' => 100,
             'last_progress_at' => now(),
-        ]);
+        ])) {
+            return;
+        }
 
         $source = $nbx->finalizeStorageIfNeeded($source->fresh() ?? $source);
         $this->dispatchSkippedWebhooks($source, $skipped);
@@ -519,6 +542,39 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
         $trimmed = trim(preg_replace('/\s+/', ' ', $error) ?: $error);
 
         return mb_substr($trimmed !== '' ? $trimmed : 'FFmpeg failed.', 0, 500);
+    }
+
+    /**
+     * Write only if this job's attempt still owns the row. See
+     * OptimizeMp4FaststartJob::updateIfCurrentAttempt() for the rationale.
+     *
+     * @param  array<string, mixed>  $attributes
+     */
+    private function updateIfCurrentAttempt(MediaSource $source, array $attributes): bool
+    {
+        if ($this->attemptId === null) {
+            $source->update($attributes);
+
+            return true;
+        }
+
+        $affected = MediaSource::query()
+            ->whereKey($source->id)
+            ->where('processing_attempt_id', $this->attemptId)
+            ->update($attributes);
+
+        if ($affected > 0) {
+            $source->forceFill($attributes);
+
+            return true;
+        }
+
+        Log::info('Skipped terminal write for superseded HLS attempt', [
+            'source_id' => $source->id,
+            'attempt_id' => $this->attemptId,
+        ]);
+
+        return false;
     }
 
     public function failed(?Throwable $exception): void

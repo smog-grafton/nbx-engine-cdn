@@ -298,7 +298,7 @@ class NbxEngineService
             'optimize_error' => null,
             'is_active' => true,
         ];
-        if (in_array($operation, ['reprocess', 'retry'], true)) {
+        if (in_array($operation, ['reprocess', 'retry', 'force_reprocess'], true)) {
             $updates['processing_revision'] = $source->processing_revision + 1;
         }
         $source->fill($updates)->save();
@@ -352,6 +352,34 @@ class NbxEngineService
             } elseif (in_array($operation, ['retry', 'reprocess', 'generate_faststart', 'compress'], true)) {
                 $source->update(['status' => 'ready', 'optimize_status' => null]);
                 if (! $mediaSourceService->queuePlaybackProcessing($source->fresh() ?? $source)) {
+                    throw new \RuntimeException('NBX could not queue playback processing because no verified work input is available.');
+                }
+            } elseif ($operation === 'force_reprocess') {
+                // Deliberately destructive, unlike plain Reprocess: discards
+                // derived artifacts and probe cache, then restarts from the
+                // true original — ignoring any already-faststarted/compressed
+                // local work file. Not the default action; gate this to
+                // admin-only confirmation in Portal's UI.
+                $forceMetadata = (array) ($source->source_metadata ?? []);
+                unset($forceMetadata['probe'], $forceMetadata['probe_output']);
+                if (isset($forceMetadata['nbx']) && is_array($forceMetadata['nbx'])) {
+                    unset($forceMetadata['nbx']['processing_result']);
+                }
+                $source->update([
+                    'status' => 'ready',
+                    'optimize_status' => null,
+                    'optimized_path' => null,
+                    'is_faststart' => false,
+                    'hls_master_path' => null,
+                    'qualities_json' => null,
+                    'source_metadata' => $forceMetadata,
+                ]);
+
+                $restored = $mediaSourceService->ensureLocalWorkFileForProcessing($source->fresh() ?? $source, forceOriginal: true);
+                if (! $restored || ! $restored->storage_path) {
+                    throw new \RuntimeException('Force reprocess could not locate the original source file to restart from.');
+                }
+                if (! $mediaSourceService->queuePlaybackProcessing($restored)) {
                     throw new \RuntimeException('NBX could not queue playback processing because no verified work input is available.');
                 }
             } elseif ($operation === 'generate_hls') {
@@ -915,6 +943,9 @@ class NbxEngineService
             'action_required' => $failure['action_required'] ?? false,
             'storage_disk' => $source->storage_disk,
             'storage_target' => $nbx['storage_target'] ?? null,
+            'compress_enabled' => (bool) $source->compress_enabled,
+            'compression_outcome' => $source->compressionOutcomeLabel(),
+            'estimated_seconds_remaining' => $source->estimatedSecondsRemaining(),
             'processing_complete' => (bool) ($nbx['processing_complete'] ?? false),
             'storage_verified' => (bool) ($nbx['storage_verified'] ?? false),
             'publication_status' => $nbx['publication_status'] ?? null,
@@ -949,6 +980,7 @@ class NbxEngineService
             'updated_at' => $source->updated_at?->toIso8601String(),
         ];
     }
+
 
     public function findForDiscovery(array $criteria): ?MediaSource
     {

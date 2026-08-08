@@ -3,12 +3,14 @@
 namespace App\Jobs;
 
 use App\Models\MediaSource;
+use App\Queue\Middleware\ConcurrencyPool;
 use App\Services\FfmpegProcessRunner;
 use App\Services\InsufficientDiskSpaceException;
 use App\Services\LocalDiskSpaceGuard;
 use App\Services\MediaBinaryDetector;
 use App\Services\MediaSourceService;
 use App\Services\NbxEngineService;
+use App\Services\ProcessingLiveness;
 use App\Services\Storage\StorageTargetRegistry;
 use App\Services\VideoProbeService;
 use Illuminate\Bus\Queueable;
@@ -71,9 +73,17 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
         ];
 
         if ((bool) config('cdn.serialize_optimization_jobs', true)) {
-            $locks[] = (new WithoutOverlapping('optimization:global'))
-                ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 25200)))
-                ->releaseAfter(30);
+            // Which tier this job competes for is decided from the request
+            // (compress_enabled), not the eventual outcome — probing hasn't
+            // run yet at middleware time, so "will this actually transcode"
+            // isn't known until handle() runs. compress_enabled=true is
+            // still the right approximation: it's the only case that can
+            // become a full CPU-bound encode.
+            $compressRequested = (bool) MediaSource::query()->whereKey($this->sourceId)->value('compress_enabled');
+            $lockSeconds = max(300, (int) config('cdn.optimization_overlap_lock_seconds', 25200));
+            $locks[] = $compressRequested
+                ? new ConcurrencyPool('transcode', max(1, (int) config('cdn.transcode_concurrency', 1)), $lockSeconds)
+                : new ConcurrencyPool('remux', max(1, (int) config('cdn.remux_concurrency', 3)), $lockSeconds);
         }
 
         return $locks;
@@ -95,6 +105,12 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             return;
         }
 
+        ProcessingLiveness::touch($source->id);
+        $this->handleAttempt($source);
+    }
+
+    private function handleAttempt(MediaSource $source): void
+    {
         $source = app(MediaSourceService::class)->ensureLocalWorkFileForProcessing($source) ?: $source;
         $disk = $source->storage_disk ?: (string) config('cdn.disk', 'public');
         if (! $source->storage_path || ! Storage::disk($disk)->exists($source->storage_path)) {
@@ -217,6 +233,18 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             );
         }
 
+        if ($exitCode === FfmpegProcessRunner::SUPERSEDED_EXIT_CODE) {
+            // A newer attempt has already taken over this source (see
+            // FfmpegProcessRunner::heartbeat()); this attempt's work is
+            // moot, and it must not write any status for a row it no
+            // longer owns.
+            if (is_file($absoluteOutput)) {
+                @unlink($absoluteOutput);
+            }
+
+            return;
+        }
+
         if ($exitCode !== 0 || $this->safeLocalFileSize($absoluteOutput) <= 0) {
             $optimizeError = $this->summarizeFfmpegError($rawError);
             Log::warning('Faststart optimization failed', [
@@ -230,7 +258,7 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
                 @unlink($absoluteOutput);
             }
 
-            $source->update([
+            if (! $this->updateIfCurrentAttempt($source, [
                 'optimize_status' => 'failed',
                 'optimize_error' => $optimizeError !== '' ? $optimizeError : 'FFmpeg faststart optimization failed.',
                 'is_faststart' => false,
@@ -240,7 +268,9 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
                 'processing_stage_progress' => null,
                 'processing_heartbeat_at' => now(),
                 'processing_diagnostics' => $rawError !== '' ? $rawError : null,
-            ]);
+            ])) {
+                return;
+            }
             $this->markNbxStatusIfManaged(
                 $source->fresh() ?? $source,
                 'failed',
@@ -257,11 +287,12 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             'progress_percent' => 80,
             'last_progress_at' => now(),
         ]);
+        ProcessingLiveness::touch($source->id);
         $outputProbe = app(VideoProbeService::class)->probe($absoluteOutput);
         $verificationError = $this->outputVerificationError($probe, $outputProbe, $absoluteOutput);
         if ($verificationError !== null) {
             @unlink($absoluteOutput);
-            $source->update([
+            if (! $this->updateIfCurrentAttempt($source, [
                 'optimize_status' => 'failed',
                 'optimize_error' => $verificationError,
                 'is_faststart' => false,
@@ -269,7 +300,9 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
                 'processing_stage_progress' => null,
                 'processing_heartbeat_at' => now(),
                 'processing_diagnostics' => $verificationError,
-            ]);
+            ])) {
+                return;
+            }
             $this->markNbxStatusIfManaged($source->fresh() ?? $source, 'failed', $verificationError);
 
             return;
@@ -365,6 +398,9 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
         ];
 
         if ($deletedOriginal || $originalMissingAfterProcessing) {
+            // hash_file() on a large output can run long enough to outlast
+            // the liveness TTL on its own; refresh right before it.
+            ProcessingLiveness::touch($source->id);
             $updates['storage_path'] = $optimizedPath;
             $updates['mime_type'] = 'video/mp4';
             $updates['file_size_bytes'] = $optimizedSize > 0 ? $optimizedSize : null;
@@ -379,11 +415,17 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             $updates['original_storage_path'] = $deletedOriginal ? $originalPath : $originalPath;
         }
 
-        $source->update($updates);
+        if (! $this->updateIfCurrentAttempt($source, $updates)) {
+            return;
+        }
         $source = $source->fresh() ?? $source;
         $isNbxManaged = ($source->source_metadata['provider'] ?? null) === 'nbx_engine'
             || isset($source->source_metadata['nbx']);
         if ($isNbxManaged) {
+            // The Contabo upload can run long on a large file; refresh
+            // before handing off so the reaper doesn't race an upload that
+            // has no ffmpeg heartbeat of its own.
+            ProcessingLiveness::touch($source->id);
             $source = $nbxService->publishAvailableArtifacts($source, ['faststart']);
             if ($source->status !== 'ready') {
                 return;
@@ -577,6 +619,42 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
         $metadata = (array) ($source->source_metadata ?? []);
 
         return $metadata['nbx']['requested'][$key] ?? $fallback;
+    }
+
+    /**
+     * Write only if this job's attempt still owns the row. Prevents a
+     * superseded attempt (declared dead by a stale-recovery pass while it
+     * was actually still running) from clobbering a fresher attempt's
+     * state once it finally reaches a terminal write. Keeps $source in
+     * sync with the DB when the write does land.
+     *
+     * @param  array<string, mixed>  $attributes
+     */
+    private function updateIfCurrentAttempt(MediaSource $source, array $attributes): bool
+    {
+        if ($this->attemptId === null) {
+            $source->update($attributes);
+
+            return true;
+        }
+
+        $affected = MediaSource::query()
+            ->whereKey($source->id)
+            ->where('processing_attempt_id', $this->attemptId)
+            ->update($attributes);
+
+        if ($affected > 0) {
+            $source->forceFill($attributes);
+
+            return true;
+        }
+
+        Log::info('Skipped terminal write for superseded optimization attempt', [
+            'source_id' => $source->id,
+            'attempt_id' => $this->attemptId,
+        ]);
+
+        return false;
     }
 
     private function markNbxStatusIfManaged(MediaSource $source, string $status, ?string $message = null): void

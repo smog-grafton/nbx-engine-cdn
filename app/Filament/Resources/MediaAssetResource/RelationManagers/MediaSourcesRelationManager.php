@@ -387,7 +387,7 @@ class MediaSourcesRelationManager extends RelationManager
                         'processing', 'pending' => 'warning',
                         default => 'gray',
                     })
-                    ->description(fn (MediaSource $record): ?string => $record->optimize_status === 'failed' && $record->optimize_error ? $record->optimize_error : null)
+                    ->description(fn (MediaSource $record): ?string => $record->optimize_status === 'failed' && $record->optimize_error ? $record->optimize_error : $record->compressionOutcomeLabel())
                     ->toggleable(),
                 Tables\Columns\TextColumn::make('file_size_bytes')
                     ->label('Size')
@@ -406,6 +406,11 @@ class MediaSourcesRelationManager extends RelationManager
                         'failed' => 'danger',
                         default => 'warning',
                     }),
+                Tables\Columns\TextColumn::make('eta')
+                    ->label('ETA')
+                    ->state(fn (MediaSource $record): ?string => $record->estimatedTimeRemainingLabel())
+                    ->placeholder('—')
+                    ->toggleable(),
                 Tables\Columns\TextColumn::make('public_url')
                     ->label('Public URL')
                     ->state(fn (MediaSource $record) => app(MediaSourceService::class)->buildPublicUrl($record))
