@@ -48,7 +48,9 @@ class ProcessHlsAfterFaststartJob implements ShouldBeUnique, ShouldQueue
         return [
             (new WithoutOverlapping('optimization:source:'.$this->sourceId))
                 ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 25200)))
-                ->dontRelease(),
+                // A blocked continuation is recoverable. Dropping it here can
+                // leave a successful faststart permanently without HLS.
+                ->releaseAfter(300),
         ];
     }
 
@@ -95,8 +97,13 @@ class ProcessHlsAfterFaststartJob implements ShouldBeUnique, ShouldQueue
                 'original_storage_path' => $source->original_storage_path,
             ]);
             $source->update([
-                'optimize_status' => 'failed',
+                // Faststart has already completed before this chained job. A
+                // missing optional HLS input must not erase that valid MP4.
+                'optimize_status' => $source->is_faststart ? 'ready' : 'failed',
                 'optimize_error' => 'HLS step skipped: input file not found on disk. Original may have been deleted.',
+                'hls_worker_status' => 'failed',
+                'hls_worker_last_error' => 'HLS step skipped: input file not found on disk. Original may have been deleted.',
+                'processing_stage' => $source->is_faststart ? 'hls_failed' : 'optimization_failed',
             ]);
             app(\App\Services\NbxWebhookDispatcher::class)->dispatch($source->fresh() ?? $source, 'job.partially_completed', [
                 'reason' => 'HLS step skipped: input file not found on disk.',

@@ -7,6 +7,7 @@ use App\Services\InsufficientDiskSpaceException;
 use App\Services\LocalDiskSpaceGuard;
 use App\Services\MediaSourceService;
 use App\Services\NbxEngineService;
+use App\Services\ProcessingLiveness;
 use App\Services\ResumableRemoteFetcher;
 use App\Services\VideoProbeService;
 use App\Support\SafeRemoteMediaUrl;
@@ -112,6 +113,10 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
 
         $source->update([
             'status' => 'downloading',
+            'processing_stage' => 'fetching',
+            'processing_stage_progress' => 0,
+            'processing_started_at' => now(),
+            'processing_heartbeat_at' => now(),
             'failure_reason' => null,
             'last_error' => null,
             'last_attempt_host' => parse_url($sourceUrl, PHP_URL_HOST) ?: null,
@@ -124,6 +129,7 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
             'last_progress_at' => now(),
             'completed_at' => null,
         ]);
+        ProcessingLiveness::touch($source->id);
 
         $storagePath = null;
         $absolutePath = null;
@@ -238,6 +244,8 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
 
                     $source->update([
                         'status' => 'proxying',
+                        'processing_stage' => 'proxying',
+                        'processing_heartbeat_at' => now(),
                         'failure_reason' => null,
                         'last_error' => $downloadError->getMessage(),
                         'last_attempt_host' => parse_url((string) $source->source_url, PHP_URL_HOST) ?: null,
@@ -278,6 +286,7 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
             }
 
             $source->update(['status' => 'processing', 'last_progress_at' => now()]);
+            ProcessingLiveness::touch($source->id);
             $preferredExtension = $this->extensionFromMimeType($mimeType);
             $currentExtension = strtolower((string) pathinfo($storagePath, PATHINFO_EXTENSION));
             $knownVideoExtensions = ['mp4', 'm4v', 'mov', 'mkv', 'webm', 'avi', 'mpeg', 'mpg', 'ts', 'm2ts'];
@@ -314,6 +323,9 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
                 'duration_seconds' => isset($probe['duration_seconds']) ? (int) $probe['duration_seconds'] : null,
                 'checksum' => hash_file('sha256', $absolutePath),
                 'status' => 'ready',
+                'processing_stage' => 'original_ready',
+                'processing_stage_progress' => 100,
+                'processing_heartbeat_at' => now(),
                 'failure_reason' => null,
                 'last_error' => null,
                 'progress_percent' => 100,

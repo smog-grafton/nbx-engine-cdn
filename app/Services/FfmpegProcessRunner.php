@@ -20,9 +20,16 @@ class FfmpegProcessRunner
      * @param  array<int, string>  $command
      * @return array{0:int,1:string}
      */
-    public function run(array $command, MediaSource $source, float $durationSeconds, string $stage): array
+    public function run(
+        array $command,
+        MediaSource $source,
+        float $durationSeconds,
+        string $stage,
+        ?string $absoluteOutput = null,
+    ): array
     {
-        $timeout = max(300, (int) config('cdn.ffmpeg_timeout_seconds', 21600));
+        $timeout = max(0, (int) config('cdn.ffmpeg_timeout_seconds', 0));
+        $idleTimeout = max(0, (int) config('cdn.ffmpeg_idle_timeout_seconds', 0));
         $heartbeatEvery = max(2, (int) config('cdn.ffmpeg_heartbeat_seconds', 10));
         // Captured once: every write for this run is guarded against this
         // exact attempt, so a superseded process (e.g. one a stale-recovery
@@ -30,8 +37,13 @@ class FfmpegProcessRunner
         // silently overwrite a fresher attempt's state. See heartbeat().
         $attemptId = $source->processing_attempt_id;
         $process = new Process($command);
-        $process->setTimeout($timeout);
-        $process->setIdleTimeout(max(120, $heartbeatEvery * 12));
+        // A quiet FFmpeg can still be muxing or writing indexes. Do not turn
+        // lack of stderr/progress into a fabricated terminal failure. Both
+        // limits are disabled by default; an operator may explicitly opt in
+        // to a hard resource guard, while liveness/reconciliation remains the
+        // source of truth for state transitions.
+        $process->setTimeout($timeout > 0 ? $timeout : null);
+        $process->setIdleTimeout($idleTimeout > 0 ? $idleTimeout : null);
         $commandSummary = $this->sanitizedCommand($command);
         Log::info('Starting FFmpeg media stage', [
             'source_id' => $source->id,
@@ -41,11 +53,15 @@ class FfmpegProcessRunner
             'command' => $commandSummary,
         ]);
         $process->start();
+        $pid = $process->getPid();
+        $absoluteOutput ??= is_string(end($command)) ? (string) end($command) : null;
+        $this->markProcessStarted($source, $stage, $pid, $absoluteOutput, $attemptId);
 
         $diagnostics = "FFmpeg command: {$commandSummary}";
         $progressBuffer = '';
         $lastHeartbeat = 0.0;
         $stageProgress = 0;
+        $processedSeconds = null;
 
         try {
             while ($process->isRunning()) {
@@ -53,16 +69,17 @@ class FfmpegProcessRunner
                 if ($chunk !== '') {
                     $progressBuffer .= $chunk;
                     $diagnostics = $this->boundedDiagnostics($diagnostics.$chunk);
-                    [$progressBuffer, $stageProgress] = $this->readProgress(
+                    [$progressBuffer, $stageProgress, $processedSeconds] = $this->readProgress(
                         $progressBuffer,
                         $durationSeconds,
                         $stageProgress,
+                        $processedSeconds,
                     );
                 }
 
                 $now = microtime(true);
                 if ($now - $lastHeartbeat >= $heartbeatEvery) {
-                    if (! $this->heartbeat($source, $stage, $stageProgress, $diagnostics, $attemptId)) {
+                    if (! $this->heartbeat($source, $stage, $stageProgress, $diagnostics, $attemptId, $pid, $absoluteOutput, $processedSeconds)) {
                         Log::warning('FFmpeg attempt superseded by a newer attempt; stopping process without writing status', [
                             'source_id' => $source->id,
                             'asset_id' => $source->media_asset_id,
@@ -82,9 +99,9 @@ class FfmpegProcessRunner
         } catch (ProcessTimedOutException $exception) {
             $process->stop(3);
             $diagnostics = $this->boundedDiagnostics(
-                $diagnostics."\nFFmpeg timed out after {$timeout} seconds: ".$exception->getMessage()
+                $diagnostics."\nFFmpeg exceeded the explicitly configured {$timeout}-second safety limit: ".$exception->getMessage()
             );
-            $this->heartbeat($source, $stage, $stageProgress, $diagnostics, $attemptId);
+            $this->heartbeat($source, $stage, $stageProgress, $diagnostics, $attemptId, $pid, $absoluteOutput, $processedSeconds);
 
             return [124, $diagnostics];
         }
@@ -92,7 +109,7 @@ class FfmpegProcessRunner
         $tail = $process->getIncrementalErrorOutput().$process->getIncrementalOutput();
         $diagnostics = $this->boundedDiagnostics($diagnostics.$tail);
         $exitCode = $process->getExitCode() ?? 1;
-        $this->heartbeat($source, $stage, $exitCode === 0 ? 100 : $stageProgress, $diagnostics, $attemptId);
+        $this->heartbeat($source, $stage, $exitCode === 0 ? 100 : $stageProgress, $diagnostics, $attemptId, null, $absoluteOutput, $processedSeconds);
 
         return [$exitCode, $diagnostics];
     }
@@ -122,13 +139,13 @@ class FfmpegProcessRunner
     }
 
     /**
-     * @return array{0:string,1:int}
+     * @return array{0:string,1:int,2:?float}
      */
-    private function readProgress(string $buffer, float $durationSeconds, int $currentProgress): array
+    private function readProgress(string $buffer, float $durationSeconds, int $currentProgress, ?float $currentSeconds): array
     {
         $lastNewline = strrpos($buffer, "\n");
         if ($lastNewline === false) {
-            return [$buffer, $currentProgress];
+            return [$buffer, $currentProgress, $currentSeconds];
         }
 
         $complete = substr($buffer, 0, $lastNewline + 1);
@@ -138,9 +155,10 @@ class FfmpegProcessRunner
         if ($last > 0 && $durationSeconds > 0) {
             $seconds = $last / 1_000_000;
             $currentProgress = max($currentProgress, min(99, (int) floor(($seconds / $durationSeconds) * 100)));
+            $currentSeconds = max((float) ($currentSeconds ?? 0), $seconds);
         }
 
-        return [$remainder, $currentProgress];
+        return [$remainder, $currentProgress, $currentSeconds];
     }
 
     /**
@@ -152,7 +170,10 @@ class FfmpegProcessRunner
         string $stage,
         int $stageProgress,
         string $diagnostics,
-        ?string $attemptId
+        ?string $attemptId,
+        ?int $pid,
+        ?string $absoluteOutput,
+        ?float $processedSeconds,
     ): bool {
         $overallProgress = match ($stage) {
             'faststarting' => 10 + (int) floor($stageProgress * 0.68),
@@ -174,6 +195,11 @@ class FfmpegProcessRunner
             'processing_diagnostics' => $diagnostics !== '' ? $diagnostics : null,
             'progress_percent' => max(0, min(99, $overallProgress)),
             'last_progress_at' => now(),
+            'ffmpeg_pid' => $pid,
+            'processing_worker_id' => $this->workerId(),
+            'processed_seconds' => $processedSeconds,
+            'current_output_size_bytes' => $this->outputSize($absoluteOutput),
+            'output_size_observed_at' => $absoluteOutput ? now() : null,
         ]);
         $stillCurrent = $attemptId === null || $affected > 0;
         if ($stillCurrent) {
@@ -181,6 +207,45 @@ class FfmpegProcessRunner
         }
 
         return $stillCurrent;
+    }
+
+    private function markProcessStarted(
+        MediaSource $source,
+        string $stage,
+        ?int $pid,
+        ?string $absoluteOutput,
+        ?string $attemptId,
+    ): void {
+        $query = MediaSource::query()->whereKey($source->id);
+        if ($attemptId !== null) {
+            $query->where('processing_attempt_id', $attemptId);
+        }
+        $query->update([
+            'processing_stage' => $stage,
+            'processing_started_at' => now(),
+            'processing_heartbeat_at' => now(),
+            'processing_worker_id' => $this->workerId(),
+            'ffmpeg_pid' => $pid,
+            'current_output_size_bytes' => $this->outputSize($absoluteOutput),
+            'output_size_observed_at' => $absoluteOutput ? now() : null,
+        ]);
+        ProcessingLiveness::touch($source->id);
+    }
+
+    private function outputSize(?string $path): ?int
+    {
+        if (! is_string($path) || $path === '' || ! is_file($path)) {
+            return null;
+        }
+
+        $size = @filesize($path);
+
+        return $size === false ? null : max(0, (int) $size);
+    }
+
+    private function workerId(): string
+    {
+        return gethostname() ?: php_uname('n');
     }
 
     private function boundedDiagnostics(string $value): string

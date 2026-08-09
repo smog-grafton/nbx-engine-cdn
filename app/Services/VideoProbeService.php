@@ -112,6 +112,11 @@ class VideoProbeService
         }
         $diagnosticVideo = $video ?? $attachedVideo;
 
+        $formatDuration = $this->number($format['duration'] ?? null);
+        $videoDuration = $this->streamDuration($video);
+        $audioDuration = $this->streamDuration($audio);
+        $primaryAvDuration = max($videoDuration ?? 0, $audioDuration ?? 0) ?: null;
+
         return array_filter([
             'container' => isset($format['format_name']) ? (string) $format['format_name'] : null,
             'video_codec' => is_array($video) ? (string) ($video['codec_name'] ?? '') ?: null : null,
@@ -139,8 +144,30 @@ class VideoProbeService
                 : null,
             'width' => is_array($video) && isset($video['width']) ? (int) $video['width'] : null,
             'height' => is_array($video) && isset($video['height']) ? (int) $video['height'] : null,
-            'duration' => isset($format['duration']) ? (float) $format['duration'] : null,
-            'duration_seconds' => isset($format['duration']) ? (int) round((float) $format['duration']) : null,
+            // Keep the historical duration fields as the container estimate for
+            // API compatibility, but expose every relevant timestamp separately.
+            // Matroska commonly has a misleading format.duration while the
+            // stream tag/duration_ts is correct, so callers must not treat this
+            // one container field as the only authority.
+            'duration' => $formatDuration,
+            'duration_seconds' => $formatDuration !== null ? (int) round($formatDuration) : null,
+            'format_duration' => $formatDuration,
+            'format_start_time' => $this->numericValue($format['start_time'] ?? null),
+            'video_duration' => $videoDuration,
+            'video_duration_source' => $this->streamDurationSource($video),
+            'video_start_time' => $this->numericValue(is_array($video) ? ($video['start_time'] ?? null) : null),
+            'video_time_base' => is_array($video) ? (string) ($video['time_base'] ?? '') ?: null : null,
+            'video_avg_frame_rate' => is_array($video) ? (string) ($video['avg_frame_rate'] ?? '') ?: null : null,
+            'video_r_frame_rate' => is_array($video) ? (string) ($video['r_frame_rate'] ?? '') ?: null : null,
+            'audio_duration' => $audioDuration,
+            'audio_duration_source' => $this->streamDurationSource($audio),
+            'audio_start_time' => $this->numericValue(is_array($audio) ? ($audio['start_time'] ?? null) : null),
+            'audio_time_base' => is_array($audio) ? (string) ($audio['time_base'] ?? '') ?: null : null,
+            'primary_av_duration' => $primaryAvDuration,
+            // The primary video timeline is the most useful operational clock
+            // for progress and output validation. Fall back only when it is
+            // unavailable (for example, unusual raw streams).
+            'processing_duration' => $videoDuration ?? $primaryAvDuration ?? $formatDuration,
             'bitrate' => isset($format['bit_rate']) ? (int) $format['bit_rate'] : null,
             'frame_rate' => is_array($video) ? $this->normalizeFrameRate((string) ($video['avg_frame_rate'] ?? $video['r_frame_rate'] ?? '')) : null,
             'file_size' => is_file($target) ? (int) filesize($target) : null,
@@ -160,5 +187,72 @@ class VideoProbeService
         }
 
         return is_numeric($value) ? (float) $value : null;
+    }
+
+    private function number(mixed $value): ?float
+    {
+        if (! is_numeric($value)) {
+            return null;
+        }
+
+        $number = (float) $value;
+
+        return $number > 0 ? $number : null;
+    }
+
+    private function numericValue(mixed $value): ?float
+    {
+        return is_numeric($value) ? (float) $value : null;
+    }
+
+    /**
+     * @param  array<string, mixed>|null  $stream
+     */
+    private function streamDuration(?array $stream): ?float
+    {
+        if (! is_array($stream)) {
+            return null;
+        }
+
+        if ($duration = $this->number($stream['duration'] ?? null)) {
+            return $duration;
+        }
+
+        $durationTs = $this->number($stream['duration_ts'] ?? null);
+        $timeBase = (string) ($stream['time_base'] ?? '');
+        if ($durationTs !== null && str_contains($timeBase, '/')) {
+            [$numerator, $denominator] = array_map('floatval', explode('/', $timeBase, 2));
+            if ($numerator > 0 && $denominator > 0) {
+                return $durationTs * ($numerator / $denominator);
+            }
+        }
+
+        $tag = data_get($stream, 'tags.DURATION');
+        if (is_string($tag) && preg_match('/^(\d+):(\d+):(\d+(?:\.\d+)?)$/', trim($tag), $matches) === 1) {
+            return ((int) $matches[1] * 3600) + ((int) $matches[2] * 60) + (float) $matches[3];
+        }
+
+        return null;
+    }
+
+    /**
+     * @param  array<string, mixed>|null  $stream
+     */
+    private function streamDurationSource(?array $stream): ?string
+    {
+        if (! is_array($stream)) {
+            return null;
+        }
+        if ($this->number($stream['duration'] ?? null) !== null) {
+            return 'stream.duration';
+        }
+        if ($this->number($stream['duration_ts'] ?? null) !== null && ! empty($stream['time_base'])) {
+            return 'duration_ts*time_base';
+        }
+        if (is_string(data_get($stream, 'tags.DURATION')) && data_get($stream, 'tags.DURATION') !== '') {
+            return 'tags.DURATION';
+        }
+
+        return null;
     }
 }

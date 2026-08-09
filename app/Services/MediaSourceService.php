@@ -1008,8 +1008,11 @@ class MediaSourceService
             'progress_percent' => $percent,
             'bytes_downloaded' => $safeDownloaded > 0 ? $safeDownloaded : null,
             'bytes_total' => $safeTotal > 0 ? $safeTotal : null,
+            'processing_stage' => $status ?? $fresh->processing_stage,
+            'processing_heartbeat_at' => now(),
             'last_progress_at' => now(),
         ])->save();
+        ProcessingLiveness::touch($fresh->id);
     }
 
     public function refreshAssetStatus(MediaAsset $asset): void
@@ -1037,6 +1040,30 @@ class MediaSourceService
     {
         return $this->withLock('media-source:queue-playback:'.$source->id, function () use ($source): bool {
             $source = $source->fresh() ?? $source;
+
+            // "Keep Original Only" is a first-class completed workflow, not
+            // an optimization that will later be discarded. Once acquisition
+            // has succeeded, publish and verify the original; do not spend
+            // CPU re-encoding it or risk an unrelated derivative failure.
+            if ($source->status === 'ready' && ! app(NbxEngineService::class)->shouldPublishOptimized($source)) {
+                $source->update([
+                    'optimize_status' => 'skipped',
+                    'optimize_error' => null,
+                    'processing_stage' => 'original_ready',
+                    'processing_stage_progress' => 100,
+                    'processing_heartbeat_at' => now(),
+                    'progress_percent' => 100,
+                    'last_progress_at' => now(),
+                ]);
+                $source = app(NbxEngineService::class)->markNbxStatus(
+                    $source->fresh() ?? $source,
+                    'original_ready',
+                    'Original-only retention selected; optimization was intentionally skipped.',
+                );
+                app(NbxEngineService::class)->finalizeStorageIfNeeded($source);
+
+                return true;
+            }
 
             if ($source->status !== 'ready') {
                 Log::warning('queuePlaybackProcessing: source not ready for optimization', [
@@ -1114,6 +1141,12 @@ class MediaSourceService
                 'processing_stage_progress' => 0,
                 'processing_heartbeat_at' => now(),
                 'processing_attempt_started_at' => now(),
+                'processing_started_at' => null,
+                'processing_worker_id' => null,
+                'ffmpeg_pid' => null,
+                'processed_seconds' => null,
+                'current_output_size_bytes' => null,
+                'output_size_observed_at' => null,
                 'processing_diagnostics' => null,
                 'progress_percent' => 0,
                 'last_progress_at' => now(),

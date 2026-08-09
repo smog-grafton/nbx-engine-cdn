@@ -4,8 +4,8 @@ namespace App\Console\Commands;
 
 use App\Models\MediaSource;
 use App\Services\MediaSourceService;
-use App\Services\NbxEngineService;
-use App\Services\ProcessingLiveness;
+use App\Services\PipelineStateService;
+use App\Services\ProcessingStateInspector;
 use Illuminate\Console\Command;
 
 class RecoverStaleOptimizations extends Command
@@ -19,7 +19,7 @@ class RecoverStaleOptimizations extends Command
 
     protected $description = 'Fail and safely requeue optimization jobs whose FFmpeg heartbeat stopped';
 
-    public function handle(MediaSourceService $media, NbxEngineService $nbx): int
+    public function handle(MediaSourceService $media, ProcessingStateInspector $inspector, PipelineStateService $pipeline): int
     {
         $limit = max(1, min(200, (int) $this->option('limit')));
         $staleMinutes = max(5, min(1440, (int) $this->option('stale-minutes')));
@@ -72,8 +72,13 @@ class RecoverStaleOptimizations extends Command
             // (e.g. past a slow non-heartbeating step, or just past the
             // 'queued' stage boundary) and must not be declared failed out
             // from under it — only a truly expired marker means dead.
-            if (ProcessingLiveness::isAlive($source->id)) {
-                $this->warn("Source #{$source->id}: still alive (liveness marker fresh); skipping.");
+            $health = $inspector->inspect($source);
+            if ($health['active']) {
+                $source->update([
+                    'current_output_size_bytes' => $health['output_bytes'] > 0 ? $health['output_bytes'] : $source->current_output_size_bytes,
+                    'output_size_observed_at' => $health['output_bytes'] > 0 ? now() : $source->output_size_observed_at,
+                ]);
+                $this->warn("Source #{$source->id}: {$health['message']} Skipping recovery.");
                 $skipped++;
 
                 continue;
@@ -100,34 +105,28 @@ class RecoverStaleOptimizations extends Command
                 $source->processing_stage ?: 'processing',
                 $staleMinutes,
             );
-            $source->update([
-                'optimize_status' => 'failed',
-                'optimize_error' => $reason,
-                'processing_stage' => 'failed',
-                'processing_stage_progress' => null,
-                'processing_heartbeat_at' => now(),
-                'processing_diagnostics' => $reason,
-                'source_metadata' => $metadata,
-                'optimize_retry_count' => $attempts + 1,
-            ]);
+            $source->update(['source_metadata' => $metadata, 'optimize_retry_count' => $attempts + 1]);
+            $source = $pipeline->markOptimizationFailed($source, 'stalled', $reason, ['diagnostics' => $reason]);
 
             if ($attempts >= $maxRetries) {
-                $nbx->markNbxStatus($source->fresh(), 'failed', $reason.' Automatic retry limit reached.');
-                $this->warn("Source #{$source->id}: retry limit reached.");
+                $this->warn("Source #{$source->id}: retry limit reached; original remains available for manual recovery.");
                 $failed++;
                 continue;
             }
 
             $source = $source->fresh();
             if (! $source?->storage_path) {
-                $nbx->markNbxStatus($source, 'failed', $reason.' No recoverable input file was found.');
-                $this->warn("Source #{$source->id}: no recoverable input.");
+                $this->warn('Source #'.($source?->id ?? 'unknown').': no recoverable input.');
                 $failed++;
                 continue;
             }
 
             if ($media->queuePlaybackProcessing($source)) {
-                $nbx->markNbxStatus($source->fresh(), 'pending', 'Stale optimization recovered and queued with a new attempt.');
+                app(\App\Services\NbxEngineService::class)->markNbxStatus(
+                    $source->fresh(),
+                    'pending',
+                    'Stale optimization recovered and queued with a new attempt.',
+                );
                 $this->info("Source #{$source->id}: queued a new optimization attempt.");
                 $requeued++;
             } else {

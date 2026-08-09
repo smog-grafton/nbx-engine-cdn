@@ -256,7 +256,9 @@ class FetchWorkerHlsArtifactJob implements ShouldQueue, ShouldBeUnique
         $source->update([
             'hls_worker_status' => 'failed',
             'hls_worker_last_error' => $error,
-            'optimize_status' => 'failed',
+            // The worker produces an optional HLS derivative. Preserve an
+            // already verified faststart MP4 and make the retry stage-specific.
+            'optimize_status' => $source->is_faststart ? 'ready' : 'failed',
             'optimize_error' => $error,
             // Track retries so the scheduler can cap infinite loops.
             'optimize_retry_count' => ($source->optimize_retry_count ?? 0) + 1,
@@ -273,7 +275,13 @@ class FetchWorkerHlsArtifactJob implements ShouldQueue, ShouldBeUnique
             'original_storage_path' => $source->original_storage_path,
         ]);
 
-        $this->notifyPortalSync($source, 'failed', false);
+        // This is an optional HLS derivative. A verified faststart remains
+        // usable, so Portal must not turn the whole source into FAILED.
+        $this->notifyPortalSync(
+            $source,
+            $source->is_faststart ? 'partially_completed' : 'failed',
+            (bool) $source->is_faststart,
+        );
     }
 
     private function parseMasterPlaylistVariants(string $content): array

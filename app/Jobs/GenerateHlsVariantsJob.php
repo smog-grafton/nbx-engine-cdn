@@ -9,6 +9,7 @@ use App\Services\MediaBinaryDetector;
 use App\Services\MediaSourceService;
 use App\Services\NbxEngineService;
 use App\Services\ProcessingLiveness;
+use App\Services\ProcessingStateInspector;
 use App\Services\VideoProbeService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
@@ -30,13 +31,13 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
 
     public int $tries = 1;
 
-    public int $timeout = 25200;
+    public int $timeout = 0;
 
     public int $uniqueFor = 28800;
 
     public function __construct(public int $sourceId, public ?string $attemptId = null)
     {
-        $this->timeout = max(600, (int) config('cdn.ffmpeg_timeout_seconds', 21600) + 3600);
+        $this->timeout = max(0, (int) config('cdn.ffmpeg_job_timeout_seconds', 0));
         $this->onQueue((string) config('cdn.optimization_queue', 'optimization'));
     }
 
@@ -215,15 +216,8 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
                     "HLS output (".count($profiles)." profile(s)) for source #{$source->id}"
                 );
             } catch (\App\Services\InsufficientDiskSpaceException $spaceError) {
-                if ($this->updateIfCurrentAttempt($source, [
-                    'optimize_status' => 'failed',
-                    'optimize_error' => $spaceError->getMessage(),
-                    'processing_stage' => 'failed',
-                    'processing_stage_progress' => null,
-                    'processing_heartbeat_at' => now(),
-                    'processing_diagnostics' => $spaceError->getMessage(),
-                ])) {
-                    app(NbxEngineService::class)->markNbxStatus($source->fresh() ?? $source, 'failed', $spaceError->getMessage());
+                if ($this->currentAttemptOwnsSource($source)) {
+                    $this->markHlsFailure($source, $spaceError->getMessage());
                 }
 
                 return;
@@ -266,7 +260,7 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
                 $profile,
                 $hasAudio,
                 $source,
-                (float) ($probe['duration'] ?? $probe['duration_seconds'] ?? 0),
+                (float) ($probe['processing_duration'] ?? $probe['duration'] ?? $probe['duration_seconds'] ?? 0),
             );
 
             if ($exitCode === FfmpegProcessRunner::SUPERSEDED_EXIT_CODE) {
@@ -303,6 +297,8 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
             $this->storeSkipped($source, $skipped);
             if (! $this->updateIfCurrentAttempt($source, [
                 'optimize_status' => 'ready',
+                'hls_worker_status' => 'failed',
+                'hls_worker_last_error' => 'HLS generation failed for all requested profiles.',
                 'playback_type' => 'mp4',
                 'hls_master_path' => null,
                 'qualities_json' => [],
@@ -338,6 +334,8 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
         if (! is_file($masterAbsolute)) {
             if (! $this->updateIfCurrentAttempt($source, [
                 'optimize_status' => 'ready',
+                'hls_worker_status' => 'failed',
+                'hls_worker_last_error' => 'HLS master playlist generation failed.',
                 'playback_type' => 'mp4',
                 'hls_master_path' => null,
                 'qualities_json' => [],
@@ -355,11 +353,16 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
 
         $this->storeSkipped($source, $skipped);
         if (! $this->updateIfCurrentAttempt($source, [
-            'optimize_status' => $skipped === [] ? 'ready' : 'failed',
+            // Faststart remains a valid progressive output even when one HLS
+            // rendition fails. Do not make it disappear by reusing the broad
+            // optimize_status field for a derivative-only failure.
+            'optimize_status' => 'ready',
             'playback_type' => 'hls',
             'hls_master_path' => $masterPath,
             'qualities_json' => $generated,
             'optimize_error' => $skipped === [] ? null : 'Some HLS profiles were skipped or failed.',
+            'hls_worker_status' => $skipped === [] ? 'completed' : 'partial',
+            'hls_worker_last_error' => $skipped === [] ? null : 'Some HLS profiles were skipped or failed.',
             'processing_stage' => $skipped === [] ? 'ready' : 'partially_completed',
             'processing_stage_progress' => 100,
             'processing_heartbeat_at' => now(),
@@ -490,6 +493,7 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
             $source,
             $duration,
             'hls_'.(string) $profile['label'],
+            $playlistAbsolute,
         );
     }
 
@@ -577,6 +581,14 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
         return false;
     }
 
+    private function currentAttemptOwnsSource(MediaSource $source): bool
+    {
+        return $this->attemptId === null || MediaSource::query()
+            ->whereKey($source->id)
+            ->where('processing_attempt_id', $this->attemptId)
+            ->exists();
+    }
+
     public function failed(?Throwable $exception): void
     {
         $source = MediaSource::find($this->sourceId);
@@ -584,20 +596,49 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
             return;
         }
 
+        $health = app(ProcessingStateInspector::class)->inspect($source);
+        if ($health['active']) {
+            $source->update([
+                'processing_diagnostics' => 'Queue reported a stopped HLS job, but '.($health['message'] ?? 'FFmpeg is still active'),
+                'last_progress_at' => now(),
+            ]);
+
+            return;
+        }
+
         $message = mb_substr(
             $exception ? 'HLS worker stopped: '.$exception->getMessage() : 'HLS worker stopped before completion.',
             -12000,
         );
+        $this->markHlsFailure($source, $message);
+    }
+
+    private function markHlsFailure(MediaSource $source, string $message): void
+    {
+        $source = $source->fresh() ?? $source;
+        $metadata = (array) ($source->source_metadata ?? []);
+        $nbx = (array) ($metadata['nbx'] ?? []);
+        $nbx['status'] = $source->is_faststart ? 'partially_completed' : 'original_ready';
+        $nbx['hls'] = [
+            'status' => 'failed',
+            'error' => mb_substr($message, -12000),
+            'failed_at' => now()->toIso8601String(),
+        ];
+        $metadata['provider'] = 'nbx_engine';
+        $metadata['nbx'] = $nbx;
         $source->update([
-            'optimize_status' => 'failed',
-            'optimize_error' => $message,
-            'processing_stage' => 'failed',
+            'optimize_status' => $source->is_faststart ? 'ready' : 'failed',
+            'optimize_error' => mb_substr($message, -12000),
+            'hls_worker_status' => 'failed',
+            'hls_worker_last_error' => mb_substr($message, -12000),
+            'processing_stage' => $source->is_faststart ? 'hls_failed' : 'optimization_failed',
             'processing_stage_progress' => null,
             'processing_heartbeat_at' => now(),
-            'processing_diagnostics' => $message,
+            'processing_diagnostics' => mb_substr($message, -12000),
+            'ffmpeg_pid' => null,
             'last_progress_at' => now(),
+            'source_metadata' => $metadata,
         ]);
-        app(NbxEngineService::class)->markNbxStatus($source->fresh(), 'failed', $message);
     }
 
     /**

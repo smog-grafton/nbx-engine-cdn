@@ -101,7 +101,14 @@ class RealMediaNormalizationTest extends TestCase
             $this->assertSame('ready', $source->optimize_status, "{$case['source']} {$case['extension']}: {$source->optimize_error}");
             $this->assertSame('ready', $source->processing_stage);
             $this->assertStringEndsWith('.mp4', (string) $source->optimized_path);
-            $this->assertSame('video/mp4', $source->mime_type);
+            // The source row still describes the retained original. The
+            // verified MP4 derivative has its own optimized_path/probe and
+            // must not relabel an original MKV/MOV as an MP4 before retention
+            // cleanup has completed.
+            $this->assertSame(
+                $case['extension'] === 'mov' ? 'video/quicktime' : ($case['extension'] === 'mkv' ? 'video/x-matroska' : 'video/mp4'),
+                $source->mime_type,
+            );
             $this->assertSame('h264', $probe['video_codec'] ?? null);
             $this->assertSame('aac', $probe['audio_codec'] ?? null);
             $this->assertStringContainsString('mp4', (string) ($probe['container'] ?? ''));

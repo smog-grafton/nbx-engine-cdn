@@ -42,10 +42,12 @@ class NbxEngineController extends Controller
             'hls_1080p' => ['nullable', 'boolean'],
             'allow_downloads' => ['nullable', 'boolean'],
             'allow_hls_streaming' => ['nullable', 'boolean'],
-            'retention_policy' => ['nullable', Rule::in(['keep_original', 'retain_original', 'delete_after_optimization', 'optimized_only'])],
+            'retention_policy' => ['nullable', Rule::in(['keep_original', 'retain_original', 'keep_both', 'keep_original_and_optimized', 'keep_original_only', 'original_only', 'delete_after_optimization', 'delete_original_after_successful_optimization', 'optimized_only', 'keep_optimized_only'])],
             'keep_original' => ['nullable', 'boolean'],
             'delete_original_after_optimization' => ['nullable', 'boolean'],
-            'max_resolution' => ['nullable', Rule::in([240, 360, 480, 720, 1080])],
+            'max_resolution' => ['nullable', Rule::in([240, 360, 480, 720, 1080, '240p', '360p', '480p', '720p', '1080p'])],
+            'resolution' => ['nullable', Rule::in([240, 360, 480, 720, 1080, '240p', '360p', '480p', '720p', '1080p'])],
+            'source_profile_resolution' => ['nullable', Rule::in([240, 360, 480, 720, 1080, '240p', '360p', '480p', '720p', '1080p'])],
             'processing_preset' => ['nullable', Rule::in(['automatic', 'faststart_only', 'balanced_720p', 'smaller_720p', 'keep_source_resolution', 'custom'])],
             'crf' => ['nullable', 'integer', 'min:16', 'max:35'],
             'encoder_preset' => ['nullable', Rule::in(['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow'])],
@@ -58,6 +60,7 @@ class NbxEngineController extends Controller
             'callback_url' => ['nullable', 'url', 'max:4096'],
             'checksum_sha256' => ['nullable', 'string', 'size:64', 'regex:/^[a-f0-9]{64}$/i'],
         ]);
+        $validated = $this->normalizeProcessingOptions($validated);
 
         if (($validated['input_type'] ?? null) === 'telegram') {
             $source = $nbx->createTelegramJob($validated);
@@ -96,10 +99,12 @@ class NbxEngineController extends Controller
             'hls_1080p' => ['nullable', 'boolean'],
             'allow_downloads' => ['nullable', 'boolean'],
             'allow_hls_streaming' => ['nullable', 'boolean'],
-            'retention_policy' => ['nullable', Rule::in(['keep_original', 'retain_original', 'delete_after_optimization', 'optimized_only'])],
+            'retention_policy' => ['nullable', Rule::in(['keep_original', 'retain_original', 'keep_both', 'keep_original_and_optimized', 'keep_original_only', 'original_only', 'delete_after_optimization', 'delete_original_after_successful_optimization', 'optimized_only', 'keep_optimized_only'])],
             'keep_original' => ['nullable', 'boolean'],
             'delete_original_after_optimization' => ['nullable', 'boolean'],
-            'max_resolution' => ['nullable', Rule::in([240, 360, 480, 720, 1080])],
+            'max_resolution' => ['nullable', Rule::in([240, 360, 480, 720, 1080, '240p', '360p', '480p', '720p', '1080p'])],
+            'resolution' => ['nullable', Rule::in([240, 360, 480, 720, 1080, '240p', '360p', '480p', '720p', '1080p'])],
+            'source_profile_resolution' => ['nullable', Rule::in([240, 360, 480, 720, 1080, '240p', '360p', '480p', '720p', '1080p'])],
             'processing_preset' => ['nullable', 'string', 'max:64'],
             'crf' => ['nullable', 'integer', 'min:16', 'max:35'],
             'encoder_preset' => ['nullable', 'string', 'max:32'],
@@ -111,6 +116,7 @@ class NbxEngineController extends Controller
             'video_ref_id' => ['nullable', 'string', 'max:100'],
             'callback_url' => ['nullable', 'url', 'max:4096'],
         ]);
+        $validated = $this->normalizeProcessingOptions($validated);
 
         $source = $nbx->createUploadJob($validated, $request->file('file'), $mediaSourceService);
 
@@ -140,10 +146,12 @@ class NbxEngineController extends Controller
             'hls_1080p' => ['nullable', 'boolean'],
             'allow_downloads' => ['nullable', 'boolean'],
             'allow_hls_streaming' => ['nullable', 'boolean'],
-            'retention_policy' => ['nullable', Rule::in(['keep_original', 'retain_original', 'delete_after_optimization', 'optimized_only'])],
+            'retention_policy' => ['nullable', Rule::in(['keep_original', 'retain_original', 'keep_both', 'keep_original_and_optimized', 'keep_original_only', 'original_only', 'delete_after_optimization', 'delete_original_after_successful_optimization', 'optimized_only', 'keep_optimized_only'])],
             'keep_original' => ['nullable', 'boolean'],
             'delete_original_after_optimization' => ['nullable', 'boolean'],
-            'max_resolution' => ['nullable', Rule::in([240, 360, 480, 720, 1080])],
+            'max_resolution' => ['nullable', Rule::in([240, 360, 480, 720, 1080, '240p', '360p', '480p', '720p', '1080p'])],
+            'resolution' => ['nullable', Rule::in([240, 360, 480, 720, 1080, '240p', '360p', '480p', '720p', '1080p'])],
+            'source_profile_resolution' => ['nullable', Rule::in([240, 360, 480, 720, 1080, '240p', '360p', '480p', '720p', '1080p'])],
             'processing_preset' => ['nullable', 'string', 'max:64'],
             'crf' => ['nullable', 'integer', 'min:16', 'max:35'],
             'encoder_preset' => ['nullable', 'string', 'max:32'],
@@ -156,6 +164,7 @@ class NbxEngineController extends Controller
             'callback_url' => ['nullable', 'url', 'max:4096'],
             'checksum_sha256' => ['nullable', 'string', 'size:64', 'regex:/^[a-f0-9]{64}$/i'],
         ]);
+        $validated = $this->normalizeProcessingOptions($validated);
 
         if ($error = $this->uploadPolicyError($validated['filename'], $validated['mime_type'] ?? null, $validated['extension'] ?? null)) {
             return $this->error($error, 422);
@@ -554,19 +563,22 @@ class NbxEngineController extends Controller
             'idempotency_key' => ['nullable', 'string', 'max:128'],
             'compress_enabled' => ['nullable', 'boolean'],
             'faststart' => ['nullable', 'boolean'],
-            'retention_policy' => ['nullable', Rule::in(['keep_original', 'retain_original', 'optimized_only'])],
+            'retention_policy' => ['nullable', Rule::in(['keep_original', 'retain_original', 'keep_both', 'keep_original_and_optimized', 'keep_original_only', 'original_only', 'delete_after_optimization', 'delete_original_after_successful_optimization', 'optimized_only', 'keep_optimized_only'])],
             'allow_downloads' => ['nullable', 'boolean'],
             'allow_hls_streaming' => ['nullable', 'boolean'],
             'hls' => ['nullable', 'array'],
             'hls.480p' => ['nullable', 'boolean'],
             'hls.720p' => ['nullable', 'boolean'],
             'hls.1080p' => ['nullable', 'boolean'],
-            'max_resolution' => ['nullable', Rule::in([240, 360, 480, 720, 1080])],
+            'max_resolution' => ['nullable', Rule::in([240, 360, 480, 720, 1080, '240p', '360p', '480p', '720p', '1080p'])],
+            'resolution' => ['nullable', Rule::in([240, 360, 480, 720, 1080, '240p', '360p', '480p', '720p', '1080p'])],
+            'source_profile_resolution' => ['nullable', Rule::in([240, 360, 480, 720, 1080, '240p', '360p', '480p', '720p', '1080p'])],
             'processing_preset' => ['nullable', 'string', 'max:64'],
             'crf' => ['nullable', 'integer', 'min:16', 'max:35'],
             'encoder_preset' => ['nullable', 'string', 'max:32'],
             'audio_bitrate' => ['nullable', 'string', 'max:16'],
         ]);
+        $validated = $this->normalizeProcessingOptions($validated);
         $source = $nbx->findForDiscovery(['job_id' => $jobId]);
         if (! $source) {
             return $this->error('NBX job not found.', 404);
@@ -661,6 +673,35 @@ class NbxEngineController extends Controller
     private function error(string $message, int $status): JsonResponse
     {
         return response()->json(['success' => false, 'data' => null, 'error' => $message], $status);
+    }
+
+    /** @param array<string, mixed> $options */
+    private function normalizeProcessingOptions(array $options): array
+    {
+        // Portal historically sent either `max_resolution` (number) or
+        // `resolution` (often "720p"). Normalize both at the API boundary so
+        // no downstream default can silently overwrite an explicit request.
+        if (array_key_exists('max_resolution', $options)) {
+            $options['max_resolution'] = $this->normalizeResolution($options['max_resolution']);
+        } elseif (array_key_exists('resolution', $options)) {
+            $options['max_resolution'] = $this->normalizeResolution($options['resolution']);
+        }
+        if (array_key_exists('source_profile_resolution', $options)) {
+            $options['source_profile_resolution'] = $this->normalizeResolution($options['source_profile_resolution']);
+        }
+
+        return $options;
+    }
+
+    private function normalizeResolution(mixed $value): ?int
+    {
+        if (is_string($value)) {
+            $value = rtrim(strtolower(trim($value)), 'p');
+        }
+
+        return is_numeric($value) && in_array((int) $value, [240, 360, 480, 720, 1080], true)
+            ? (int) $value
+            : null;
     }
 
     private function uploadSessionKey(string $session): string

@@ -160,6 +160,23 @@ class MediaSourcesRelationManager extends RelationManager
                         ->label('Allow HLS streaming URL')
                         ->default(true)
                         ->inline(false),
+                    Forms\Components\Select::make('max_resolution')
+                        ->label('Maximum output resolution')
+                        ->options([
+                            480 => '480p',
+                            720 => '720p',
+                            1080 => '1080p',
+                        ])
+                        ->helperText('An explicit job choice overrides NBX_DEFAULT_RESOLUTION. Lower-resolution inputs are never upscaled.'),
+                    Forms\Components\Select::make('retention_policy')
+                        ->label('Original retention')
+                        ->default('optimized_only')
+                        ->options([
+                            'optimized_only' => 'Keep Optimized Only',
+                            'keep_original_only' => 'Keep Original Only',
+                            'keep_both' => 'Keep Original + Optimized',
+                        ])
+                        ->helperText('The original is never deleted until an optimized output has passed validation, final upload, remote verification, and URL publication.'),
                 ])
                 ->columns(2)
                 ->collapsible()
@@ -847,11 +864,14 @@ class MediaSourcesRelationManager extends RelationManager
                             $body = match ($publicationStatus) {
                                 'complete' => 'A verified output was found in storage and its public URL was restored.',
                                 'partial' => 'Some, but not all, expected outputs were found and verified in storage.',
-                                'missing' => 'No verified output exists in storage yet — the job may still genuinely be processing/uploading, or it has not started publishing. Nothing was changed; try again shortly.',
+                                'processing' => 'Processing is still active. Check the stage and live process details; no state was changed.',
+                                'uploading' => 'Encoding completed and final storage upload is still active. No state was changed.',
+                                'optimization_failed' => 'Optimization genuinely failed, but the original remains available. Retry optimization or use the original without fetching from Telebot again.',
+                                'missing' => 'No verified output exists in storage yet. No active processor was found; retry the relevant stage or reconcile again after storage becomes available.',
                                 default => 'Publication status: '.str_replace('_', ' ', $publicationStatus).'.',
                             };
                             $notification = Notification::make()->title('Storage verification finished')->body($body);
-                            ($publicationStatus === 'missing' ? $notification->warning() : $notification->success())->send();
+                            (in_array($publicationStatus, ['missing', 'optimization_failed'], true) ? $notification->warning() : $notification->success())->send();
                         } catch (\Throwable $exception) {
                             Notification::make()
                                 ->danger()
@@ -902,6 +922,17 @@ class MediaSourcesRelationManager extends RelationManager
                             ->label('Generate 720p HLS')
                             ->default(false)
                             ->inline(false),
+                        Forms\Components\Select::make('max_resolution')
+                            ->label('Maximum output resolution')
+                            ->options([480 => '480p', 720 => '720p', 1080 => '1080p']),
+                        Forms\Components\Select::make('retention_policy')
+                            ->label('Original retention')
+                            ->default('optimized_only')
+                            ->options([
+                                'optimized_only' => 'Keep Optimized Only',
+                                'keep_original_only' => 'Keep Original Only',
+                                'keep_both' => 'Keep Original + Optimized',
+                            ]),
                     ])
                     ->action(function (MediaSource $record, array $data): void {
                         $record->update([
@@ -941,6 +972,17 @@ class MediaSourcesRelationManager extends RelationManager
                             ->label('Generate 720p HLS')
                             ->default(false)
                             ->inline(false),
+                        Forms\Components\Select::make('max_resolution')
+                            ->label('Maximum output resolution')
+                            ->options([480 => '480p', 720 => '720p', 1080 => '1080p']),
+                        Forms\Components\Select::make('retention_policy')
+                            ->label('Original retention')
+                            ->default('optimized_only')
+                            ->options([
+                                'optimized_only' => 'Keep Optimized Only',
+                                'keep_original_only' => 'Keep Original Only',
+                                'keep_both' => 'Keep Original + Optimized',
+                            ]),
                     ])
                     ->action(function (MediaSource $record, array $data): void {
                         $record->update([
@@ -1119,6 +1161,8 @@ class MediaSourcesRelationManager extends RelationManager
             'hls_1080p' => (bool) ($data['hls_1080p'] ?? config('nbx.default_hls_1080', false)),
             'allow_downloads' => (bool) ($data['allow_downloads'] ?? true),
             'allow_hls_streaming' => (bool) ($data['allow_hls_streaming'] ?? true),
+            'max_resolution' => $data['max_resolution'] ?? null,
+            'retention_policy' => (string) ($data['retention_policy'] ?? 'optimized_only'),
             'input_type' => $inputType,
         ];
     }
@@ -1134,6 +1178,8 @@ class MediaSourcesRelationManager extends RelationManager
             'hls_1080p' => $get('hls_1080p'),
             'allow_downloads' => $get('allow_downloads'),
             'allow_hls_streaming' => $get('allow_hls_streaming'),
+            'max_resolution' => $get('max_resolution'),
+            'retention_policy' => $get('retention_policy'),
         ], $inputType);
     }
 

@@ -19,7 +19,12 @@ return [
     'remux_concurrency' => (int) env('CDN_REMUX_CONCURRENCY', 3),
     'optimization_overlap_lock_seconds' => (int) env('CDN_OPTIMIZATION_OVERLAP_LOCK_SECONDS', 25200),
     'optimization_stale_minutes' => (int) env('CDN_OPTIMIZATION_STALE_MINUTES', 20),
-    'ffmpeg_timeout_seconds' => (int) env('CDN_FFMPEG_TIMEOUT_SECONDS', 21600),
+    // FFmpeg itself is not timed out by default. Health is determined from
+    // PID, heartbeat and output growth, not elapsed wall time.
+    'ffmpeg_timeout_seconds' => (int) env('CDN_FFMPEG_TIMEOUT_SECONDS', 0),
+    'ffmpeg_idle_timeout_seconds' => (int) env('CDN_FFMPEG_IDLE_TIMEOUT_SECONDS', 0),
+    // Laravel queue timeout; zero disables SIGALRM for media jobs.
+    'ffmpeg_job_timeout_seconds' => (int) env('CDN_FFMPEG_JOB_TIMEOUT_SECONDS', 0),
     'ffmpeg_heartbeat_seconds' => (int) env('CDN_FFMPEG_HEARTBEAT_SECONDS', 10),
     'ffmpeg_diagnostics_max_bytes' => (int) env('CDN_FFMPEG_DIAGNOSTICS_MAX_BYTES', 12000),
     'ffmpeg_threads' => (int) env('CDN_FFMPEG_THREADS', 0),
@@ -80,9 +85,25 @@ return [
     'compress_video_codec' => (string) env('CDN_COMPRESS_VIDEO_CODEC', 'libx264'),
     'compress_audio_codec' => (string) env('CDN_COMPRESS_AUDIO_CODEC', 'aac'),
     'compress_audio_bitrate' => (string) env('CDN_COMPRESS_AUDIO_BITRATE', '128k'),
-    'compress_crf' => (int) env('CDN_COMPRESS_CRF', 23),
+    'compress_audio_bitrate_mono' => (string) env('CDN_COMPRESS_AUDIO_BITRATE_MONO', '96k'),
+    'compress_audio_bitrate_surround' => (string) env('CDN_COMPRESS_AUDIO_BITRATE_SURROUND', '160k'),
+    // Null means select the resolution-aware CRF profile in the optimizer.
+    // Set CDN_COMPRESS_CRF only when a deployment deliberately needs a fixed
+    // quality target for every job.
+    'compress_crf' => env('CDN_COMPRESS_CRF'),
     'compress_preset' => (string) env('CDN_COMPRESS_PRESET', 'fast'),
     'compress_max_height' => (int) env('CDN_COMPRESS_MAX_HEIGHT', 0),
+    // CRF remains the quality control; these resolution-aware caps prevent a
+    // high-bitrate source from silently recreating its original size.
+    'compress_maxrate_480p' => (string) env('CDN_COMPRESS_MAXRATE_480P', '1200k'),
+    'compress_bufsize_480p' => (string) env('CDN_COMPRESS_BUFSIZE_480P', '2400k'),
+    'compress_maxrate_720p' => (string) env('CDN_COMPRESS_MAXRATE_720P', '2500k'),
+    'compress_bufsize_720p' => (string) env('CDN_COMPRESS_BUFSIZE_720P', '5000k'),
+    'compress_maxrate_1080p' => (string) env('CDN_COMPRESS_MAXRATE_1080P', '4500k'),
+    'compress_bufsize_1080p' => (string) env('CDN_COMPRESS_BUFSIZE_1080P', '9000k'),
+    'compress_smaller_maxrate_720p' => (string) env('CDN_COMPRESS_SMALLER_MAXRATE_720P', '1800k'),
+    'compress_smaller_bufsize_720p' => (string) env('CDN_COMPRESS_SMALLER_BUFSIZE_720P', '3600k'),
+    'compress_ineffective_savings_percent' => (float) env('CDN_COMPRESS_INEFFECTIVE_SAVINGS_PERCENT', 5),
     'compress_skip_bitrate_480p' => (int) env('CDN_COMPRESS_SKIP_BITRATE_480P', 900000),
     'compress_skip_bitrate_720p' => (int) env('CDN_COMPRESS_SKIP_BITRATE_720P', 1500000),
     'compress_skip_bitrate_1080p' => (int) env('CDN_COMPRESS_SKIP_BITRATE_1080P', 2200000),

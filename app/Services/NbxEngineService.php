@@ -275,6 +275,21 @@ class NbxEngineService
             fclose($stream);
         }
 
+        if (! $this->shouldPublishOptimized($source)) {
+            // storeStreamedSource has already called the original-only branch
+            // of queuePlaybackProcessing. Do not overwrite its reconciled
+            // status with the generic upload/optimization status below.
+            $source = $this->finalizeStorageIfNeeded($source->fresh() ?? $source);
+            $source = $this->markNbxStatus(
+                $source->fresh() ?? $source,
+                'original_ready',
+                'Original-only retention selected; the uploaded source is published without optimization.',
+            );
+            app(NbxWebhookDispatcher::class)->dispatch($source, 'job.created');
+
+            return $source;
+        }
+
         if ($this->shouldRetainOriginal($source)) {
             $source = $this->publishAvailableArtifacts($source->fresh() ?? $source, ['original']);
         }
@@ -305,7 +320,7 @@ class NbxEngineService
         $requested = (array) ($nbx['requested'] ?? []);
         foreach ([
             'faststart', 'allow_downloads', 'allow_hls_streaming', 'max_resolution',
-            'processing_preset', 'crf', 'encoder_preset', 'audio_bitrate',
+            'source_profile_resolution', 'processing_preset', 'crf', 'encoder_preset', 'audio_bitrate',
         ] as $key) {
             if (array_key_exists($key, $options)) {
                 $requested[$key] = $options[$key];
@@ -601,8 +616,8 @@ class NbxEngineService
             'last_progress_at' => now(),
         ]);
         $source = $source->fresh() ?? $source;
-        $roles = ['faststart', 'hls'];
-        if ($this->shouldRetainOriginal($source)) {
+        $roles = $this->shouldPublishOptimized($source) ? ['faststart', 'hls'] : [];
+        if ($this->shouldPublishOriginal($source)) {
             array_unshift($roles, 'original');
         }
         $source = $this->publishAvailableArtifacts($source, $roles);
@@ -680,7 +695,7 @@ class NbxEngineService
         $qualities = is_array($source->qualities_json) ? $source->qualities_json : [];
 
         try {
-            if (in_array('original', $roles, true) && $this->shouldRetainOriginal($source)) {
+            if (in_array('original', $roles, true) && $this->shouldPublishOriginal($source)) {
                 $originalPath = $this->firstExistingPath($currentDisk, [
                     $source->original_storage_path,
                     $source->storage_path,
@@ -691,7 +706,7 @@ class NbxEngineService
                 }
             }
 
-            if (in_array('faststart', $roles, true)) {
+            if (in_array('faststart', $roles, true) && $this->shouldPublishOptimized($source)) {
                 $faststartPath = $source->is_faststart
                     && $source->optimize_status === 'ready'
                     && is_string($source->optimized_path)
@@ -708,7 +723,7 @@ class NbxEngineService
                 }
             }
 
-            if (in_array('hls', $roles, true) && $source->hls_master_path && $this->safeExists($currentDisk, (string) $source->hls_master_path)) {
+            if (in_array('hls', $roles, true) && $this->shouldPublishOptimized($source) && $source->hls_master_path && $this->safeExists($currentDisk, (string) $source->hls_master_path)) {
                 $hlsBase = dirname((string) $source->hls_master_path);
                 $hlsFiles = $this->hlsDirectoryFiles($source, $currentDisk);
                 foreach ($hlsFiles as $path) {
@@ -778,6 +793,35 @@ class NbxEngineService
         $source = $source->fresh() ?? $source;
         $metadata = (array) ($source->source_metadata ?? []);
         $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
+        $health = app(ProcessingStateInspector::class)->inspect($source);
+
+        // Verification is also a state-reconciliation tool. If there is hard
+        // evidence that an encode/upload is still alive, do not turn "no final
+        // object yet" into a missing/failed publication. The caller gets an
+        // actionable health snapshot instead.
+        if ($health['active']) {
+            $nbx['status'] = $health['state'];
+            $nbx['publication_status'] = $health['state'];
+            $nbx['reconciliation'] = [
+                'state' => $health['state'],
+                'message' => $health['message'],
+                'ffmpeg_pid' => $health['ffmpeg_pid'],
+                'worker_id' => $health['worker_id'],
+                'output_bytes' => $health['output_bytes'],
+                'output_growing' => $health['output_growing'],
+                'checked_at' => now()->toIso8601String(),
+            ];
+            $metadata['provider'] = 'nbx_engine';
+            $metadata['nbx'] = $nbx;
+            $source->update([
+                'processing_heartbeat_at' => now(),
+                'current_output_size_bytes' => $health['output_bytes'] > 0 ? $health['output_bytes'] : $source->current_output_size_bytes,
+                'output_size_observed_at' => $health['output_bytes'] > 0 ? now() : $source->output_size_observed_at,
+                'source_metadata' => $metadata,
+            ]);
+
+            return $source->fresh() ?? $source;
+        }
         $target = (string) ($nbx['storage_target'] ?? config('nbx.default_storage', 'contabo'));
         $resolvedTarget = $this->resolveDiskForTarget($target);
         $finalDisk = $resolvedTarget['disk'];
@@ -825,13 +869,53 @@ class NbxEngineService
             && in_array(strtolower((string) pathinfo((string) ($original['key'] ?? ''), PATHINFO_EXTENSION)), ['mp4', 'm4v'], true)
             && $this->probeProvesPlayable((array) ($original['probe'] ?? $proof));
         $hasPlayableOutput = $hasFaststart || $hasHls || $hasPlayableOriginal;
+        $originalOnly = $this->normalizedRetentionPolicy($requested['retention_policy'] ?? null) === 'keep_original_only';
+        $hasVerifiedOriginal = $this->artifactIsRemotelyVerified($original, 'original');
+        // An original-only request may intentionally retain a MKV/MOV. It is
+        // a verified downloadable source even when it is not browser-playable
+        // and must not be reported as a failed publication merely for that.
+        $hasUsableRequestedOutput = $hasPlayableOutput || ($originalOnly && $hasVerifiedOriginal);
         $processingComplete = (bool) ($nbx['processing_complete'] ?? false)
             || $source->status === 'ready'
             || ($source->is_faststart && $source->optimize_status === 'ready')
             || $this->hasStoredArtifact($nbx);
         $publicationStatus = $missingArtifact === null
             ? 'complete'
-            : ($hasPlayableOutput ? 'partial' : ($verifiedRoles === [] ? 'missing' : 'attention_required'));
+            : ($hasUsableRequestedOutput ? 'partial' : ($verifiedRoles === [] ? 'missing' : 'attention_required'));
+
+        if ($source->optimize_status === 'failed' && ! $hasPlayableOutput) {
+            $nbx = array_merge($nbx, [
+                'final_artifacts' => $artifacts,
+                'processing_complete' => false,
+                'storage_verified' => $verifiedRoles !== [],
+                'publication_status' => 'optimization_failed',
+                'status' => 'original_ready',
+                'reconciled_at' => now()->toIso8601String(),
+                'reconciled_roles' => array_values(array_unique($verifiedRoles)),
+                'reconciliation' => [
+                    'state' => 'optimization_failed',
+                    'message' => $health['message'],
+                    'original_present' => $health['original_present'],
+                    'checked_at' => now()->toIso8601String(),
+                ],
+            ]);
+            $metadata['provider'] = 'nbx_engine';
+            $metadata['nbx'] = $nbx;
+            $source->update([
+                'status' => 'ready',
+                'is_active' => false,
+                'failure_reason' => null,
+                'last_error' => $source->optimize_error,
+                'processing_stage' => 'optimization_failed',
+                'processing_stage_progress' => null,
+                'processing_heartbeat_at' => now(),
+                'processing_diagnostics' => $source->processing_diagnostics,
+                'last_progress_at' => now(),
+                'source_metadata' => $metadata,
+            ]);
+
+            return $this->refreshOutputMetadata($source->fresh() ?? $source);
+        }
 
         $nbx = array_merge($nbx, [
             'final_artifacts' => $artifacts,
@@ -853,11 +937,11 @@ class NbxEngineService
 
         $source->fill([
             'status' => $processingComplete ? 'ready' : $source->status,
-            'is_active' => $hasPlayableOutput,
+            'is_active' => $hasUsableRequestedOutput,
             'storage_target_key' => $resolvedTarget['target_key'],
             'failure_reason' => $missingArtifact === null
                 ? null
-                : ($hasPlayableOutput
+                : ($hasUsableRequestedOutput
                     ? 'A playable source is available, but another requested format still needs publication.'
                     : 'Stored media was found, but no verified playback output is published yet.'),
             'last_error' => $missingArtifact,
@@ -941,12 +1025,14 @@ class NbxEngineService
         $mp4Url = $playback['mp4_play_url'] ?? $playback['download_url'] ?? null;
         $artifacts = is_array($nbx['final_artifacts'] ?? null) ? $nbx['final_artifacts'] : [];
         $originalArtifact = is_array($artifacts['original'] ?? null) ? $artifacts['original'] : [];
+        $originalOnly = $this->normalizedRetentionPolicy($nbx['requested']['retention_policy'] ?? null) === 'keep_original_only';
+        $originalReady = $originalOnly && ! empty($originalArtifact['url']) && ($originalArtifact['verified'] ?? false);
 
         $metadata['provider'] = 'nbx_engine';
         $metadata['nbx'] = array_merge($nbx, [
             'status' => $source->status === 'failed'
                 ? 'failed'
-                : ($hlsUrl ? 'completed' : ($mp4Url ? 'partially_completed' : ($nbx['status'] ?? 'pending'))),
+                : ($originalReady ? 'original_ready' : ($hlsUrl ? 'completed' : ($mp4Url ? 'partially_completed' : ($nbx['status'] ?? 'pending')))),
             'job_id' => $source->external_job_id,
             'outputs' => [
                 'original_url' => $originalArtifact['url'] ?? null,
@@ -969,6 +1055,7 @@ class NbxEngineService
     public function discoveryPayload(MediaSource $source, MediaSourceService $mediaSourceService): array
     {
         $source = $this->refreshOutputMetadata($source);
+        $health = app(ProcessingStateInspector::class)->inspect($source);
         $failure = app(ProcessingFailurePresenter::class)->forSource($source);
         $playback = $mediaSourceService->buildPlaybackManifest($source);
         $metadata = (array) ($source->source_metadata ?? []);
@@ -990,9 +1077,27 @@ class NbxEngineService
             'nbx_job_id' => $source->external_job_id,
             'asset_id' => (string) $source->media_asset_id,
             'source_id' => $source->id,
-            'status' => $nbx['status'] ?? $source->status,
+            // source_status and optimization_status remain independently
+            // available below. A derivative-only failure must not be reported
+            // to Portal as a terminal source failure.
+            'status' => $source->status === 'ready' && $source->optimize_status === 'failed'
+                ? 'original_ready'
+                : ($nbx['status'] ?? $source->status),
             'source_status' => $source->status,
+            'original_status' => $health['original_present'] ? 'ready' : ($source->status === 'ready' ? 'unknown' : $source->status),
             'optimize_status' => $source->optimize_status,
+            'optimization_status' => $source->optimize_status,
+            'upload_status' => $health['state'] === 'uploading' ? 'processing' : (($nbx['publication_status'] ?? null) === 'complete' ? 'completed' : 'waiting'),
+            'verification_status' => (bool) ($nbx['storage_verified'] ?? false) ? 'verified' : 'waiting',
+            'process_health' => [
+                'state' => $health['state'],
+                'active' => $health['active'],
+                'message' => $health['message'],
+                'ffmpeg_pid' => $health['ffmpeg_pid'],
+                'worker_id' => $health['worker_id'],
+                'current_output_size_bytes' => $health['output_bytes'],
+                'output_growing' => $health['output_growing'],
+            ],
             'processing_stage' => $source->processing_stage,
             'processing_stage_progress' => $source->processing_stage_progress,
             'processing_heartbeat_at' => $source->processing_heartbeat_at?->toIso8601String(),
@@ -1105,10 +1210,12 @@ class NbxEngineService
             ],
             'allow_downloads' => (bool) ($data['allow_downloads'] ?? true),
             'allow_hls_streaming' => (bool) ($data['allow_hls_streaming'] ?? true),
-            'retention_policy' => (string) ($data['retention_policy'] ?? 'optimized_only'),
+            'retention_policy' => $this->normalizedRetentionPolicy($data['retention_policy'] ?? null),
             'keep_original' => (bool) ($data['keep_original'] ?? false),
             'delete_original_after_optimization' => (bool) ($data['delete_original_after_optimization'] ?? true),
-            'max_resolution' => isset($data['max_resolution']) ? (int) $data['max_resolution'] : null,
+            'max_resolution' => $this->normalizeResolution($data['max_resolution'] ?? $data['resolution'] ?? null),
+            'source_profile_resolution' => $this->normalizeResolution($data['source_profile_resolution'] ?? null),
+            'resolution_precedence' => 'explicit_job > source_profile > nbx_default',
             'processing_preset' => (string) ($data['processing_preset'] ?? 'automatic'),
             'crf' => isset($data['crf']) ? (int) $data['crf'] : null,
             'encoder_preset' => $data['encoder_preset'] ?? null,
@@ -1256,6 +1363,15 @@ class NbxEngineService
     {
         $requested = (array) ($nbx['requested'] ?? []);
         $artifacts = (array) ($nbx['final_artifacts'] ?? []);
+        $policy = $this->normalizedRetentionPolicy($requested['retention_policy'] ?? null);
+
+        if ($policy === 'keep_original_only') {
+            $original = (array) ($artifacts['original'] ?? []);
+
+            return $this->artifactIsRemotelyVerified($original, 'original')
+                ? null
+                : 'Verified original output is missing; optimization was intentionally skipped and the local original was preserved.';
+        }
 
         $faststart = (array) ($artifacts['faststart'] ?? []);
         if (($requested['faststart'] ?? true) && ! $this->artifactIsRemotelyVerified($faststart, 'faststart')) {
@@ -1297,8 +1413,10 @@ class NbxEngineService
             }
 
             $isHls = $role === 'hls_master';
+            $extension = strtolower((string) pathinfo((string) ($artifact['key'] ?? ''), PATHINFO_EXTENSION));
+            $isBrowserPlayableOriginal = $role !== 'original' || in_array($extension, ['mp4', 'm4v'], true);
             $sources[] = [
-                'type' => $isHls ? 'hls' : 'mp4',
+                'type' => $isHls ? 'hls' : ($isBrowserPlayableOriginal ? 'mp4' : 'source'),
                 'role' => match ($role) {
                     'original' => 'source_original',
                     'faststart' => 'playback_progressive',
@@ -1308,14 +1426,14 @@ class NbxEngineService
                 'disk' => $artifact['disk'] ?? 'contabo',
                 'key' => $artifact['key'] ?? null,
                 'url' => $artifact['url'],
-                'container' => $isHls ? 'hls' : 'mp4',
+                'container' => $isHls ? 'hls' : ($extension ?: 'unknown'),
                 'mime_type' => $artifact['mime_type'] ?? ($isHls ? 'application/vnd.apple.mpegurl' : 'video/mp4'),
                 'bytes' => $artifact['bytes'] ?? null,
                 'verified' => (bool) ($artifact['verified'] ?? false),
                 'fast_start' => $role === 'faststart',
-                'is_downloadable' => $role === 'faststart'
+                'is_downloadable' => in_array($role, ['faststart', 'original'], true)
                     && (bool) ($nbx['requested']['allow_downloads'] ?? true),
-                'is_streamable' => true,
+                'is_streamable' => $isHls || $isBrowserPlayableOriginal,
             ];
         }
 
@@ -1420,13 +1538,47 @@ class NbxEngineService
     {
         $metadata = (array) ($source->source_metadata ?? []);
         $requested = (array) ($metadata['nbx']['requested'] ?? []);
-        $policy = (string) ($requested['retention_policy'] ?? '');
+        $policy = $this->normalizedRetentionPolicy($requested['retention_policy'] ?? null);
 
-        if ($policy !== '') {
-            return in_array($policy, ['keep_original', 'retain_original'], true);
+        return in_array($policy, ['keep_both', 'keep_original_only'], true)
+            || (bool) ($requested['keep_original'] ?? false);
+    }
+
+    public function shouldPublishOriginal(MediaSource $source): bool
+    {
+        return $this->shouldRetainOriginal($source);
+    }
+
+    public function shouldPublishOptimized(MediaSource $source): bool
+    {
+        $metadata = (array) ($source->source_metadata ?? []);
+        $requested = (array) ($metadata['nbx']['requested'] ?? []);
+
+        return $this->normalizedRetentionPolicy($requested['retention_policy'] ?? null) !== 'keep_original_only';
+    }
+
+    private function normalizedRetentionPolicy(mixed $policy): string
+    {
+        return match (strtolower(trim((string) $policy))) {
+            'keep_original', 'retain_original', 'keep_both', 'keep_original_and_optimized' => 'keep_both',
+            'keep_original_only', 'original_only' => 'keep_original_only',
+            'delete_after_optimization', 'delete_original_after_successful_optimization', 'optimized_only', 'keep_optimized_only' => 'optimized_only',
+            default => 'optimized_only',
+        };
+    }
+
+    private function normalizeResolution(mixed $value): ?int
+    {
+        if (is_string($value)) {
+            $value = rtrim(strtolower(trim($value)), 'p');
+        }
+        if (! is_numeric($value)) {
+            return null;
         }
 
-        return (bool) ($requested['keep_original'] ?? false);
+        $resolution = (int) $value;
+
+        return in_array($resolution, [240, 360, 480, 720, 1080], true) ? $resolution : null;
     }
 
     private function findByIdempotencyKey(mixed $key): ?MediaSource

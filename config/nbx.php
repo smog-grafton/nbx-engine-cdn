@@ -22,6 +22,10 @@ return [
     'default_hls_480' => (bool) env('NBX_DEFAULT_HLS_480', false),
     'default_hls_720' => (bool) env('NBX_DEFAULT_HLS_720', false),
     'default_hls_1080' => (bool) env('NBX_DEFAULT_HLS_1080', false),
+    // DEFAULT_RESOLUTION is accepted for backward compatibility with older
+    // deployments. It is only a fallback: an explicit job/Portal resolution
+    // always wins, followed by a source/profile resolution.
+    'default_resolution' => env('NBX_DEFAULT_RESOLUTION', env('DEFAULT_RESOLUTION')),
 
     'max_upload_mb' => (int) env('NBX_MAX_UPLOAD_SIZE_MB', env('MAX_UPLOAD_MB', 20480)),
     'upload_session_ttl_minutes' => (int) env('NBX_UPLOAD_SESSION_TTL_MINUTES', 60),

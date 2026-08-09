@@ -33,6 +33,12 @@ class MediaSource extends Model
         'processing_stage',
         'processing_attempt_id',
         'processing_attempt_started_at',
+        'processing_started_at',
+        'processing_worker_id',
+        'ffmpeg_pid',
+        'processed_seconds',
+        'current_output_size_bytes',
+        'output_size_observed_at',
         'processing_stage_progress',
         'processing_heartbeat_at',
         'processing_diagnostics',
@@ -78,6 +84,11 @@ class MediaSource extends Model
             'processing_stage_progress' => 'integer',
             'processing_heartbeat_at' => 'datetime',
             'processing_attempt_started_at' => 'datetime',
+            'processing_started_at' => 'datetime',
+            'output_size_observed_at' => 'datetime',
+            'ffmpeg_pid' => 'integer',
+            'processed_seconds' => 'float',
+            'current_output_size_bytes' => 'integer',
             'hls_worker_artifact_expires_at' => 'datetime',
             'is_active' => 'boolean',
             'is_faststart' => 'boolean',
@@ -166,7 +177,9 @@ class MediaSource extends Model
         $mode = (string) ($nbx['processing_result']['processing_mode'] ?? $metadata['processing_result']['processing_mode'] ?? '');
 
         return match ($mode) {
-            'video_transcode' => 'Compressed.',
+            'video_transcode' => (($nbx['processing_result']['compression_effective'] ?? $metadata['processing_result']['compression_effective'] ?? true) === false)
+                ? 'Compression completed but saved too little space; review the source bitrate/profile before treating it as optimized.'
+                : 'Compressed.',
             'remux_fallback_smaller' => 'Compression ran but did not reduce file size, so the compatible remux was kept instead.',
             'remux', 'remux_already_efficient' => 'Compression was skipped: the source was already within the configured efficient-bitrate threshold (CDN_COMPRESS_SKIP_BITRATE_*), so only a fast-start remux ran.',
             'audio_transcode' => 'Only the audio track was re-encoded; the video was already compatible.',

@@ -4,7 +4,10 @@ namespace Tests\Feature;
 
 use App\Models\MediaAsset;
 use App\Models\MediaSource;
+use App\Jobs\OptimizeMp4FaststartJob;
 use App\Services\NbxEngineService;
+use App\Services\PipelineStateService;
+use App\Services\ProcessingLiveness;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Storage;
@@ -31,6 +34,111 @@ class NbxPipelineContractTest extends TestCase
         $this->assertFalse($requested['compression']);
         $this->assertSame(['480p' => false, '720p' => false, '1080p' => false], $requested['hls']);
         $this->assertSame('optimized_only', $requested['retention_policy']);
+    }
+
+    public function test_mkv_duration_validation_prefers_primary_video_over_bad_container_metadata(): void
+    {
+        $method = new \ReflectionMethod(OptimizeMp4FaststartJob::class, 'durationValidation');
+        $job = new OptimizeMp4FaststartJob(1);
+        $validation = $method->invoke($job, [
+            // This models the reported class of Matroska: the container says
+            // 5412.18s but the actual picture timeline is 5388.46s.
+            'format_duration' => 5412.18,
+            'video_duration' => 5388.46,
+            'audio_duration' => 5390.12,
+            'primary_av_duration' => 5390.12,
+        ], [
+            'format_duration' => 5388.42,
+            'video_duration' => 5388.42,
+            'audio_duration' => 5388.44,
+            'primary_av_duration' => 5388.44,
+        ]);
+
+        $this->assertSame('primary_video_stream', $validation['basis']);
+        $this->assertTrue($validation['valid']);
+        $this->assertTrue($validation['input_container_disagrees_with_video']);
+        $this->assertSame(0.04, $validation['difference']);
+    }
+
+    public function test_explicit_portal_resolution_wins_over_profile_and_nbx_default(): void
+    {
+        config()->set('nbx.default_resolution', '480p');
+        $asset = MediaAsset::query()->create([
+            'type' => 'movie', 'title' => 'Resolution precedence', 'status' => 'ready', 'visibility' => 'public',
+        ]);
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'upload',
+            'status' => 'ready',
+            'source_metadata' => app(NbxEngineService::class)->initialMetadata([
+                'max_resolution' => '720p',
+                'source_profile_resolution' => '480p',
+            ], 'upload'),
+        ]);
+
+        $method = new \ReflectionMethod(OptimizeMp4FaststartJob::class, 'requestedMaxHeight');
+        $this->assertSame(720, $method->invoke(new OptimizeMp4FaststartJob($source->id), $source, ['height' => 1080]));
+    }
+
+    public function test_keep_original_only_publishes_without_queuing_or_deleting_the_source(): void
+    {
+        config()->set('filesystems.disks.contabo.key', 'test-key');
+        config()->set('filesystems.disks.contabo.secret', 'test-secret');
+        $asset = MediaAsset::query()->create([
+            'type' => 'movie', 'title' => 'Original only', 'status' => 'ready', 'visibility' => 'public',
+        ]);
+        $path = "media/{$asset->id}/original.mkv";
+        Storage::disk('public')->put($path, 'the-original-mkv');
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'remote_fetch',
+            'storage_disk' => 'public',
+            'storage_path' => $path,
+            'original_storage_path' => $path,
+            'status' => 'ready',
+            'external_job_id' => 'original-only-contract',
+            'source_metadata' => app(NbxEngineService::class)->initialMetadata([
+                'storage_target' => 'contabo',
+                'retention_policy' => 'keep_original_only',
+            ], 'remote_fetch'),
+        ]);
+
+        $this->assertTrue(app(\App\Services\MediaSourceService::class)->queuePlaybackProcessing($source));
+        $source->refresh();
+
+        $this->assertSame('skipped', $source->optimize_status);
+        $this->assertSame('original_ready', data_get($source->source_metadata, 'nbx.status'));
+        $this->assertSame(
+            'videos/nbx/original-only-contract/original/original.mkv',
+            data_get($source->source_metadata, 'nbx.final_artifacts.original.key'),
+        );
+        Storage::disk('contabo')->assertExists('videos/nbx/original-only-contract/original/original.mkv');
+    }
+
+    public function test_optimization_failure_preserves_ready_source_and_active_reconciliation_never_marks_it_failed(): void
+    {
+        $asset = MediaAsset::query()->create([
+            'type' => 'movie', 'title' => 'Stage separation', 'status' => 'ready', 'visibility' => 'public',
+        ]);
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'remote_fetch',
+            'status' => 'ready',
+            'external_job_id' => 'stage-separation-contract',
+            'source_metadata' => app(NbxEngineService::class)->initialMetadata(['storage_target' => 'contabo'], 'remote_fetch'),
+        ]);
+
+        $failed = app(PipelineStateService::class)->markOptimizationFailed($source, 'validation', 'Duration validation failed.');
+        $this->assertSame('ready', $failed->status);
+        $this->assertSame('failed', $failed->optimize_status);
+        $this->assertSame('original_ready', data_get($failed->source_metadata, 'nbx.status'));
+
+        $failed->update(['optimize_status' => 'processing', 'processing_stage' => 'compressing']);
+        ProcessingLiveness::touch($failed->id);
+        $reconciled = app(NbxEngineService::class)->reconcilePublishedArtifacts($failed);
+        $this->assertSame('ready', $reconciled->status);
+        $this->assertSame('processing', data_get($reconciled->source_metadata, 'nbx.publication_status'));
+        $this->assertSame('processing', data_get($reconciled->source_metadata, 'nbx.reconciliation.state'));
     }
 
     public function test_unprocessed_mov_is_never_published_as_a_faststart_artifact(): void
