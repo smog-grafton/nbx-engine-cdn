@@ -188,6 +188,57 @@ Artisan::command('media:inspect-timeline {source : Media source ID}', function (
     ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
 })->purpose('Read-only forensic probe of stored input/output packet timelines for a media source');
 
+Artisan::command('media:retry-optimization {source : Media source ID}', function (int $source, MediaSourceService $mediaSourceService, ProcessingStateInspector $stateInspector) {
+    $mediaSource = MediaSource::find($source);
+    if (! $mediaSource) {
+        $this->error("Media source #{$source} was not found.");
+
+        return 1;
+    }
+
+    $health = $stateInspector->inspect($mediaSource);
+    if ($health['active']) {
+        $this->warn("Source #{$source} still has active work: {$health['message']}");
+
+        return 2;
+    }
+
+    // This is intentionally not a remote import retry. It reuses a verified
+    // original whenever it is present, which is the safe recovery path after
+    // a derivative-only failure for a 1–3 GB Telegram movie.
+    $mediaSource = $mediaSourceService->ensureLocalWorkFileForProcessing($mediaSource) ?: $mediaSource;
+    $disk = (string) ($mediaSource->storage_disk ?: config('nbx.work_storage', config('cdn.disk', 'public')));
+    if (! $mediaSource->storage_path || ! Storage::disk($disk)->exists($mediaSource->storage_path)) {
+        $this->error("Source #{$source} has no reusable original work file; use an import retry only if a fresh handoff is required.");
+
+        return 3;
+    }
+
+    $metadata = (array) ($mediaSource->source_metadata ?? []);
+    $metadata['retry']['optimization'] = [
+        'requested_at' => now()->toIso8601String(),
+        'mode' => 'reuse_original',
+    ];
+    $mediaSource->update([
+        'status' => 'ready',
+        'optimize_status' => null,
+        'optimize_error' => null,
+        'failure_reason' => null,
+        'last_error' => null,
+        'source_metadata' => $metadata,
+    ]);
+
+    if (! $mediaSourceService->queuePlaybackProcessing($mediaSource->fresh() ?? $mediaSource)) {
+        $this->error("Source #{$source} could not be queued for optimization.");
+
+        return 4;
+    }
+
+    $this->info("Source #{$source} queued for optimization using its existing original; no Telegram re-download was requested.");
+
+    return 0;
+})->purpose('Retry only optimization for a source with a reusable original; never re-download the remote input');
+
 Artisan::command('nbx:publish-final-artifacts {--limit=50 : Maximum ready NBX sources to publish}', function () {
     $limit = max(1, (int) $this->option('limit'));
     $service = app(\App\Services\NbxEngineService::class);

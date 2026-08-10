@@ -76,6 +76,13 @@ malformed and a direct MKV → MP4 transcode is valid. If packets continue towar
 4840 seconds, the output is genuinely truncated and must remain rejected; the
 command prints both sides of that distinction.
 
+When the original is present, retry only the derivative stage—do not click an
+import retry that asks Teletyde to fetch the 1.12 GB file again:
+
+```bash
+php artisan media:retry-optimization 237
+```
+
 ```bash
 php artisan media:recover-stale-optimizations \
   --job=a349202b-c186-48aa-8287-9d95e8f12172 \

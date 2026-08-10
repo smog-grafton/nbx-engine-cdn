@@ -296,6 +296,44 @@ class CdnLoadHardeningTest extends TestCase
         $this->assertDatabaseCount('jobs', 0);
     }
 
+    public function test_targeted_optimization_retry_reuses_the_original_without_queueing_a_remote_import(): void
+    {
+        config()->set('cdn.disk', 'public');
+        config()->set('nbx.work_storage', 'public');
+        config()->set('queue.default', 'database');
+        config()->set('cdn.enable_hls', false);
+
+        $asset = MediaAsset::query()->create([
+            'type' => 'movie',
+            'title' => 'Retry original fixture',
+            'status' => 'importing',
+            'visibility' => 'unlisted',
+        ]);
+        $path = 'media/'.$asset->id.'/retry-original.mkv';
+        Storage::disk('public')->put($path, 'original-movie-bytes');
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'remote_fetch',
+            'source_url' => 'https://example.com/telegram-handoff',
+            'storage_disk' => 'public',
+            'storage_path' => $path,
+            'original_storage_path' => $path,
+            'status' => 'failed',
+            'optimize_status' => 'failed',
+            'optimize_error' => 'Old validation failure.',
+            'failure_reason' => 'Old validation failure.',
+            'is_active' => true,
+        ]);
+
+        Artisan::call('media:retry-optimization', ['source' => $source->id]);
+
+        $source->refresh();
+        $this->assertSame('ready', $source->status);
+        $this->assertSame('pending', $source->optimize_status);
+        $this->assertSame('reuse_original', $source->source_metadata['retry']['optimization']['mode'] ?? null);
+        $this->assertDatabaseCount('jobs', 1);
+    }
+
     public function test_import_endpoint_normalizes_bracketed_m4v_source_urls(): void
     {
         config()->set('queue.default', 'database');
