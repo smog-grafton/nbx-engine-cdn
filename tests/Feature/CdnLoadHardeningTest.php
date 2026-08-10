@@ -7,6 +7,7 @@ use App\Jobs\OptimizeMp4FaststartJob;
 use App\Models\MediaAsset;
 use App\Models\MediaSource;
 use App\Services\MediaSourceService;
+use App\Services\ProcessingLiveness;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Storage;
@@ -55,6 +56,38 @@ class CdnLoadHardeningTest extends TestCase
         $this->assertTrue($service->queuePlaybackProcessing($source));
         $this->assertFalse($service->queuePlaybackProcessing($source->fresh()));
         $this->assertSame('pending', $source->fresh()->optimize_status);
+        $this->assertDatabaseCount('jobs', 1);
+    }
+
+    public function test_telegram_handoff_declared_size_survives_queue_dispatch_for_later_integrity_comparison(): void
+    {
+        config()->set('queue.default', 'database');
+        config()->set('cdn.import_queue', 'default');
+
+        $asset = MediaAsset::query()->create([
+            'type' => 'movie',
+            'title' => 'Telegram integrity fixture',
+            'status' => 'importing',
+            'visibility' => 'unlisted',
+        ]);
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'remote_fetch',
+            'source_url' => 'https://example.com/signed/movie.mkv',
+            'status' => 'pending',
+            'bytes_total' => 123456,
+            'source_metadata' => [
+                'handoff_integrity' => ['telebot_declared_bytes' => 123456],
+            ],
+        ]);
+
+        app(MediaSourceService::class)->queueRemoteImport($source);
+        $source->refresh();
+
+        $this->assertSame(123456, $source->bytes_total);
+        $this->assertSame('queued', $source->processing_stage);
+        $this->assertSame('default', $source->source_metadata['queue']['import']['name'] ?? null);
+        $this->assertNotEmpty($source->source_metadata['queue']['import']['dispatched_at'] ?? null);
         $this->assertDatabaseCount('jobs', 1);
     }
 
@@ -230,6 +263,37 @@ class CdnLoadHardeningTest extends TestCase
         $this->assertSame('pending', $source->status);
         $this->assertNull($source->completed_at);
         $this->assertDatabaseCount('jobs', 1);
+    }
+
+    public function test_reconciler_does_not_requeue_or_fail_a_stale_row_while_the_worker_heartbeat_is_alive(): void
+    {
+        config()->set('cdn.disk', 'public');
+        config()->set('queue.default', 'database');
+
+        $asset = MediaAsset::query()->create([
+            'type' => 'movie',
+            'title' => 'Still-running import',
+            'status' => 'importing',
+            'visibility' => 'unlisted',
+        ]);
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'remote_fetch',
+            'source_url' => 'https://example.com/still-running.mkv',
+            'storage_disk' => 'public',
+            'status' => 'processing',
+            'processing_stage' => 'compressing',
+            'is_active' => true,
+        ]);
+        MediaSource::withoutTimestamps(fn () => $source->forceFill(['updated_at' => now()->subHour()])->saveQuietly());
+        ProcessingLiveness::touch($source->id);
+
+        Artisan::call('cdn:reconcile', ['--minutes' => 30]);
+
+        $source->refresh();
+        $this->assertSame('processing', $source->status);
+        $this->assertSame('compressing', $source->processing_stage);
+        $this->assertDatabaseCount('jobs', 0);
     }
 
     public function test_import_endpoint_normalizes_bracketed_m4v_source_urls(): void

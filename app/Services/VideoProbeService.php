@@ -38,6 +38,132 @@ class VideoProbeService
     }
 
     /**
+     * Read the actual primary packet timelines without trusting container
+     * Duration metadata. This is deliberately an exceptional diagnostic: a
+     * normal probe is cheap; a packet scan walks the entire file and is used
+     * only when an encode disagrees with an input whose stream durations are
+     * absent or untrustworthy (a common Matroska failure mode).
+     *
+     * A successful scan answers the important forensic question precisely:
+     * do media packets really exist after the apparent output end, or is the
+     * MKV Segment/Info duration simply wrong? A timed-out or failed scan is
+     * never used as a partial duration.
+     *
+     * @return array<string, mixed>
+     */
+    public function packetTimeline(string $absolutePath): array
+    {
+        $ffprobe = app(MediaBinaryDetector::class)->ffprobe();
+        if (! $ffprobe || ! is_file($absolutePath)) {
+            return [
+                'complete' => false,
+                'source' => 'unavailable',
+                'reason' => 'FFprobe or the local input file is unavailable.',
+            ];
+        }
+
+        $video = $this->packetTimelineForStream($ffprobe, $absolutePath, 'v:0');
+        $audio = $this->packetTimelineForStream($ffprobe, $absolutePath, 'a:0');
+        $videoEnd = $video['end_seconds'] ?? null;
+        $audioEnd = $audio['end_seconds'] ?? null;
+        $complete = (bool) ($video['complete'] ?? false) || (bool) ($audio['complete'] ?? false);
+
+        return array_filter([
+            'complete' => $complete,
+            'source' => 'ffprobe_packet_timestamps',
+            'video_end_seconds' => $videoEnd,
+            'audio_end_seconds' => $audioEnd,
+            'primary_av_end_seconds' => max((float) ($videoEnd ?? 0), (float) ($audioEnd ?? 0)) ?: null,
+            'video_packets' => $video['packets'] ?? 0,
+            'audio_packets' => $audio['packets'] ?? 0,
+            'video_scan' => $video['reason'] ?? null,
+            'audio_scan' => $audio['reason'] ?? null,
+        ], static fn ($value): bool => $value !== null && $value !== '');
+    }
+
+    /**
+     * @return array{complete: bool, end_seconds?: float, packets: int, reason?: string}
+     */
+    private function packetTimelineForStream(string $ffprobe, string $absolutePath, string $selector): array
+    {
+        $timeout = max(0, (int) config('cdn.ffprobe_packet_timeline_timeout_seconds', 0));
+        $process = new Process([
+            $ffprobe,
+            '-v', 'error',
+            '-select_streams', $selector,
+            '-show_entries', 'packet=pts_time,dts_time,duration_time',
+            '-of', 'csv=p=0',
+            $absolutePath,
+        ]);
+        // The output contains a line per packet; consume it incrementally so
+        // a multi-hour movie does not become a multi-megabyte PHP string.
+        $process->disableOutput();
+        $process->setTimeout($timeout > 0 ? (float) $timeout : null);
+
+        $lineBuffer = '';
+        $packets = 0;
+        $end = null;
+        $consume = static function (string $chunk) use (&$lineBuffer, &$packets, &$end): void {
+            $lineBuffer .= str_replace("\r", '', $chunk);
+            while (($newline = strpos($lineBuffer, "\n")) !== false) {
+                $line = trim(substr($lineBuffer, 0, $newline));
+                $lineBuffer = substr($lineBuffer, $newline + 1);
+                if ($line === '') {
+                    continue;
+                }
+                $columns = str_getcsv($line);
+                $pts = isset($columns[0]) && is_numeric($columns[0]) ? (float) $columns[0] : null;
+                $dts = isset($columns[1]) && is_numeric($columns[1]) ? (float) $columns[1] : null;
+                $duration = isset($columns[2]) && is_numeric($columns[2]) ? max(0.0, (float) $columns[2]) : 0.0;
+                $timestamp = max((float) ($pts ?? -INF), (float) ($dts ?? -INF));
+                if (! is_finite($timestamp)) {
+                    continue;
+                }
+                $packets++;
+                $candidate = $timestamp + $duration;
+                $end = $end === null ? $candidate : max($end, $candidate);
+            }
+        };
+
+        try {
+            $process->run(static function (string $type, string $chunk) use ($consume): void {
+                if ($type === Process::OUT) {
+                    $consume($chunk);
+                }
+            });
+            if ($lineBuffer !== '') {
+                $consume($lineBuffer."\n");
+            }
+        } catch (ProcessTimedOutException $exception) {
+            Log::warning('video_probe.packet_timeline_timed_out', [
+                'target' => basename($absolutePath),
+                'stream' => $selector,
+                'timeout' => $process->getTimeout(),
+            ]);
+
+            return ['complete' => false, 'packets' => $packets, 'reason' => 'packet scan timed out'];
+        }
+
+        if (! $process->isSuccessful()) {
+            return [
+                'complete' => false,
+                'packets' => $packets,
+                // Output is intentionally disabled because packet listings can
+                // be very large. The exit code remains durable diagnostic
+                // evidence without retaining a movie's worth of ffprobe text.
+                'reason' => 'packet scan failed with exit code '.($process->getExitCode() ?? 'unknown'),
+            ];
+        }
+
+        return array_filter([
+            'complete' => $packets > 0 && $end !== null,
+            'end_seconds' => $end !== null ? round($end, 6) : null,
+            'packets' => $packets,
+            'reason' => $packets > 0 ? null : 'no packets in selected stream',
+        ], static fn ($value): bool => $value !== null && $value !== '');
+    }
+
+    /**
      * @return array<string, mixed>
      */
     private function runProbe(string $ffprobe, string $target, bool $remote): array

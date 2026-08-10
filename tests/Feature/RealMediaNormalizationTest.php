@@ -119,6 +119,87 @@ class RealMediaNormalizationTest extends TestCase
         }
     }
 
+    public function test_mkv_with_misleading_container_duration_uses_completed_packet_timeline_not_header_metadata(): void
+    {
+        $ffmpeg = app(MediaBinaryDetector::class)->ffmpeg();
+        if (! $ffmpeg || ! app(MediaBinaryDetector::class)->ffprobe()) {
+            $this->markTestSkipped('FFmpeg and FFprobe are required for the Matroska timeline test.');
+        }
+
+        $asset = MediaAsset::query()->create([
+            'type' => 'movie',
+            'title' => 'Matroska timeline fixture',
+            'status' => 'ready',
+            'visibility' => 'public',
+        ]);
+        $path = "media/{$asset->id}/misleading-duration.mkv";
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'remote_fetch',
+            'storage_disk' => 'public',
+            'storage_path' => $path,
+            'mime_type' => 'video/x-matroska',
+            'status' => 'ready',
+            'is_active' => true,
+            'compress_enabled' => true,
+            // This mirrors the reported incident: ffprobe exposes a container
+            // duration but neither stream has a usable duration field. The
+            // actual fixture is two seconds, while the metadata claims six.
+            'source_metadata' => [
+                'probe' => [
+                    'container' => 'matroska,webm',
+                    'has_video' => true,
+                    'has_audio' => true,
+                    'video_codec' => 'h264',
+                    'audio_codec' => 'aac',
+                    'pixel_format' => 'yuv420p',
+                    'width' => 640,
+                    'height' => 360,
+                    'format_duration' => 6.0,
+                    'duration' => 6.0,
+                    'processing_duration' => 6.0,
+                ],
+                'provider' => 'nbx_engine',
+                'nbx' => [
+                    'storage_target' => 'public',
+                    'requested' => [
+                        'compression' => true,
+                        'faststart' => true,
+                        'retention_policy' => 'keep_both',
+                        'allow_downloads' => true,
+                        'allow_hls_streaming' => false,
+                        'hls' => ['480p' => false, '720p' => false, '1080p' => false],
+                    ],
+                ],
+            ],
+        ]);
+        Storage::disk('public')->makeDirectory("media/{$asset->id}");
+        (new Process([
+            $ffmpeg,
+            '-y',
+            '-f', 'lavfi',
+            '-i', 'testsrc=size=640x360:rate=25:duration=2',
+            '-f', 'lavfi',
+            '-i', 'sine=frequency=800:duration=2',
+            '-shortest',
+            '-c:v', 'libx264',
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac',
+            Storage::disk('public')->path($path),
+        ]))->setTimeout(60)->mustRun();
+
+        (new OptimizeMp4FaststartJob($source->id))->handle();
+        $source->refresh();
+        $packetTimeline = $source->source_metadata['probe']['packet_timeline'] ?? [];
+
+        $this->assertSame('ready', $source->optimize_status, (string) $source->optimize_error);
+        $this->assertTrue((bool) ($packetTimeline['complete'] ?? false));
+        $this->assertEqualsWithDelta(2.0, (float) ($packetTimeline['video_end_seconds'] ?? 0), 0.25);
+        $this->assertEqualsWithDelta(2.0, (float) ($packetTimeline['primary_av_end_seconds'] ?? 0), 0.25);
+        $this->assertSame(2, $source->duration_seconds);
+        $this->assertSame('packet_timeline_video', $source->source_metadata['nbx']['processing_result']['duration_validation']['basis'] ?? null);
+    }
+
     public function test_verified_mp4_generates_a_real_hls_master_and_segments(): void
     {
         $ffmpeg = app(MediaBinaryDetector::class)->ffmpeg();

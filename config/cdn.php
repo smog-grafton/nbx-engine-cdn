@@ -27,6 +27,11 @@ return [
     'ffmpeg_job_timeout_seconds' => (int) env('CDN_FFMPEG_JOB_TIMEOUT_SECONDS', 0),
     'ffmpeg_heartbeat_seconds' => (int) env('CDN_FFMPEG_HEARTBEAT_SECONDS', 10),
     'ffmpeg_diagnostics_max_bytes' => (int) env('CDN_FFMPEG_DIAGNOSTICS_MAX_BYTES', 12000),
+    // Full packet scans are only run to resolve a genuine duration conflict.
+    // Zero means no elapsed-time cutoff; incomplete scans are never accepted
+    // as media evidence.
+    'ffprobe_packet_timeline_timeout_seconds' => (int) env('CDN_FFPROBE_PACKET_TIMELINE_TIMEOUT_SECONDS', 0),
+    'queue_warn_delay_seconds' => (int) env('CDN_QUEUE_WARN_DELAY_SECONDS', 30),
     'ffmpeg_threads' => (int) env('CDN_FFMPEG_THREADS', 0),
     // ffprobe previously had no timeout anywhere in the codebase and could
     // hang a worker indefinitely on a large/borderline-corrupt file.

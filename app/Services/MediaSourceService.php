@@ -840,6 +840,17 @@ class MediaSourceService
             $jobId = $preserveJobId && filled($source->external_job_id)
                 ? (string) $source->external_job_id
                 : (string) Str::uuid();
+            $queue = (string) config('cdn.import_queue', 'default');
+            $metadata = (array) ($source->source_metadata ?? []);
+            $declaredBytes = data_get($metadata, 'handoff_integrity.telebot_declared_bytes');
+            $knownBytes = is_numeric($source->bytes_total ?? null)
+                ? (int) $source->bytes_total
+                : (is_numeric($declaredBytes) ? (int) $declaredBytes : null);
+            $metadata['queue']['import'] = [
+                'name' => $queue,
+                'job_id' => $jobId,
+                'dispatched_at' => now()->toIso8601String(),
+            ];
 
             $source->update([
                 'status' => 'pending',
@@ -848,7 +859,10 @@ class MediaSourceService
                 'storage_disk' => (string) config('nbx.work_storage', $this->storageDisk()),
                 'progress_percent' => 0,
                 'bytes_downloaded' => null,
-                'bytes_total' => null,
+                // A Telegram handoff already knows its Telegram byte count.
+                // Preserve it through dispatch and compare it with NBX's
+                // signed-URL response before promoting the original.
+                'bytes_total' => $knownBytes,
                 'started_at' => null,
                 'last_progress_at' => now(),
                 'completed_at' => null,
@@ -861,10 +875,15 @@ class MediaSourceService
                 'playback_type' => null,
                 'hls_master_path' => null,
                 'qualities_json' => null,
+                'processing_stage' => 'queued',
+                'processing_stage_progress' => 0,
+                'processing_heartbeat_at' => now(),
+                'processing_diagnostics' => 'Import queued on '.$queue.'.',
+                'source_metadata' => $metadata,
             ]);
 
             ImportRemoteMediaSourceJob::dispatch($source->id, $jobId)
-                ->onQueue((string) config('cdn.import_queue', 'default'));
+                ->onQueue($queue);
 
             return true;
         });

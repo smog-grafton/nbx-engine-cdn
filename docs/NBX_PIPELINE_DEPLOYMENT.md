@@ -31,7 +31,16 @@ Deploy in this order so Portal never emits operations that an older NBX release 
    NBX_KEEP_LOCAL_WORK_FILES=false
    ```
 
-7. Restart the `default`, `optimization`, and `nbx-webhook` queue workers, and ensure Laravel's scheduler is running. The scheduler retries Telegram jobs that were waiting for Teletyde capacity.
+7. Restart the `default`, `optimization`, and `nbx-webhook` queue workers, and ensure Laravel's scheduler is running. The scheduler retries Telegram jobs that were waiting for Teletyde capacity. A job accepted by `telegram-handoff` is not processed by the scheduler: it needs a persistent `default` worker immediately. For non-Docker deployments run these separately under Supervisor/systemd:
+
+   ```bash
+   php artisan queue:work database --queue=default --sleep=1 --tries=1 --timeout=0
+   php artisan queue:work database --queue=optimization --sleep=1 --tries=1 --timeout=0
+   php artisan queue:work database --queue=nbx-webhook --sleep=1 --tries=1 --timeout=120
+   php artisan schedule:work
+   ```
+
+   In the supplied Docker image, verify all four programs with `supervisorctl status`. A queued import now records both `dispatched_at` and `claimed_at`; a multi-minute gap means the deployed `default` worker is absent, stopped, or saturated, rather than a Telebot/FFmpeg failure.
 8. Verify routes and runtime dependencies:
 
    ```bash

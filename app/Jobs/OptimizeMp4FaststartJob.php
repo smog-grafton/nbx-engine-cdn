@@ -145,6 +145,11 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             'processing_stage_progress' => 0,
             'processing_heartbeat_at' => now(),
             'processing_diagnostics' => null,
+            // Do not let an observation from a prior attempt masquerade as
+            // this attempt's authoritative input timeline.
+            'processed_seconds' => null,
+            'current_output_size_bytes' => null,
+            'output_size_observed_at' => null,
             'progress_percent' => 5,
             'last_progress_at' => now(),
         ]);
@@ -285,7 +290,36 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
         ]);
         ProcessingLiveness::touch($source->id);
         $outputProbe = app(VideoProbeService::class)->probe($absoluteOutput);
-        $durationValidation = $this->durationValidation($probe, $outputProbe);
+        // First compare the ordinary probe values. If a Matroska-style input
+        // has no stream duration and only its container duration disagrees,
+        // inspect the actual packet timeline before deciding the MP4 is
+        // truncated. This is evidence, not a wider tolerance.
+        $initialDurationValidation = $this->durationValidation($probe, $outputProbe);
+        if ($this->requiresPacketTimelineInspection($probe, $initialDurationValidation)) {
+            $packetTimeline = app(VideoProbeService::class)->packetTimeline($absoluteInput);
+            $probe['packet_timeline'] = $packetTimeline;
+            $metadata = (array) (($source->fresh() ?? $source)->source_metadata ?? []);
+            $metadata['probe'] = $probe;
+            $metadata['packet_timeline_inspected_at'] = now()->toIso8601String();
+            $source->update(['source_metadata' => $metadata]);
+
+            if (($packetTimeline['complete'] ?? false) && is_numeric($packetTimeline['primary_av_end_seconds'] ?? null)) {
+                // The source must present the playable packet duration rather
+                // than stale MKV Segment metadata to all later stages/UI.
+                $source->update(['duration_seconds' => (int) round((float) $packetTimeline['primary_av_end_seconds'])]);
+            }
+            Log::info('NBX duration conflict inspected with packet timestamps', [
+                'source_id' => $source->id,
+                'initial_validation' => $initialDurationValidation,
+                'packet_timeline' => $packetTimeline,
+            ]);
+        }
+        $source = $source->fresh() ?? $source;
+        $durationValidation = $this->durationValidation(
+            $probe,
+            $outputProbe,
+            $source->processed_seconds,
+        );
         $verificationError = $this->outputVerificationError($probe, $outputProbe, $absoluteOutput, $durationValidation);
         if ($verificationError !== null) {
             @unlink($absoluteOutput);
@@ -315,7 +349,7 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             [$fallbackExit, $fallbackError] = $this->runFaststartCopy($ffmpeg, $absoluteInput, $fallbackOutput, $source, $duration);
             if ($fallbackExit === 0 && $this->safeLocalFileSize($fallbackOutput) > 0) {
                 $fallbackProbe = app(VideoProbeService::class)->probe($fallbackOutput);
-                if ($this->outputVerificationError($probe, $fallbackProbe, $fallbackOutput, $this->durationValidation($probe, $fallbackProbe)) === null) {
+                if ($this->outputVerificationError($probe, $fallbackProbe, $fallbackOutput, $this->durationValidation($probe, $fallbackProbe, $source->processed_seconds)) === null) {
                     @unlink($absoluteOutput);
                     @rename($fallbackOutput, $absoluteOutput);
                     $processingMode = 'remux_fallback_smaller';
@@ -868,9 +902,23 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
      *
      * @return array<string, mixed>
      */
-    private function durationValidation(array $input, array $output): array
+    private function durationValidation(array $input, array $output, mixed $ffmpegObservedInputTimeline = null): array
     {
         $candidates = [
+            // A complete packet scan is the strongest source for malformed
+            // containers: it proves where packets actually end.
+            'packet_timeline_video' => [
+                data_get($input, 'packet_timeline.video_end_seconds'),
+                $output['video_duration'] ?? null,
+            ],
+            'packet_timeline_primary_av' => [
+                data_get($input, 'packet_timeline.primary_av_end_seconds'),
+                $output['primary_av_duration'] ?? null,
+            ],
+            // FFmpeg's terminal out_time is recorded while it reads the same
+            // input during this attempt. It is independent confirmation when
+            // ffprobe did not expose a stream duration.
+            'ffmpeg_observed_input_timeline' => [$ffmpegObservedInputTimeline, $output['video_duration'] ?? $output['primary_av_duration'] ?? null],
             'primary_video_stream' => [$input['video_duration'] ?? null, $output['video_duration'] ?? null],
             'longest_primary_av_stream' => [$input['primary_av_duration'] ?? null, $output['primary_av_duration'] ?? null],
             'container_duration' => [
@@ -899,6 +947,8 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
                 'valid' => $difference <= $tolerance,
                 'input_container_disagrees_with_video' => $this->durationsDisagree($input['format_duration'] ?? $input['duration'] ?? null, $input['video_duration'] ?? null),
                 'output_container_disagrees_with_video' => $this->durationsDisagree($output['format_duration'] ?? $output['duration'] ?? null, $output['video_duration'] ?? null),
+                'input_packet_timeline' => $input['packet_timeline'] ?? null,
+                'ffmpeg_observed_input_timeline' => $this->nullableFloat($ffmpegObservedInputTimeline),
             ];
         }
 
@@ -910,6 +960,20 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
         ];
     }
 
+    private function requiresPacketTimelineInspection(array $input, array $validation): bool
+    {
+        if (($validation['basis'] ?? null) !== 'container_duration' || ($validation['valid'] ?? true) === true) {
+            return false;
+        }
+
+        // Do not scan every input. The scan is for the exact pathological
+        // case reported here: FFprobe cannot report usable stream duration
+        // and a container's duration is the only, conflicting value.
+        return ! is_numeric($input['video_duration'] ?? null)
+            && ! is_numeric($input['audio_duration'] ?? null)
+            && empty($input['packet_timeline']);
+    }
+
     /** @return array<string, float|null> */
     private function durationSnapshot(array $probe): array
     {
@@ -918,6 +982,8 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             'video' => $this->nullableFloat($probe['video_duration'] ?? null),
             'audio' => $this->nullableFloat($probe['audio_duration'] ?? null),
             'primary_av' => $this->nullableFloat($probe['primary_av_duration'] ?? null),
+            'packet_video' => $this->nullableFloat(data_get($probe, 'packet_timeline.video_end_seconds')),
+            'packet_primary_av' => $this->nullableFloat(data_get($probe, 'packet_timeline.primary_av_end_seconds')),
         ];
     }
 
@@ -999,7 +1065,7 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
 
         if (($durationValidation['comparable'] ?? false) && ! ($durationValidation['valid'] ?? true)) {
             return sprintf(
-                'Optimization validation failed: duration mismatch using %s (input %ss, output %ss, difference %ss; tolerance %ss). Input container %ss, input video %ss, input audio %ss; output container %ss, output video %ss, output audio %ss.',
+                'Optimization validation failed: duration mismatch using %s (input %ss, output %ss, difference %ss; tolerance %ss). Input container %ss, input video %ss, input audio %ss, input packet video %ss, input packet A/V %ss, FFmpeg observed input %ss; output container %ss, output video %ss, output audio %ss.',
                 $durationValidation['basis'] ?? 'unknown timeline',
                 $this->formatDuration($durationValidation['input_duration'] ?? null),
                 $this->formatDuration($durationValidation['output_duration'] ?? null),
@@ -1008,6 +1074,9 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
                 $this->formatDuration($input['format_duration'] ?? $input['duration'] ?? null),
                 $this->formatDuration($input['video_duration'] ?? null),
                 $this->formatDuration($input['audio_duration'] ?? null),
+                $this->formatDuration(data_get($input, 'packet_timeline.video_end_seconds')),
+                $this->formatDuration(data_get($input, 'packet_timeline.primary_av_end_seconds')),
+                $this->formatDuration($durationValidation['ffmpeg_observed_input_timeline'] ?? null),
                 $this->formatDuration($output['format_duration'] ?? $output['duration'] ?? null),
                 $this->formatDuration($output['video_duration'] ?? null),
                 $this->formatDuration($output['audio_duration'] ?? null),

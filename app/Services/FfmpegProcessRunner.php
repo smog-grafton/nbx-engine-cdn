@@ -107,6 +107,19 @@ class FfmpegProcessRunner
         }
 
         $tail = $process->getIncrementalErrorOutput().$process->getIncrementalOutput();
+        // FFmpeg emits its terminal `out_time_*` progress block as it exits.
+        // Consume it before persisting the final heartbeat: otherwise the
+        // durable timeline can lag the real end of a long Matroska input by a
+        // complete stats interval (five seconds by default), which is exactly
+        // the evidence we need when container metadata is unreliable.
+        if ($tail !== '') {
+            [, $stageProgress, $processedSeconds] = $this->readProgress(
+                $tail."\n",
+                $durationSeconds,
+                $stageProgress,
+                $processedSeconds,
+            );
+        }
         $diagnostics = $this->boundedDiagnostics($diagnostics.$tail);
         $exitCode = $process->getExitCode() ?? 1;
         $this->heartbeat($source, $stage, $exitCode === 0 ? 100 : $stageProgress, $diagnostics, $attemptId, null, $absoluteOutput, $processedSeconds);

@@ -111,6 +111,32 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
             return;
         }
 
+        $queueMetadata = (array) ($source->source_metadata ?? []);
+        $queuedAt = data_get($queueMetadata, 'queue.import.dispatched_at');
+        $queueDelaySeconds = null;
+        if (is_string($queuedAt) && $queuedAt !== '') {
+            try {
+                $queueDelaySeconds = max(0, now()->diffInSeconds(\Illuminate\Support\Carbon::parse($queuedAt)));
+            } catch (\Throwable) {
+                // Historic records need not contain a parseable timestamp.
+            }
+        }
+        $queueMetadata['queue']['import'] = array_filter(array_merge(
+            (array) data_get($queueMetadata, 'queue.import', []),
+            [
+                'claimed_at' => now()->toIso8601String(),
+                'claim_delay_seconds' => $queueDelaySeconds,
+            ],
+        ), static fn ($value): bool => $value !== null);
+        if ($queueDelaySeconds !== null && $queueDelaySeconds >= (int) config('cdn.queue_warn_delay_seconds', 30)) {
+            Log::warning('NBX import queue claim was delayed', [
+                'source_id' => $source->id,
+                'job_id' => $this->jobId,
+                'queue' => config('cdn.import_queue', 'default'),
+                'delay_seconds' => $queueDelaySeconds,
+            ]);
+        }
+
         $source->update([
             'status' => 'downloading',
             'processing_stage' => 'fetching',
@@ -128,6 +154,10 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
             'started_at' => now(),
             'last_progress_at' => now(),
             'completed_at' => null,
+            'source_metadata' => $queueMetadata,
+            'processing_diagnostics' => $queueDelaySeconds === null
+                ? 'Import worker claimed the queued job.'
+                : "Import worker claimed the queued job after {$queueDelaySeconds}s.",
         ]);
         ProcessingLiveness::touch($source->id);
 
@@ -142,6 +172,15 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
             $fetchProbe = $remoteFetcher->probe($sourceUrl);
             $contentLength = $fetchProbe->expectedSize;
             $contentType = $fetchProbe->contentType;
+            $sourceMetadata = (array) (($source->fresh() ?? $source)->source_metadata ?? []);
+            $telebotDeclaredBytes = data_get($sourceMetadata, 'handoff_integrity.telebot_declared_bytes');
+            if (is_numeric($telebotDeclaredBytes) && $contentLength !== null && (int) $telebotDeclaredBytes !== (int) $contentLength) {
+                throw new \RuntimeException(sprintf(
+                    'remote_handoff_size_mismatch: Telebot declared %d bytes but the signed source URL reports %d bytes.',
+                    (int) $telebotDeclaredBytes,
+                    (int) $contentLength,
+                ));
+            }
 
             $filename = $this->resolveRemoteFilename($sourceUrl, $source->id, $contentType);
             $storagePath = sprintf('media/%s/%d/%s', $source->media_asset_id, $source->id, $filename);
@@ -310,6 +349,14 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
             if ($probe !== []) {
                 $metadata['probe'] = $probe;
             }
+            $metadata['intake_integrity'] = array_filter([
+                'expected_bytes' => $contentLength,
+                'telebot_declared_bytes' => is_numeric($telebotDeclaredBytes) ? (int) $telebotDeclaredBytes : null,
+                'actual_bytes' => $size,
+                'sha256' => hash_file('sha256', $absolutePath) ?: null,
+                'verified' => $contentLength === null || $size === (int) $contentLength,
+                'committed_at' => now()->toIso8601String(),
+            ], static fn ($value): bool => $value !== null);
             $isTelegramHandoff = ($metadata['nbx']['input_type'] ?? null) === 'telegram';
             unset($metadata['telebot_source_url']);
 
@@ -321,7 +368,7 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
                 'mime_type' => $mimeType,
                 'file_size_bytes' => $size > 0 ? $size : null,
                 'duration_seconds' => isset($probe['duration_seconds']) ? (int) $probe['duration_seconds'] : null,
-                'checksum' => hash_file('sha256', $absolutePath),
+                'checksum' => $metadata['intake_integrity']['sha256'] ?? hash_file('sha256', $absolutePath),
                 'status' => 'ready',
                 'processing_stage' => 'original_ready',
                 'processing_stage_progress' => 100,

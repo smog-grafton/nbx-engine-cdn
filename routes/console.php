@@ -6,10 +6,13 @@ use App\Models\MediaSource;
 use App\Services\ContaboStorageCredentialService;
 use App\Services\MediaBinaryDetector;
 use App\Services\MediaSourceService;
+use App\Services\ProcessingStateInspector;
+use App\Services\VideoProbeService;
 use Illuminate\Foundation\Inspiring;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schedule;
 use Illuminate\Support\Facades\Storage;
 
@@ -143,6 +146,48 @@ Artisan::command('nbx:health', function () {
     }
 })->purpose('Show NBX Engine storage, FFmpeg, and final URL health');
 
+Artisan::command('media:inspect-timeline {source : Media source ID}', function (int $source) {
+    $mediaSource = MediaSource::find($source);
+    if (! $mediaSource) {
+        $this->error("Media source #{$source} was not found.");
+
+        return 1;
+    }
+
+    $diskName = (string) ($mediaSource->storage_disk ?: config('nbx.work_storage', config('cdn.disk', 'public')));
+    $disk = Storage::disk($diskName);
+    $probeService = app(VideoProbeService::class);
+    $inspect = static function (?string $path) use ($disk, $probeService): array {
+        if (! is_string($path) || $path === '' || ! $disk->exists($path)) {
+            return ['present' => false];
+        }
+
+        try {
+            $absolute = $disk->path($path);
+        } catch (\Throwable) {
+            return ['present' => true, 'local_path_available' => false, 'size_bytes' => (int) $disk->size($path)];
+        }
+
+        return [
+            'present' => true,
+            'local_path_available' => true,
+            'size_bytes' => (int) $disk->size($path),
+            'probe' => $probeService->probe($absolute),
+            'packet_timeline' => $probeService->packetTimeline($absolute),
+        ];
+    };
+
+    $this->line((string) json_encode([
+        'source_id' => $mediaSource->id,
+        'source_status' => $mediaSource->status,
+        'optimization_status' => $mediaSource->optimize_status,
+        'processing_stage' => $mediaSource->processing_stage,
+        'recorded_processed_seconds' => $mediaSource->processed_seconds,
+        'input' => $inspect($mediaSource->original_storage_path ?: $mediaSource->storage_path),
+        'optimized_output' => $inspect($mediaSource->optimized_path),
+    ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+})->purpose('Read-only forensic probe of stored input/output packet timelines for a media source');
+
 Artisan::command('nbx:publish-final-artifacts {--limit=50 : Maximum ready NBX sources to publish}', function () {
     $limit = max(1, (int) $this->option('limit'));
     $service = app(\App\Services\NbxEngineService::class);
@@ -251,7 +296,7 @@ Artisan::command('nbx:reconcile-artifacts {--limit=200} {--apply : Persist corre
     }
 })->purpose('Reconcile NBX database status with verified final object existence and byte size');
 
-Artisan::command('cdn:reconcile {--minutes=30}', function (MediaSourceService $mediaSourceService) {
+Artisan::command('cdn:reconcile {--minutes=30}', function (MediaSourceService $mediaSourceService, ProcessingStateInspector $stateInspector) {
     $minutes = max(1, (int) $this->option('minutes'));
 
     /** @var \Illuminate\Support\Collection<int, MediaSource> $staleSources */
@@ -263,9 +308,25 @@ Artisan::command('cdn:reconcile {--minutes=30}', function (MediaSourceService $m
     $requeued = 0;
     $markedFailed = 0;
     $restoredReady = 0;
+    $stillActive = 0;
 
     foreach ($staleSources as $source) {
         /** @var MediaSource $source */
+        // `updated_at` measures database writes, not whether the media
+        // process is alive. An encode can be actively muxing with a quiet
+        // database row, so never requeue or fail it until PID/heartbeat/output
+        // evidence says it is genuinely inactive.
+        $health = $stateInspector->inspect($source);
+        if ($health['active']) {
+            Log::info('CDN reconciliation deferred for an active media process', [
+                'source_id' => $source->id,
+                'state' => $health['state'],
+                'message' => $health['message'],
+            ]);
+            $stillActive++;
+
+            continue;
+        }
         if ($source->storage_path && $source->storage_disk) {
             $disk = \Illuminate\Support\Facades\Storage::disk($source->storage_disk);
             $exists = $disk->exists($source->storage_path);
@@ -316,7 +377,7 @@ Artisan::command('cdn:reconcile {--minutes=30}', function (MediaSourceService $m
         }
     }
 
-    $this->info("Requeued: {$requeued}, restored ready: {$restoredReady}, marked failed: {$markedFailed}");
+    $this->info("Requeued: {$requeued}, restored ready: {$restoredReady}, active/deferred: {$stillActive}, marked failed: {$markedFailed}");
 })->purpose('Reconcile stale CDN media source imports');
 
 Artisan::command('media:retry-failed-optimizations {--limit=5} {--stale-minutes=30} {--max-retries=10}', function (MediaSourceService $mediaSourceService) {

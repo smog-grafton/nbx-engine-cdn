@@ -435,6 +435,14 @@ class MediaController extends Controller
                 'telebot_message' => 'Teletyde handoff accepted. NBX is fetching the temporary file.',
                 'handoff_mode' => 'source_url',
                 'handoff_received_at' => now()->toIso8601String(),
+                'handoff_integrity' => array_filter([
+                    // Telebot obtains this directly from Telegram. Keep it
+                    // distinct from NBX's later HTTP Content-Length so a
+                    // mismatched handoff can never look like a valid movie.
+                    'telebot_declared_bytes' => $validated['bytes_total'] ?? null,
+                    'received_at' => now()->toIso8601String(),
+                    'source' => 'telebot_source_url',
+                ], static fn ($value): bool => $value !== null),
             ]);
 
             $source->update([
