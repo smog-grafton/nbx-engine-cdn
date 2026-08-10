@@ -100,7 +100,7 @@ class MediaSourcesRelationManager extends RelationManager
                 ->label('Compress to MP4 on optimization')
                 ->default(true)
                 ->helperText('When enabled, after fetch or upload the file is transcoded to H.264 MP4 (smaller size, faststart) before playback and HLS. Recommended for large MKV/AVI files.')
-                ->visible(fn (Forms\Get $get): bool => in_array($get('source_type'), ['remote_fetch', 'upload'], true)),
+                ->visible(fn (Forms\Get $get): bool => in_array($get('source_type'), ['remote_fetch', 'upload', 'telegram'], true)),
             Forms\Components\Section::make('NBX Engine processing')
                 ->description('These match the portal NBX options. Work files stay local for FFmpeg, then final outputs move to Contabo unless Local is selected.')
                 ->schema([
@@ -180,7 +180,7 @@ class MediaSourcesRelationManager extends RelationManager
                 ])
                 ->columns(2)
                 ->collapsible()
-                ->visible(fn (Forms\Get $get): bool => in_array($get('source_type'), ['remote_fetch', 'upload', 'url'], true)),
+                ->visible(fn (Forms\Get $get): bool => in_array($get('source_type'), ['remote_fetch', 'upload', 'url', 'telegram'], true)),
             Forms\Components\Actions::make([
                 Forms\Components\Actions\Action::make('start_remote_import')
                     ->label('Start Import Now')
@@ -523,13 +523,16 @@ class MediaSourcesRelationManager extends RelationManager
                                 'source_url' => $sourceUrl,
                                 'status' => 'pending',
                                 'is_active' => (bool) ($data['is_active'] ?? true),
-                                'compress_enabled' => true,
-                                'source_metadata' => [
-                                    'source' => 'telegram',
-                                    'telegram_url' => $sourceUrl,
-                                    'telebot_status' => 'waiting_for_capacity',
-                                    'telebot_message' => 'Waiting to dispatch to Telebot.',
-                                ],
+                                'compress_enabled' => (bool) ($data['compress_enabled'] ?? true),
+                                'source_metadata' => array_replace_recursive(
+                                    app(NbxEngineService::class)->initialMetadata($this->nbxProcessingPayload($data, 'telegram'), 'telegram'),
+                                    [
+                                        'source' => 'telegram',
+                                        'telegram_url' => $sourceUrl,
+                                        'telebot_status' => 'waiting_for_capacity',
+                                        'telebot_message' => 'Waiting to dispatch to Telebot.',
+                                    ],
+                                ),
                             ]);
 
                             $dispatched = app(TelegramImportDispatchService::class)->dispatch($source);
@@ -690,6 +693,8 @@ class MediaSourcesRelationManager extends RelationManager
                         $data['hls_1080p'] = (bool) ($hls['1080p'] ?? config('nbx.default_hls_1080', false));
                         $data['allow_downloads'] = (bool) ($requested['allow_downloads'] ?? true);
                         $data['allow_hls_streaming'] = (bool) ($requested['allow_hls_streaming'] ?? true);
+                        $data['max_resolution'] = $requested['max_resolution'] ?? null;
+                        $data['retention_policy'] = $this->retentionPolicyFor($requested['retention_policy'] ?? null);
 
                         return $data;
                     })
@@ -704,12 +709,15 @@ class MediaSourcesRelationManager extends RelationManager
                                 throw new \RuntimeException('Please enter a valid Telegram message URL.');
                             }
 
-                            $metadata = array_merge((array) ($record->source_metadata ?? []), [
-                                'source' => 'telegram',
-                                'telegram_url' => $sourceUrl,
-                                'telebot_status' => 'waiting_for_capacity',
-                                'telebot_message' => 'Waiting to dispatch to Telebot.',
-                            ]);
+                            $metadata = array_replace_recursive(
+                                $this->mergeNbxMetadata($record, $this->nbxProcessingPayload($data, 'telegram')),
+                                [
+                                    'source' => 'telegram',
+                                    'telegram_url' => $sourceUrl,
+                                    'telebot_status' => 'waiting_for_capacity',
+                                    'telebot_message' => 'Waiting to dispatch to Telebot.',
+                                ],
+                            );
 
                             $record->update([
                                 'source_type' => 'remote_fetch',
@@ -719,7 +727,7 @@ class MediaSourcesRelationManager extends RelationManager
                                 'bytes_downloaded' => null,
                                 'bytes_total' => null,
                                 'is_active' => (bool) ($data['is_active'] ?? $record->is_active),
-                                'compress_enabled' => true,
+                                'compress_enabled' => (bool) ($data['compress_enabled'] ?? true),
                                 'source_metadata' => $metadata,
                             ]);
 
@@ -1148,6 +1156,15 @@ class MediaSourcesRelationManager extends RelationManager
         }
 
         return MediaUrl::normalize($trimmed) ?? $trimmed;
+    }
+
+    private function retentionPolicyFor(mixed $policy): string
+    {
+        return match (strtolower(trim((string) $policy))) {
+            'keep_original_only', 'original_only' => 'keep_original_only',
+            'keep_original', 'retain_original', 'keep_both', 'keep_original_and_optimized' => 'keep_both',
+            default => 'optimized_only',
+        };
     }
 
     private function nbxProcessingPayload(array $data, string $inputType): array

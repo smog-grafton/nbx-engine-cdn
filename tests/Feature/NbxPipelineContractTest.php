@@ -36,6 +36,18 @@ class NbxPipelineContractTest extends TestCase
         $this->assertSame('optimized_only', $requested['retention_policy']);
     }
 
+    public function test_telegram_processing_metadata_preserves_keep_original_only(): void
+    {
+        $metadata = app(NbxEngineService::class)->initialMetadata([
+            'compress_enabled' => true,
+            'retention_policy' => 'keep_original_only',
+        ], 'telegram');
+
+        $this->assertSame('telegram', $metadata['nbx']['input_type']);
+        $this->assertTrue($metadata['nbx']['requested']['compression']);
+        $this->assertSame('keep_original_only', $metadata['nbx']['requested']['retention_policy']);
+    }
+
     public function test_mkv_duration_validation_prefers_primary_video_over_bad_container_metadata(): void
     {
         $method = new \ReflectionMethod(OptimizeMp4FaststartJob::class, 'durationValidation');
