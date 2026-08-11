@@ -214,6 +214,7 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             && ! $needsDownscale
             && $this->isAlreadyEfficient($probe);
         $stage = $shouldCompress && ! $alreadyEfficient ? 'compressing' : 'faststarting';
+        $compressionPlan = null;
         $source->update([
             'processing_stage' => $stage,
             'processing_stage_progress' => 0,
@@ -232,6 +233,7 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             [$exitCode, $rawError] = $this->runAudioTranscode($ffmpeg, $absoluteInput, $absoluteOutput, $source, $duration);
         } else {
             $processingMode = 'video_transcode';
+            $compressionPlan = $this->compressionPlan($source, $probe, $needsDownscale ? $maxHeight : 0);
             [$exitCode, $rawError] = $this->runCompressionTranscode(
                 $ffmpeg,
                 $absoluteInput,
@@ -240,6 +242,7 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
                 $needsDownscale ? $maxHeight : 0,
                 $duration,
                 $probe,
+                $compressionPlan,
             );
         }
 
@@ -404,8 +407,14 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             'output_bytes' => $optimizedSize,
             'bytes_saved' => $bytesSaved,
             'percentage_saved' => $percentageSaved,
+            'input_bitrate' => is_numeric($probe['bitrate'] ?? null) ? (int) $probe['bitrate'] : null,
+            'output_bitrate' => is_numeric($outputProbe['bitrate'] ?? null) ? (int) $outputProbe['bitrate'] : null,
             'compression_effective' => ! $compressionIneffective,
             'compression_outcome' => $compressionIneffective ? 'ineffective' : 'effective',
+            'compression_requested' => $shouldCompress,
+            'encoder_plan' => $compressionPlan,
+            'final_video_stream_copy' => in_array($processingMode, ['remux', 'remux_already_efficient', 'audio_transcode', 'remux_fallback_smaller'], true),
+            'final_audio_stream_copy' => in_array($processingMode, ['remux', 'remux_already_efficient', 'remux_fallback_smaller'], true),
             'processing_seconds' => round(microtime(true) - $processingStarted, 2),
             'input_container' => $probe['container'] ?? null,
             'output_container' => $outputProbe['container'] ?? 'mp4',
@@ -595,18 +604,9 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
         int $requestedMaxHeight = 0,
         float $duration = 0,
         array $probe = [],
+        ?array $plan = null,
     ): array {
-        $videoCodec = (string) config('cdn.compress_video_codec', 'libx264');
-        $audioCodec = (string) config('cdn.compress_audio_codec', 'aac');
-        $processingPreset = (string) $this->requestedValue($source, 'processing_preset', 'automatic');
-        $profile = $this->compressionProfile($probe, $requestedMaxHeight, $processingPreset);
-        $defaultCrf = $processingPreset === 'smaller_720p' ? min(35, $profile['crf'] + 2) : $profile['crf'];
-        $crf = max(16, min(35, (int) $this->requestedValue($source, 'crf', $defaultCrf)));
-        $audioBitrate = (string) $this->requestedValue($source, 'audio_bitrate', $profile['audio_bitrate']);
-        $preset = (string) $this->requestedValue($source, 'encoder_preset', config('cdn.compress_preset', 'medium'));
-        $maxHeight = $requestedMaxHeight > 0
-            ? $requestedMaxHeight
-            : max(0, (int) config('cdn.compress_max_height', 0));
+        $plan ??= $this->compressionPlan($source, $probe, $requestedMaxHeight);
 
         $parts = [
             $ffmpeg,
@@ -628,21 +628,21 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             '-sn',
             '-dn',
             '-c:v',
-            $videoCodec,
+            (string) $plan['video_codec'],
             '-preset',
-            $preset,
+            (string) $plan['encoder_preset'],
             '-crf',
-            (string) $crf,
+            (string) $plan['crf'],
             '-maxrate',
-            $profile['maxrate'],
+            (string) $plan['maxrate'],
             '-bufsize',
-            $profile['bufsize'],
+            (string) $plan['bufsize'],
             '-pix_fmt',
             'yuv420p',
             '-c:a',
-            $audioCodec,
+            (string) $plan['audio_codec'],
             '-b:a',
-            $audioBitrate,
+            (string) $plan['audio_bitrate'],
             '-movflags',
             '+faststart',
         ];
@@ -653,19 +653,57 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             $parts[] = (string) $threads;
         }
 
-        // libx264 with yuv420p requires even dimensions. The previous height-
-        // only condition left odd source dimensions untouched, producing
-        // "Error while opening encoder for output stream 0:0".
         $parts[] = '-vf';
-        $parts[] = $maxHeight > 0
-            ? "scale={$maxHeight}:{$maxHeight}:force_original_aspect_ratio=decrease:force_divisible_by=2"
-            : 'scale=trunc(iw/2)*2:trunc(ih/2)*2';
+        $parts[] = (string) $plan['scale_filter'];
         $parts[] = '-max_muxing_queue_size';
         $parts[] = '4096';
 
         $parts[] = $absoluteOutput;
 
         return app(FfmpegProcessRunner::class)->run($parts, $source, $duration, 'compressing', $absoluteOutput);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function compressionPlan(MediaSource $source, array $probe, int $requestedMaxHeight = 0): array
+    {
+        $videoCodec = (string) config('cdn.compress_video_codec', 'libx264');
+        $audioCodec = (string) config('cdn.compress_audio_codec', 'aac');
+        $processingPreset = (string) $this->requestedValue($source, 'processing_preset', 'automatic');
+        $profile = $this->compressionProfile($probe, $requestedMaxHeight, $processingPreset);
+        $defaultCrf = $processingPreset === 'smaller_720p' ? min(35, $profile['crf'] + 2) : $profile['crf'];
+        $crf = max(16, min(35, (int) $this->requestedValue($source, 'crf', $defaultCrf)));
+        $audioBitrate = (string) $this->requestedValue($source, 'audio_bitrate', $profile['audio_bitrate']);
+        $preset = (string) $this->requestedValue($source, 'encoder_preset', config('cdn.compress_preset', 'medium'));
+        $maxHeight = $requestedMaxHeight > 0
+            ? $requestedMaxHeight
+            : max(0, (int) config('cdn.compress_max_height', 0));
+
+        return [
+            'processing_preset' => $processingPreset,
+            'video_codec' => $videoCodec,
+            'audio_codec' => $audioCodec,
+            'encoder_preset' => $preset,
+            'crf' => $crf,
+            'maxrate' => $profile['maxrate'],
+            'bufsize' => $profile['bufsize'],
+            'audio_bitrate' => $audioBitrate,
+            'max_height' => $maxHeight > 0 ? $maxHeight : null,
+            'scale_filter' => $this->scaleFilter($probe, $maxHeight),
+        ];
+    }
+
+    private function scaleFilter(array $probe, int $maxHeight): string
+    {
+        $inputHeight = max(0, (int) ($probe['height'] ?? 0));
+        if ($maxHeight > 0 && $inputHeight > $maxHeight) {
+            return "scale=-2:{$maxHeight}";
+        }
+
+        // libx264 with yuv420p requires even dimensions; when no downscale is
+        // needed, preserve the original aspect ratio and only trim odd pixels.
+        return 'scale=trunc(iw/2)*2:trunc(ih/2)*2';
     }
 
     private function requestedValue(MediaSource $source, string $key, mixed $fallback): mixed

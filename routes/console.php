@@ -542,6 +542,7 @@ Artisan::command('media:refresh-asset-statuses {--importing-only : Only refresh 
 Artisan::command('media:process-optimization-queue {--max-jobs=10 : Max optimization jobs to run}', function () {
     $maxJobs = max(1, (int) $this->option('max-jobs'));
     $queue = (string) config('cdn.optimization_queue', 'optimization');
+    $timeout = max(0, (int) config('cdn.ffmpeg_job_timeout_seconds', 0));
 
     $this->info("Processing up to {$maxJobs} optimization job(s)...");
     Artisan::call('queue:work', [
@@ -549,7 +550,7 @@ Artisan::command('media:process-optimization-queue {--max-jobs=10 : Max optimiza
         '--max-jobs' => $maxJobs,
         '--stop-when-empty' => true,
         '--tries' => 1,
-        '--timeout' => 25200,
+        '--timeout' => $timeout,
     ]);
 
     $this->info('Done.');
@@ -859,12 +860,14 @@ Schedule::call(function (): void {
 })->name('cdn:queue-work:default')->withoutOverlapping()->everyMinute();
 
 Schedule::call(function (): void {
+    $timeout = max(0, (int) config('cdn.ffmpeg_job_timeout_seconds', 0));
+
     Artisan::call('queue:work', [
         '--queue' => (string) config('cdn.optimization_queue', 'optimization'),
         '--max-jobs' => 1,
         '--stop-when-empty' => true,
         '--tries' => 1,
-        '--timeout' => 7200,
+        '--timeout' => $timeout,
         '--max-time' => 58,
     ]);
 })->name('cdn:queue-work:optimization')->withoutOverlapping()->everyTwoMinutes();

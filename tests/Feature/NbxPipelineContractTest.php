@@ -92,6 +92,18 @@ class NbxPipelineContractTest extends TestCase
         $this->assertSame(720, $method->invoke(new OptimizeMp4FaststartJob($source->id), $source, ['height' => 1080]));
     }
 
+    public function test_compression_scale_filter_caps_height_without_square_warping(): void
+    {
+        $method = new \ReflectionMethod(OptimizeMp4FaststartJob::class, 'scaleFilter');
+        $job = new OptimizeMp4FaststartJob(1);
+
+        $this->assertSame('scale=-2:720', $method->invoke($job, ['width' => 1920, 'height' => 1080], 720));
+        $this->assertSame(
+            'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+            $method->invoke($job, ['width' => 640, 'height' => 360], 720),
+        );
+    }
+
     public function test_keep_original_only_publishes_without_queuing_or_deleting_the_source(): void
     {
         config()->set('filesystems.disks.contabo.key', 'test-key');
