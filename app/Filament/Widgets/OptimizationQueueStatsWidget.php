@@ -4,9 +4,9 @@ namespace App\Filament\Widgets;
 
 use App\Filament\Resources\MediaAssetResource;
 use App\Models\MediaSource;
+use App\Services\OptimizationQueueInspector;
 use Filament\Widgets\StatsOverviewWidget as BaseWidget;
 use Filament\Widgets\StatsOverviewWidget\Stat;
-use Illuminate\Support\Facades\DB;
 
 class OptimizationQueueStatsWidget extends BaseWidget
 {
@@ -16,26 +16,19 @@ class OptimizationQueueStatsWidget extends BaseWidget
 
     protected function getStats(): array
     {
-        $queueConnection = config('queue.default');
-        $queueConfig = config("queue.connections.{$queueConnection}");
-        $optimizationQueue = (string) config('cdn.optimization_queue', 'optimization');
-
-        $optimizationPending = null;
-        if (($queueConfig['driver'] ?? null) === 'database') {
-            $connection = $queueConfig['connection'] ?? null;
-            $table = $queueConfig['table'] ?? 'jobs';
-            try {
-                $optimizationPending = DB::connection($connection)->table($table)
-                    ->where('queue', $optimizationQueue)
-                    ->count();
-            } catch (\Throwable $e) {
-                // table may not exist; fall back to null
-                $optimizationPending = null;
-            }
-        }
+        $queueSummary = app(OptimizationQueueInspector::class)->summary();
+        $optimizationPending = $queueSummary['total'];
 
         $sourcesPending = MediaSource::where('status', 'ready')
             ->whereIn('optimize_status', ['pending', 'processing'])
+            ->count();
+        $sourcesQueued = MediaSource::where('status', 'ready')
+            ->where('optimize_status', 'pending')
+            ->where('processing_stage', 'queued')
+            ->count();
+        $sourcesPreparing = MediaSource::where('status', 'ready')
+            ->where('optimize_status', 'processing')
+            ->where('processing_stage', 'preparing_input')
             ->count();
 
         $sourcesFailed = MediaSource::where('status', 'ready')
@@ -51,13 +44,18 @@ class OptimizationQueueStatsWidget extends BaseWidget
         return [
             Stat::make('Optimization queue (jobs)', $optimizationPending ?? 'N/A')
                 ->description(
-                    (bool) config('cdn.enable_hls', true)
-                        ? 'Jobs waiting (each source = 2 jobs: faststart + HLS). Scheduler runs every 2 min, 1 job at a time.'
-                        : 'Jobs waiting (HLS disabled, 1 job per source – faststart only). Scheduler runs every 2 min, 1 job at a time.'
+                    $queueSummary['can_inspect']
+                        ? sprintf(
+                            'Ready %d, delayed %d, reserved %d. Docker workers poll every second; scheduler fallback runs every 2 min.',
+                            (int) $queueSummary['ready'],
+                            (int) $queueSummary['delayed'],
+                            (int) $queueSummary['reserved'],
+                        )
+                        : 'Current queue driver cannot be inspected through the jobs table.'
                 )
                 ->color(($optimizationPending ?? 0) > 0 ? 'warning' : 'success'),
             Stat::make('Sources pending optimization', $sourcesPending)
-                ->description('Media sources with optimize_status pending or processing.')
+                ->description("Queued {$sourcesQueued}; preparing input {$sourcesPreparing}.")
                 ->color($sourcesPending > 0 ? 'warning' : 'success'),
             Stat::make('Sources with failed optimization', $sourcesFailed)
                 ->description('Click to view media assets with failed sources. Use "Run re-optimise" on a source or wait for the retry command (every 5 min).')

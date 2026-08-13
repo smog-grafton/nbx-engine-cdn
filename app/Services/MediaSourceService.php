@@ -9,6 +9,7 @@ use App\Models\MediaSource;
 use App\Services\Storage\StorageTargetRegistry;
 use App\Support\MediaUrl;
 use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
@@ -96,6 +97,12 @@ class MediaSourceService
             }
 
             $expectedSize = $this->safeSize($candidateDisk, $candidateKey);
+            $this->markOptimizationPreparingInput($source, [
+                'from' => $candidate['label'],
+                'source_disk' => $candidateDisk,
+                'source_key' => $candidateKey,
+                'expected_size' => $expectedSize > 0 ? $expectedSize : null,
+            ]);
 
             $stream = Storage::disk($candidateDisk)->readStream($candidateKey);
             if (! is_resource($stream)) {
@@ -113,7 +120,7 @@ class MediaSourceService
             $stagingPath = $workPath.'.restoring-'.Str::random(8);
             try {
                 Storage::disk($workDisk)->makeDirectory(dirname($workPath));
-                Storage::disk($workDisk)->put($stagingPath, $stream);
+                $this->putWorkStreamWithHeartbeat($workDisk, $stagingPath, $stream, $source, $expectedSize);
             } finally {
                 if (is_resource($stream)) {
                     fclose($stream);
@@ -182,6 +189,10 @@ class MediaSourceService
 
         if ($remoteUrl) {
             try {
+                $this->markOptimizationPreparingInput($source, [
+                    'from' => 'remote_url',
+                    'url_host' => parse_url($remoteUrl, PHP_URL_HOST),
+                ]);
                 Storage::disk($workDisk)->makeDirectory(dirname($workPath));
                 $absolutePath = Storage::disk($workDisk)->path($workPath);
                 $response = Http::timeout((int) config('cdn.remote_fetch_timeout', 21600))
@@ -220,6 +231,146 @@ class MediaSourceService
         }
 
         return null;
+    }
+
+    /**
+     * A worker has claimed the optimization job, but may still be restoring a
+     * durable Contabo/R2 object back to local work storage before FFmpeg can
+     * start. Surface that as active work instead of leaving the row looking
+     * idle in queued/pending for the whole copy.
+     *
+     * @param  array<string, mixed>  $context
+     */
+    public function markOptimizationPreparingInput(MediaSource $source, array $context = []): MediaSource
+    {
+        $source = $source->fresh() ?? $source;
+        if (! in_array($source->optimize_status, ['pending', 'processing'], true)) {
+            return $source;
+        }
+
+        $metadata = (array) ($source->source_metadata ?? []);
+        $nbx = (array) ($metadata['nbx'] ?? []);
+        $updates = [
+            'optimize_status' => 'processing',
+            'processing_stage' => 'preparing_input',
+            'processing_stage_progress' => 0,
+            'processing_heartbeat_at' => now(),
+            'processing_diagnostics' => 'Worker claimed job and is preparing local input.',
+            'processing_worker_id' => app(ProcessingStateInspector::class)->workerId(),
+            'ffmpeg_pid' => null,
+            'progress_percent' => min(9, max(1, (int) ($source->progress_percent ?: 1))),
+            'last_progress_at' => now(),
+        ];
+
+        if (($metadata['provider'] ?? null) === 'nbx_engine' || isset($metadata['nbx'])) {
+            $metadata['provider'] = 'nbx_engine';
+            $metadata['nbx'] = array_merge($nbx, [
+                'status' => 'preparing_input',
+                'optimization' => array_filter([
+                    'status' => 'processing',
+                    'stage' => 'preparing_input',
+                    'started_at' => Arr::get($nbx, 'optimization.started_at', now()->toIso8601String()),
+                    'message' => 'Worker claimed job and is preparing local input.',
+                    'input_restore' => array_filter($context, static fn (mixed $value): bool => $value !== null && $value !== ''),
+                ], static fn (mixed $value): bool => $value !== null && $value !== []),
+            ]);
+            $updates['source_metadata'] = $metadata;
+        }
+
+        $source->update($updates);
+        ProcessingLiveness::touch($source->id);
+
+        return $source->fresh() ?? $source;
+    }
+
+    /**
+     * @param  resource  $stream
+     */
+    private function putWorkStreamWithHeartbeat(string $disk, string $path, mixed $stream, MediaSource $source, int $expectedSize): void
+    {
+        try {
+            $absolutePath = Storage::disk($disk)->path($path);
+            $directory = dirname($absolutePath);
+            if (! is_dir($directory)) {
+                @mkdir($directory, 0775, true);
+            }
+            $output = fopen($absolutePath, 'wb');
+            if (! is_resource($output)) {
+                throw new \RuntimeException('Could not open staging work file for writing.');
+            }
+        } catch (\Throwable) {
+            Storage::disk($disk)->put($path, $stream);
+            ProcessingLiveness::touch($source->id);
+
+            return;
+        }
+
+        $bytes = 0;
+        $lastHeartbeat = 0.0;
+        try {
+            while (! feof($stream)) {
+                $chunk = fread($stream, 1024 * 1024);
+                if ($chunk === false) {
+                    throw new \RuntimeException('Failed reading durable input stream.');
+                }
+                if ($chunk === '') {
+                    continue;
+                }
+                $written = fwrite($output, $chunk);
+                if ($written === false || $written < strlen($chunk)) {
+                    throw new \RuntimeException('Failed writing staging work file.');
+                }
+
+                $bytes += $written;
+                $now = microtime(true);
+                if ($now - $lastHeartbeat >= 5) {
+                    $this->touchInputPreparationProgress($source, $bytes, $expectedSize);
+                    $lastHeartbeat = $now;
+                }
+            }
+        } finally {
+            if (is_resource($output)) {
+                fclose($output);
+            }
+        }
+
+        $this->touchInputPreparationProgress($source, $bytes, $expectedSize);
+    }
+
+    private function touchInputPreparationProgress(MediaSource $source, int $bytes, int $expectedSize): void
+    {
+        $percent = $expectedSize > 0
+            ? max(0, min(100, (int) floor(($bytes / $expectedSize) * 100)))
+            : 0;
+
+        MediaSource::query()
+            ->whereKey($source->id)
+            ->where('processing_attempt_id', $source->processing_attempt_id)
+            ->update([
+                'processing_stage' => 'preparing_input',
+                'processing_stage_progress' => $percent,
+                'processing_heartbeat_at' => now(),
+                'processing_diagnostics' => $expectedSize > 0
+                    ? sprintf('Preparing input: copied %s of %s.', $this->formatBytes($bytes), $this->formatBytes($expectedSize))
+                    : sprintf('Preparing input: copied %s.', $this->formatBytes($bytes)),
+                'current_output_size_bytes' => $bytes,
+                'output_size_observed_at' => now(),
+                'last_progress_at' => now(),
+        ]);
+        ProcessingLiveness::touch($source->id);
+    }
+
+    private function formatBytes(int $bytes): string
+    {
+        $units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        $value = max(0, $bytes);
+        $unit = 0;
+        while ($value >= 1024 && $unit < count($units) - 1) {
+            $value /= 1024;
+            $unit++;
+        }
+
+        return round($value, 1).' '.$units[$unit];
     }
 
     private function inferredFaststartPath(?string $storagePath): ?string

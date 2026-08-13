@@ -40,6 +40,7 @@ class ProcessHlsAfterFaststartJob implements ShouldBeUnique, ShouldQueue
 
     public function middleware(): array
     {
+        $releaseAfter = max(5, (int) config('cdn.optimization_overlap_release_seconds', 30));
         // No global/tiered concurrency lock here deliberately: this job
         // does no FFmpeg work itself, only decides what to dispatch next,
         // so it doesn't compete for the CPU-bound concurrency budget (see
@@ -50,7 +51,7 @@ class ProcessHlsAfterFaststartJob implements ShouldBeUnique, ShouldQueue
                 ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 25200)))
                 // A blocked continuation is recoverable. Dropping it here can
                 // leave a successful faststart permanently without HLS.
-                ->releaseAfter(300),
+                ->releaseAfter($releaseAfter),
         ];
     }
 

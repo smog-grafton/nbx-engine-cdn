@@ -59,6 +59,134 @@ class CdnLoadHardeningTest extends TestCase
         $this->assertDatabaseCount('jobs', 1);
     }
 
+    public function test_stale_recovery_does_not_requeue_queued_source_with_matching_ready_job(): void
+    {
+        config()->set('filesystems.default', 'public');
+        config()->set('cdn.disk', 'public');
+        config()->set('cdn.enable_hls', false);
+        config()->set('queue.default', 'database');
+        config()->set('cdn.queued_optimization_missing_job_grace_seconds', 30);
+
+        $asset = MediaAsset::query()->create([
+            'type' => 'movie',
+            'title' => 'Queued With Job',
+            'status' => 'ready',
+            'visibility' => 'public',
+        ]);
+        $path = 'media/'.$asset->id.'/queued-with-job.mkv';
+        Storage::disk('public')->put($path, 'video-bytes');
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'upload',
+            'storage_disk' => 'public',
+            'storage_path' => $path,
+            'status' => 'ready',
+            'is_active' => true,
+            'compress_enabled' => true,
+        ]);
+
+        $this->assertTrue(app(MediaSourceService::class)->queuePlaybackProcessing($source));
+        $source->refresh();
+        MediaSource::withoutTimestamps(fn () => $source->forceFill([
+            'processing_heartbeat_at' => now()->subMinutes(10),
+            'updated_at' => now()->subMinutes(10),
+        ])->saveQuietly());
+
+        Artisan::call('media:recover-stale-optimizations', ['--stale-minutes' => 5, '--limit' => 10]);
+
+        $source->refresh();
+        $this->assertSame('pending', $source->optimize_status);
+        $this->assertSame('queued', $source->processing_stage);
+        $this->assertDatabaseCount('jobs', 1);
+    }
+
+    public function test_stale_recovery_requeues_abandoned_queued_source_when_queue_row_is_missing(): void
+    {
+        config()->set('filesystems.default', 'public');
+        config()->set('cdn.disk', 'public');
+        config()->set('cdn.enable_hls', false);
+        config()->set('queue.default', 'database');
+        config()->set('cdn.queued_optimization_missing_job_grace_seconds', 30);
+
+        $asset = MediaAsset::query()->create([
+            'type' => 'movie',
+            'title' => 'Queued Missing Job',
+            'status' => 'ready',
+            'visibility' => 'public',
+        ]);
+        $path = 'media/'.$asset->id.'/queued-missing-job.mkv';
+        Storage::disk('public')->put($path, 'video-bytes');
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'upload',
+            'storage_disk' => 'public',
+            'storage_path' => $path,
+            'status' => 'ready',
+            'optimize_status' => 'pending',
+            'processing_stage' => 'queued',
+            'processing_attempt_id' => (string) \Illuminate\Support\Str::uuid(),
+            'processing_attempt_started_at' => now()->subMinutes(10),
+            'processing_heartbeat_at' => now()->subMinutes(10),
+            'last_progress_at' => now()->subMinutes(10),
+            'is_active' => true,
+            'compress_enabled' => true,
+        ]);
+
+        Artisan::call('media:recover-stale-optimizations', ['--stale-minutes' => 5, '--limit' => 10]);
+
+        $source->refresh();
+        $this->assertSame('pending', $source->optimize_status);
+        $this->assertSame('queued', $source->processing_stage);
+        $this->assertNotNull($source->processing_attempt_id);
+        $this->assertDatabaseCount('jobs', 1);
+    }
+
+    public function test_stale_recovery_requeues_reserved_queued_job_with_no_worker_heartbeat(): void
+    {
+        config()->set('filesystems.default', 'public');
+        config()->set('cdn.disk', 'public');
+        config()->set('cdn.enable_hls', false);
+        config()->set('queue.default', 'database');
+        config()->set('cdn.queued_optimization_missing_job_grace_seconds', 30);
+        config()->set('cdn.queued_optimization_reserved_rescue_seconds', 30);
+
+        $asset = MediaAsset::query()->create([
+            'type' => 'movie',
+            'title' => 'Reserved Dead Job',
+            'status' => 'ready',
+            'visibility' => 'public',
+        ]);
+        $path = 'media/'.$asset->id.'/reserved-dead-job.mkv';
+        Storage::disk('public')->put($path, 'video-bytes');
+        $source = MediaSource::query()->create([
+            'media_asset_id' => $asset->id,
+            'source_type' => 'upload',
+            'storage_disk' => 'public',
+            'storage_path' => $path,
+            'status' => 'ready',
+            'is_active' => true,
+            'compress_enabled' => true,
+        ]);
+
+        $this->assertTrue(app(MediaSourceService::class)->queuePlaybackProcessing($source));
+        $source->refresh();
+        \Illuminate\Support\Facades\DB::table('jobs')->update([
+            'reserved_at' => now()->subMinutes(10)->timestamp,
+        ]);
+        MediaSource::withoutTimestamps(fn () => $source->forceFill([
+            'processing_heartbeat_at' => now()->subMinutes(10),
+            'updated_at' => now()->subMinutes(10),
+        ])->saveQuietly());
+
+        Artisan::call('media:recover-stale-optimizations', ['--stale-minutes' => 5, '--limit' => 10]);
+
+        $source->refresh();
+        $this->assertSame('pending', $source->optimize_status);
+        $this->assertSame('queued', $source->processing_stage);
+        $this->assertDatabaseCount('jobs', 1);
+        $this->assertDatabaseHas('jobs', ['reserved_at' => null]);
+    }
+
     public function test_telegram_handoff_declared_size_survives_queue_dispatch_for_later_integrity_comparison(): void
     {
         config()->set('queue.default', 'database');

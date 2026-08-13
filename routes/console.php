@@ -6,6 +6,7 @@ use App\Models\MediaSource;
 use App\Services\ContaboStorageCredentialService;
 use App\Services\MediaBinaryDetector;
 use App\Services\MediaSourceService;
+use App\Services\OptimizationQueueInspector;
 use App\Services\ProcessingStateInspector;
 use App\Services\VideoProbeService;
 use Illuminate\Foundation\Inspiring;
@@ -556,6 +557,93 @@ Artisan::command('media:process-optimization-queue {--max-jobs=10 : Max optimiza
     $this->info('Done.');
 })->purpose('Run optimization queue worker to process pending/failed optimization jobs');
 
+Artisan::command('media:optimization-health {--source= : Include queue/job evidence for one media source ID}', function (OptimizationQueueInspector $queueInspector) {
+    $summary = $queueInspector->summary();
+    $this->info('Optimization queue health');
+    $this->line('Driver: '.($summary['driver'] ?? 'unknown').' | queue: '.$summary['queue']);
+
+    if (! $summary['can_inspect']) {
+        $this->warn('The current queue driver cannot be inspected through the database jobs table.');
+    } else {
+        $this->line(sprintf(
+            'Jobs: total=%d ready=%d delayed=%d reserved=%d retry_after=%ss',
+            (int) $summary['total'],
+            (int) $summary['ready'],
+            (int) $summary['delayed'],
+            (int) $summary['reserved'],
+            (int) $summary['retry_after'],
+        ));
+        $this->line(sprintf(
+            'Oldest ages: ready=%ss delayed=%ss reserved=%ss',
+            $summary['oldest_ready_seconds'] ?? 'n/a',
+            $summary['oldest_delayed_seconds'] ?? 'n/a',
+            $summary['oldest_reserved_seconds'] ?? 'n/a',
+        ));
+    }
+
+    $sourceCounts = MediaSource::query()
+        ->where('status', 'ready')
+        ->whereIn('optimize_status', ['pending', 'processing', 'failed', 'ready'])
+        ->selectRaw('optimize_status, processing_stage, COUNT(*) as total')
+        ->groupBy('optimize_status', 'processing_stage')
+        ->orderBy('optimize_status')
+        ->orderBy('processing_stage')
+        ->get();
+
+    $this->newLine();
+    $this->info('Ready source optimization states');
+    foreach ($sourceCounts as $row) {
+        $this->line(sprintf(
+            '%s / %s: %d',
+            $row->optimize_status ?: 'null',
+            $row->processing_stage ?: 'null',
+            (int) $row->total,
+        ));
+    }
+
+    $sourceId = $this->option('source');
+    if ($sourceId !== null && $sourceId !== '') {
+        $source = MediaSource::query()->find((int) $sourceId);
+        if (! $source) {
+            $this->warn('Source #'.(int) $sourceId.' was not found.');
+
+            return;
+        }
+
+        $this->newLine();
+        $this->info("Source #{$source->id}");
+        $this->line(sprintf(
+            'status=%s optimize_status=%s stage=%s attempt=%s heartbeat=%s updated=%s',
+            $source->status,
+            $source->optimize_status ?: 'null',
+            $source->processing_stage ?: 'null',
+            $source->processing_attempt_id ?: 'null',
+            $source->processing_heartbeat_at?->toDateTimeString() ?: 'null',
+            $source->updated_at?->toDateTimeString() ?: 'null',
+        ));
+
+        $jobs = $queueInspector->jobsForSource($source);
+        if ($jobs === []) {
+            $this->warn('No matching optimization queue row was found for this source attempt.');
+
+            return;
+        }
+
+        foreach ($jobs as $job) {
+            $this->line(sprintf(
+                'job #%d %s %s attempts=%d age=%ss available_in=%ss reserved_for=%s',
+                $job['id'],
+                $job['display_name'] ?: 'unknown-job',
+                $job['state'],
+                $job['attempts'],
+                $job['age_seconds'],
+                $job['available_in_seconds'],
+                $job['reserved_for_seconds'] ?? 'n/a',
+            ));
+        }
+    }
+})->purpose('Inspect NBX optimization queue readiness, delays, reservations and source-level evidence');
+
 Artisan::command('media:clear-optimization-queue', function () {
     $connection = config('queue.default');
     $driver = config("queue.connections.{$connection}.driver");
@@ -877,9 +965,9 @@ Schedule::call(function (): void {
 })->name('cdn:retry-failed-optimizations')->withoutOverlapping()->everyFiveMinutes();
 
 Schedule::command('media:recover-stale-optimizations', [
-    '--limit' => 1,
+    '--limit' => (int) config('cdn.optimization_recovery_batch_limit', 10),
     '--stale-minutes' => (int) config('cdn.optimization_stale_minutes', 20),
 ])
     ->name('cdn:recover-stale-optimizations')
     ->withoutOverlapping()
-    ->everyFiveMinutes();
+    ->everyMinute();

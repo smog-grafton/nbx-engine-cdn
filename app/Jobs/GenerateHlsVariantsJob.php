@@ -57,11 +57,12 @@ class GenerateHlsVariantsJob implements ShouldBeUnique, ShouldQueue
 
     public function middleware(): array
     {
+        $releaseAfter = max(5, (int) config('cdn.optimization_overlap_release_seconds', 30));
         $locks = [
             // releaseAfter (not dontRelease) — see OptimizeMp4FaststartJob.
             (new WithoutOverlapping('optimization:source:'.$this->sourceId))
                 ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 25200)))
-                ->releaseAfter(300),
+                ->releaseAfter($releaseAfter),
         ];
 
         if ((bool) config('cdn.serialize_optimization_jobs', true)) {

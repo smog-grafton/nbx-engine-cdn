@@ -18,7 +18,11 @@ return [
     'transcode_concurrency' => (int) env('CDN_TRANSCODE_CONCURRENCY', 1),
     'remux_concurrency' => (int) env('CDN_REMUX_CONCURRENCY', 3),
     'optimization_overlap_lock_seconds' => (int) env('CDN_OPTIMIZATION_OVERLAP_LOCK_SECONDS', 25200),
+    'optimization_overlap_release_seconds' => (int) env('CDN_OPTIMIZATION_OVERLAP_RELEASE_SECONDS', 30),
     'optimization_stale_minutes' => (int) env('CDN_OPTIMIZATION_STALE_MINUTES', 20),
+    'queued_optimization_missing_job_grace_seconds' => (int) env('CDN_QUEUED_OPTIMIZATION_MISSING_JOB_GRACE_SECONDS', 120),
+    'queued_optimization_reserved_rescue_seconds' => (int) env('CDN_QUEUED_OPTIMIZATION_RESERVED_RESCUE_SECONDS', 300),
+    'optimization_recovery_batch_limit' => (int) env('CDN_OPTIMIZATION_RECOVERY_BATCH_LIMIT', 10),
     // FFmpeg itself is not timed out by default. Health is determined from
     // PID, heartbeat and output growth, not elapsed wall time.
     'ffmpeg_timeout_seconds' => (int) env('CDN_FFMPEG_TIMEOUT_SECONDS', 0),

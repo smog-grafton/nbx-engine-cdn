@@ -63,6 +63,7 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
 
     public function middleware(): array
     {
+        $releaseAfter = max(5, (int) config('cdn.optimization_overlap_release_seconds', 30));
         $locks = [
             // releaseAfter (not dontRelease): if a worker crashes mid-run and
             // leaves this lock held, a scheduled/manual retry dispatch must be
@@ -73,7 +74,7 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
             // need several manual reprocess attempts before one "stuck".
             (new WithoutOverlapping('optimization:source:'.$this->sourceId))
                 ->expireAfter(max(300, (int) config('cdn.optimization_overlap_lock_seconds', 25200)))
-                ->releaseAfter(300),
+                ->releaseAfter($releaseAfter),
         ];
 
         if ((bool) config('cdn.serialize_optimization_jobs', true)) {
@@ -110,6 +111,9 @@ class OptimizeMp4FaststartJob implements ShouldBeUnique, ShouldQueue
         }
 
         ProcessingLiveness::touch($source->id);
+        $source = app(MediaSourceService::class)->markOptimizationPreparingInput($source, [
+            'from' => 'queue_worker',
+        ]);
         $this->handleAttempt($source);
     }
 
