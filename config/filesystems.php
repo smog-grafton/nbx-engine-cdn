@@ -111,6 +111,19 @@ return [
             'report' => false,
         ],
 
+        'r2' => [
+            'driver' => 's3',
+            'key' => env('CLOUDFLARE_R2_ACCESS_KEY_ID', env('R2_ACCESS_KEY_ID')),
+            'secret' => env('CLOUDFLARE_R2_SECRET_ACCESS_KEY', env('R2_SECRET_ACCESS_KEY')),
+            'region' => env('CLOUDFLARE_R2_REGION', env('R2_REGION', 'auto')),
+            'bucket' => env('CLOUDFLARE_R2_BUCKET', env('R2_BUCKET', 'nbx')),
+            'url' => env('CLOUDFLARE_R2_PUBLIC_URL', env('R2_PUBLIC_URL', 'https://nbxgen.naraboxtv.com')),
+            'endpoint' => env('CLOUDFLARE_R2_ENDPOINT', env('R2_ENDPOINT')),
+            'use_path_style_endpoint' => (bool) env('CLOUDFLARE_R2_USE_PATH_STYLE_ENDPOINT', env('R2_USE_PATH_STYLE_ENDPOINT', false)),
+            'throw' => false,
+            'report' => false,
+        ],
+
     ],
 
     /*

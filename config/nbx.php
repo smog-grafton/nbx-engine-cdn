@@ -11,7 +11,7 @@ return [
     'webhook_timeout' => (int) env('NBX_WEBHOOK_TIMEOUT', 20),
     'portal_storage_callback_url' => (string) env('NBX_PORTAL_STORAGE_CALLBACK_URL', ''),
 
-    'default_storage' => (string) env('NBX_DEFAULT_STORAGE', 'contabo'),
+    'default_storage' => (string) env('NBX_DEFAULT_STORAGE', 'auto'),
     'work_storage' => (string) env('NBX_WORK_STORAGE', env('FILESYSTEM_DISK', 'public')),
     'allow_local_storage' => (bool) env('NBX_ALLOW_LOCAL_STORAGE', true),
     'allow_1080p' => (bool) env('NBX_ALLOW_1080P', false),

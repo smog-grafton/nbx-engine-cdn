@@ -128,10 +128,11 @@ class VerifiedObjectStorageService
                     $this->multipartUpload($sourceStream, $targetDisk, $targetPath, $contentType);
                     $multipart = true;
                 } else {
-                    $stored = Storage::disk($targetDisk)->put($targetPath, $sourceStream, [
-                        'visibility' => 'public',
-                        'ContentType' => $contentType,
-                    ]);
+                    $stored = Storage::disk($targetDisk)->put(
+                        $targetPath,
+                        $sourceStream,
+                        $this->putOptionsForDisk($targetDisk, $contentType),
+                    );
 
                     if (! $stored) {
                         throw new \RuntimeException("Could not store {$targetPath} on {$targetDisk}.");
@@ -240,6 +241,27 @@ class VerifiedObjectStorageService
 
             throw $exception;
         }
+    }
+
+    /**
+     * R2 public delivery is controlled by the bucket/custom domain, not by
+     * per-object ACLs. Avoid sending public-read ACL options to R2 endpoints.
+     */
+    private function putOptionsForDisk(string $disk, string $contentType): array
+    {
+        $endpoint = strtolower((string) config("filesystems.disks.{$disk}.endpoint", ''));
+        $provider = strtolower((string) config("filesystems.disks.{$disk}.provider", ''));
+        $isR2 = $disk === 'r2'
+            || str_contains($endpoint, '.r2.cloudflarestorage.com')
+            || str_contains($provider, 'r2');
+
+        $options = ['ContentType' => $contentType];
+
+        if (! $isR2) {
+            $options['visibility'] = 'public';
+        }
+
+        return $options;
     }
 
     /**

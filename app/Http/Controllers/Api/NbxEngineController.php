@@ -641,7 +641,7 @@ class NbxEngineController extends Controller
             'hls_enabled' => (bool) config('cdn.enable_hls', true),
             'default_hls_profiles' => (array) config('cdn.hls_profiles', []),
             'nbx_defaults' => [
-                'storage' => (string) config('nbx.default_storage', 'contabo'),
+                'storage' => (string) config('nbx.default_storage', 'auto'),
                 'faststart' => (bool) config('nbx.default_faststart', true),
                 'hls_480p' => (bool) config('nbx.default_hls_480', false),
                 'hls_720p' => (bool) config('nbx.default_hls_720', false),

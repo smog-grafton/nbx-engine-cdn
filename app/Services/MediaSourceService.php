@@ -1333,7 +1333,7 @@ class MediaSourceService
 
         return ($metadata['provider'] ?? null) === 'nbx_engine'
             && app(StorageTargetRegistry::class)->isContaboFamily(
-                (string) ($nbx['storage_target'] ?? config('nbx.default_storage', 'contabo'))
+                (string) ($nbx['storage_target'] ?? config('nbx.default_storage', 'auto'))
             );
     }
 

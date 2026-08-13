@@ -72,12 +72,9 @@ class StorageTargetRegistry
     }
 
     /**
-     * True for any target that resolves to a real Contabo bucket (the
-     * legacy literal "contabo", or a concrete logical key like
-     * "contabo_nbx"/"contabo_nb_nbx"), as opposed to NBX's own local/public
-     * work disk. Use this instead of `=== 'contabo'` — since storage_target
-     * is now resolved to a concrete logical key at job-creation time, an
-     * exact-literal comparison against "contabo" never matches new jobs.
+     * True for any remote object-storage target (Contabo or R2), as opposed
+     * to NBX's own local/public work disk. Kept under the legacy method name
+     * because older call sites use it to mean "not local".
      */
     public function isContaboFamily(?string $key): bool
     {

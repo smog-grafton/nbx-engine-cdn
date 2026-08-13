@@ -49,6 +49,23 @@ class StorageTargetSelectionTest extends TestCase
                 'known_used_bytes' => 0,
                 'known_used_at' => now()->toIso8601String(),
             ],
+            'storage_targets.targets.r2_nbx' => [
+                'label' => 'Cloudflare R2 — nbx',
+                'provider' => 'cloudflare_r2',
+                'disk' => 'r2',
+                'endpoint' => 'https://e31bdccee36e2432baee084144f9c6ae.r2.cloudflarestorage.com',
+                'region' => 'auto',
+                'bucket' => 'nbx',
+                'public_url' => 'https://nbxgen.naraboxtv.com',
+                'path_prefix' => 'videos',
+                'enabled' => false,
+                'writable' => true,
+                'priority' => 200,
+                'capacity_bytes' => 10995116277760,
+                'reserve_percent' => 5,
+                'known_used_bytes' => 0,
+                'known_used_at' => now()->toIso8601String(),
+            ],
             'storage_targets.legacy_target_key' => 'contabo_nbx',
         ]);
     }
@@ -68,6 +85,18 @@ class StorageTargetSelectionTest extends TestCase
 
         $this->assertSame('nbx', $selector->resolveExplicit('contabo_nbx', 1000)['target']->bucket);
         $this->assertSame('nb-nbx', $selector->resolveExplicit('contabo_nb_nbx', 1000)['target']->bucket);
+    }
+
+    public function test_automatic_selection_prefers_r2_when_enabled(): void
+    {
+        config(['storage_targets.targets.r2_nbx.enabled' => true]);
+
+        $resolution = app(AutomaticStorageSelector::class)->resolveAutomatic(1_000_000);
+
+        $this->assertSame('r2_nbx', $resolution['target']->key);
+        $this->assertSame('cloudflare_r2', $resolution['target']->provider);
+        $this->assertSame('nbx', $resolution['target']->bucket);
+        $this->assertTrue($resolution['auto']);
     }
 
     public function test_automatic_selection_prefers_nb_nbx_while_nbx_is_near_soft_limit(): void

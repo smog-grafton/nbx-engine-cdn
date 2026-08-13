@@ -102,7 +102,7 @@ class MediaSourcesRelationManager extends RelationManager
                 ->helperText('When enabled, after fetch or upload the file is transcoded to H.264 MP4 (smaller size, faststart) before playback and HLS. Recommended for large MKV/AVI files.')
                 ->visible(fn (Forms\Get $get): bool => in_array($get('source_type'), ['remote_fetch', 'upload', 'telegram'], true)),
             Forms\Components\Section::make('NBX Engine processing')
-                ->description('These match the portal NBX options. Work files stay local for FFmpeg, then final outputs move to Contabo unless Local is selected.')
+                ->description('These match the portal NBX options. Work files stay local for FFmpeg, then final outputs move to the selected object-storage target unless Local is selected.')
                 ->schema([
                     Forms\Components\Select::make('storage_target')
                         ->label('Final storage')
@@ -174,7 +174,7 @@ class MediaSourcesRelationManager extends RelationManager
                         ->options([
                             'optimized_only' => 'Keep Optimized Only',
                             'keep_original_only' => 'Keep Original Only',
-                            'keep_both' => 'Keep Original + Optimized',
+                            'retain_original' => 'Keep Original + Optimized',
                         ])
                         ->helperText('The original is never deleted until an optimized output has passed validation, final upload, remote verification, and URL publication.'),
                 ])
@@ -419,6 +419,21 @@ class MediaSourcesRelationManager extends RelationManager
                     ->badge()
                     ->formatStateUsing(fn (?string $state): string => strtoupper((string) ($state ?: 'mp4')))
                     ->color(fn (?string $state): string => $state === 'hls' ? 'success' : 'info')
+                    ->toggleable(),
+                Tables\Columns\TextColumn::make('source_metadata.nbx.storage_target')
+                    ->label('Storage')
+                    ->badge()
+                    ->placeholder('local')
+                    ->formatStateUsing(fn (?string $state): string => $state
+                        ? (string) (config('storage_targets.targets.'.$state.'.label') ?: $state)
+                        : 'Local')
+                    ->color(fn (?string $state): string => match ($state) {
+                        'r2_nbx' => 'success',
+                        'contabo_nb_nbx' => 'info',
+                        'contabo_nbx' => 'gray',
+                        null, 'local', 'public' => 'gray',
+                        default => 'warning',
+                    })
                     ->toggleable(),
                 Tables\Columns\TextColumn::make('hls_worker_status')
                     ->label('HLS Worker')
@@ -686,7 +701,7 @@ class MediaSourcesRelationManager extends RelationManager
                         $requested = is_array($nbx['requested'] ?? null) ? $nbx['requested'] : [];
                         $hls = is_array($requested['hls'] ?? null) ? $requested['hls'] : [];
 
-                        $data['storage_target'] = $nbx['storage_target'] ?? config('nbx.default_storage', 'contabo');
+                        $data['storage_target'] = $nbx['storage_target'] ?? config('nbx.default_storage', 'auto');
                         $data['faststart'] = (bool) ($requested['faststart'] ?? config('nbx.default_faststart', true));
                         $data['hls_480p'] = (bool) ($hls['480p'] ?? config('nbx.default_hls_480', true));
                         $data['hls_720p'] = (bool) ($hls['720p'] ?? config('nbx.default_hls_720', false));
@@ -939,7 +954,7 @@ class MediaSourcesRelationManager extends RelationManager
                             ->options([
                                 'optimized_only' => 'Keep Optimized Only',
                                 'keep_original_only' => 'Keep Original Only',
-                                'keep_both' => 'Keep Original + Optimized',
+                                'retain_original' => 'Keep Original + Optimized',
                             ]),
                     ])
                     ->action(function (MediaSource $record, array $data): void {
@@ -989,7 +1004,7 @@ class MediaSourcesRelationManager extends RelationManager
                             ->options([
                                 'optimized_only' => 'Keep Optimized Only',
                                 'keep_original_only' => 'Keep Original Only',
-                                'keep_both' => 'Keep Original + Optimized',
+                                'retain_original' => 'Keep Original + Optimized',
                             ]),
                     ])
                     ->action(function (MediaSource $record, array $data): void {
@@ -1162,7 +1177,7 @@ class MediaSourcesRelationManager extends RelationManager
     {
         return match (strtolower(trim((string) $policy))) {
             'keep_original_only', 'original_only' => 'keep_original_only',
-            'keep_original', 'retain_original', 'keep_both', 'keep_original_and_optimized' => 'keep_both',
+            'keep_original', 'retain_original', 'keep_both', 'keep_original_and_optimized' => 'retain_original',
             default => 'optimized_only',
         };
     }
@@ -1170,7 +1185,7 @@ class MediaSourcesRelationManager extends RelationManager
     private function nbxProcessingPayload(array $data, string $inputType): array
     {
         return [
-            'storage_target' => (string) ($data['storage_target'] ?? config('nbx.default_storage', 'contabo')),
+            'storage_target' => (string) ($data['storage_target'] ?? config('nbx.default_storage', 'auto')),
             'faststart' => (bool) ($data['faststart'] ?? config('nbx.default_faststart', true)),
             'compress_enabled' => (bool) ($data['compress_enabled'] ?? false),
             'hls_480p' => (bool) ($data['hls_480p'] ?? config('nbx.default_hls_480', true)),

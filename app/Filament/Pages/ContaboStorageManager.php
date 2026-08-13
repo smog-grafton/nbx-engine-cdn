@@ -23,7 +23,9 @@ class ContaboStorageManager extends Page
 
     protected static ?string $navigationGroup = 'Storage';
 
-    protected static ?string $navigationLabel = 'Contabo inventory';
+    protected static ?string $navigationLabel = 'Object inventory';
+
+    protected static ?string $title = 'Object storage inventory';
 
     protected static ?int $navigationSort = 10;
 
@@ -103,7 +105,7 @@ class ContaboStorageManager extends Page
             Notification::make()
                 ->success()
                 ->title('Read-only inventory queued')
-                ->body("Run #{$run->id} will index object metadata without changing Contabo.")
+                ->body("Run #{$run->id} will index object metadata without changing storage.")
                 ->send();
             $this->loadObjects();
         } catch (\Throwable $exception) {
@@ -117,7 +119,7 @@ class ContaboStorageManager extends Page
     }
 
     /**
-     * Disaster recovery: rebuild media_assets/media_sources for Contabo
+     * Disaster recovery: rebuild media_assets/media_sources for object-storage
      * objects nbx itself owns but which have no matching database row
      * (e.g. after the nbx database was lost and redeployed empty). This
      * only reads storage_inventory_objects — run "Scan bucket" (or wait for
@@ -155,7 +157,7 @@ class ContaboStorageManager extends Page
         Notification::make()
             ->success()
             ->title('Catalog rebuild queued')
-            ->body('This rescans every NBX-owned Contabo bucket and recreates rows for orphaned job folders. Refresh this page shortly to see the result summary.')
+            ->body('This rescans every NBX-owned storage target and recreates rows for orphaned job folders. Refresh this page shortly to see the result summary.')
             ->send();
     }
 

@@ -22,15 +22,19 @@ class NbxEngineService
      * pick a different bucket mid-job and split one job's outputs across
      * two buckets, which is not allowed.
      *
-     * Returns 'local'/'public' verbatim (non-Contabo storage), or a
-     * concrete logical bucket key (e.g. "contabo_nbx", "contabo_nb_nbx").
+     * Returns 'local'/'public' verbatim, or a concrete logical bucket key
+     * (e.g. "r2_nbx", "contabo_nbx", "contabo_nb_nbx").
      */
     private function resolveInitialStorageTarget(array $data): string
     {
-        $raw = (string) ($data['storage_target'] ?? config('nbx.default_storage', 'contabo'));
+        $raw = (string) ($data['storage_target'] ?? config('nbx.default_storage', 'auto'));
 
         if (in_array($raw, ['local', 'public'], true)) {
-            return (bool) config('nbx.allow_local_storage', true) ? $raw : 'contabo';
+            if ((bool) config('nbx.allow_local_storage', true)) {
+                return $raw;
+            }
+
+            $raw = 'auto';
         }
 
         $registry = app(StorageTargetRegistry::class);
@@ -591,7 +595,7 @@ class NbxEngineService
             return $source;
         }
         $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
-        $target = (string) ($nbx['storage_target'] ?? config('nbx.default_storage', 'contabo'));
+        $target = (string) ($nbx['storage_target'] ?? config('nbx.default_storage', 'auto'));
         $resolvedTarget = $this->resolveDiskForTarget($target);
         $targetDisk = $resolvedTarget['disk'];
         $currentDisk = $source->storage_disk ?: (string) config('cdn.disk', 'public');
@@ -675,7 +679,7 @@ class NbxEngineService
         $source = $source->fresh() ?? $source;
         $metadata = (array) ($source->source_metadata ?? []);
         $nbx = is_array($metadata['nbx'] ?? null) ? $metadata['nbx'] : [];
-        $target = (string) ($nbx['storage_target'] ?? config('nbx.default_storage', 'contabo'));
+        $target = (string) ($nbx['storage_target'] ?? config('nbx.default_storage', 'auto'));
         $resolvedTarget = $this->resolveDiskForTarget($target);
         $targetDisk = $resolvedTarget['disk'];
         $finalDisk = $resolvedTarget['disk'];
@@ -822,7 +826,7 @@ class NbxEngineService
 
             return $source->fresh() ?? $source;
         }
-        $target = (string) ($nbx['storage_target'] ?? config('nbx.default_storage', 'contabo'));
+        $target = (string) ($nbx['storage_target'] ?? config('nbx.default_storage', 'auto'));
         $resolvedTarget = $this->resolveDiskForTarget($target);
         $finalDisk = $resolvedTarget['disk'];
         if (! $resolvedTarget['is_contabo']) {
@@ -1122,7 +1126,7 @@ class NbxEngineService
             'storage_verified' => (bool) ($nbx['storage_verified'] ?? false),
             'publication_status' => $nbx['publication_status'] ?? null,
             'publication_error' => $nbx['finalization_error'] ?? null,
-            'default_storage' => (string) config('nbx.default_storage', 'contabo'),
+            'default_storage' => (string) config('nbx.default_storage', 'auto'),
             'original_url' => $this->artifactUrl($nbx, 'original'),
             'faststart_mp4_url' => $playback['mp4_play_url'] ?? null,
             'download_mp4_url' => $this->mp4OnlyUrl($playback['download_url'] ?? null),
