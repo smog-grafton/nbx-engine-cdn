@@ -67,6 +67,24 @@ return [
             'known_used_at' => env('CONTABO_NB_NBX_KNOWN_USED_AT'),
         ],
 
+        'r2_nbx' => [
+            'label' => 'Cloudflare R2 — nbx',
+            'provider' => 'cloudflare_r2',
+            'disk' => env('CLOUDFLARE_R2_DISK', 'r2'),
+            'endpoint' => env('CLOUDFLARE_R2_ENDPOINT', 'https://e31bdccee36e2432baee084144f9c6ae.r2.cloudflarestorage.com'),
+            'region' => env('CLOUDFLARE_R2_REGION', 'auto'),
+            'bucket' => env('CLOUDFLARE_R2_BUCKET', 'nbx'),
+            'public_url' => env('CLOUDFLARE_R2_PUBLIC_URL', 'https://nbxgen.naraboxtv.com'),
+            'path_prefix' => env('CLOUDFLARE_R2_PATH_PREFIX', 'videos'),
+            'enabled' => (bool) env('CLOUDFLARE_R2_ENABLED', false),
+            'writable' => (bool) env('CLOUDFLARE_R2_WRITABLE', true),
+            'priority' => (int) env('CLOUDFLARE_R2_PRIORITY', 200),
+            'capacity_bytes' => (int) env('CLOUDFLARE_R2_CAPACITY_BYTES', 10995116277760), // 10 TiB accounting guardrail.
+            'reserve_percent' => (float) env('CLOUDFLARE_R2_RESERVE_PERCENT', 5),
+            'known_used_bytes' => (int) env('CLOUDFLARE_R2_KNOWN_USED_BYTES', 0),
+            'known_used_at' => env('CLOUDFLARE_R2_KNOWN_USED_AT'),
+        ],
+
     ],
 
     'default_target' => env('MEDIA_STORAGE_DEFAULT_TARGET', 'auto'),

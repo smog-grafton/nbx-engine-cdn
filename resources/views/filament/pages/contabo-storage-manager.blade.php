@@ -26,7 +26,7 @@
         <div class="rounded-xl bg-white p-5 shadow-sm ring-1 ring-gray-950/5 dark:bg-gray-900 dark:ring-white/10">
             <div class="flex flex-wrap items-start justify-between gap-4">
                 <div>
-                    <h2 class="font-semibold text-gray-950 dark:text-white">Read-only bucket inventory</h2>
+                    <h2 class="font-semibold text-gray-950 dark:text-white">Read-only storage inventory</h2>
                     @if ($latestRun)
                         <p class="mt-1 text-sm text-gray-600 dark:text-gray-300">
                             Run #{{ $latestRun['id'] }} · {{ str_replace('_', ' ', $latestRun['status']) }}
@@ -46,9 +46,9 @@
                     wire:click="startInventory"
                     wire:loading.attr="disabled"
                     wire:target="startInventory"
-                    wire:confirm="Start a read-only Contabo inventory? This lists and indexes metadata; it does not modify or delete objects."
+                    wire:confirm="Start a read-only object storage inventory? This lists and indexes metadata; it does not modify or delete objects."
                 >
-                    <span wire:loading.remove wire:target="startInventory">Scan bucket</span>
+                    <span wire:loading.remove wire:target="startInventory">Scan storage</span>
                     <span wire:loading wire:target="startInventory">Queuing…</span>
                 </x-filament::button>
             </div>
@@ -62,7 +62,7 @@
                 <div>
                     <h2 class="font-semibold text-gray-950 dark:text-white">Catalog recovery from storage</h2>
                     <p class="mt-1 text-sm text-gray-600 dark:text-gray-300">
-                        Recreates media_assets/media_sources rows for NBX job folders that exist in Contabo but have
+                        Recreates media_assets/media_sources rows for NBX job folders that exist in object storage but have
                         no matching database row — for recovering after the NBX database was lost.
                     </p>
                     @if ($latestRebuild)
@@ -102,7 +102,7 @@
                         wire:click="startRebuild"
                         wire:loading.attr="disabled"
                         wire:target="startRebuild"
-                        wire:confirm="Rebuild the NBX catalog from Contabo storage? This creates new media_assets/media_sources rows for every recoverable job folder that has no matching database row. It does not modify or delete storage objects."
+                        wire:confirm="Rebuild the NBX catalog from object storage? This creates new media_assets/media_sources rows for every recoverable job folder that has no matching database row. It does not modify or delete storage objects."
                     >
                         <span wire:loading.remove wire:target="startRebuild">Rebuild catalog from storage</span>
                         <span wire:loading wire:target="startRebuild">Queuing…</span>

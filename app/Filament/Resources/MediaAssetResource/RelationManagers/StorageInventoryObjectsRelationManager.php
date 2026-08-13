@@ -11,7 +11,7 @@ class StorageInventoryObjectsRelationManager extends RelationManager
 {
     protected static string $relationship = 'storageInventoryObjects';
 
-    protected static ?string $title = 'Contabo storage packages';
+    protected static ?string $title = 'Object-storage packages';
 
     public function form(Form $form): Form
     {
@@ -81,7 +81,7 @@ class StorageInventoryObjectsRelationManager extends RelationManager
             ])
             ->defaultPaginationPageOption(25)
             ->paginationPageOptions([10, 25, 50, 100])
-            ->emptyStateHeading('No indexed Contabo objects')
+            ->emptyStateHeading('No indexed storage objects')
             ->emptyStateDescription('Run a read-only storage inventory to link this asset to originals, Fast Start MP4, and HLS package objects.');
     }
 
