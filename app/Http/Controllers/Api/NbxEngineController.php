@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\MediaSource;
 use App\Services\ContaboStorageCredentialService;
 use App\Services\MediaBinaryDetector;
 use App\Services\MediaSourceService;
@@ -25,6 +26,17 @@ class NbxEngineController extends Controller
         $validated = $request->validate([
             'input_type' => ['required', Rule::in(['remote_fetch', 'upload', 'object_storage', 'telegram'])],
             'source_url' => ['required_if:input_type,remote_fetch', 'nullable', 'string', 'max:4096'],
+            'migration' => ['nullable', 'array'],
+            'migration.kind' => ['nullable', 'string', 'in:legacy_cdn'],
+            'migration.legacy_asset_id' => ['nullable', 'string', 'max:100'],
+            'migration.legacy_source_id' => ['nullable', 'integer', 'min:1'],
+            'migration.original_source_url' => ['nullable', 'url', 'max:4096'],
+            'migration.fallback_source_url' => ['nullable', 'url', 'max:4096'],
+            'migration.stored_filename' => ['nullable', 'string', 'max:255'],
+            'migration.stored_size_bytes' => ['nullable', 'integer', 'min:1'],
+            'migration.stored_mime_type' => ['nullable', 'string', 'max:255'],
+            'migration.lookup_url' => ['nullable', 'url', 'max:4096'],
+            'migration.idempotency_key' => ['nullable', 'string', 'max:128'],
             'telegram_url' => ['required_if:input_type,telegram', 'nullable', 'url', 'max:4096'],
             'object_url' => ['required_if:input_type,object_storage', 'nullable', 'string', 'max:4096'],
             'object_disk' => ['nullable', 'string', 'max:100'],
@@ -69,9 +81,26 @@ class NbxEngineController extends Controller
         }
 
         if (in_array(($validated['input_type'] ?? null), ['remote_fetch', 'object_storage'], true)) {
-            $validated['source_url'] = SafeRemoteMediaUrl::assertAllowed(
-                $validated['source_url'] ?? $validated['object_url'] ?? null
-            );
+            try {
+                $validated['source_url'] = SafeRemoteMediaUrl::assertAllowed(
+                    $validated['source_url'] ?? $validated['object_url'] ?? null
+                );
+            } catch (\Throwable $originalError) {
+                $migration = (array) ($validated['migration'] ?? []);
+                $fallbackUrl = trim((string) ($migration['fallback_source_url'] ?? ''));
+                if (($migration['kind'] ?? null) !== 'legacy_cdn' || $fallbackUrl === '') {
+                    throw $originalError;
+                }
+
+                $validated['source_url'] = SafeRemoteMediaUrl::assertAllowed($fallbackUrl);
+                $migration['state'] = 'trying_legacy_public';
+                $migration['original_error'] = substr(
+                    preg_replace('/\s+/', ' ', trim($originalError->getMessage())) ?: 'Original source was unavailable.',
+                    0,
+                    1000,
+                );
+                $validated['migration'] = $migration;
+            }
             $source = $nbx->createRemoteJob($validated, $mediaSourceService);
 
             return $this->success($nbx->discoveryPayload($source, $mediaSourceService), 202);
@@ -455,7 +484,15 @@ class NbxEngineController extends Controller
                 null,
                 true
             );
-            $source = $nbx->createUploadJob($jobData, $uploaded, $mediaSourceService);
+            if (! empty($sessionData['existing_source_id'])) {
+                $source = MediaSource::with('asset')->find((int) $sessionData['existing_source_id']);
+                if (! $source) {
+                    return $this->error('The NBX migration source no longer exists.', 404);
+                }
+                $source = $nbx->acceptPushedUpload($source, $uploaded, $mediaSourceService, $sessionData);
+            } else {
+                $source = $nbx->createUploadJob($jobData, $uploaded, $mediaSourceService);
+            }
             $result = $nbx->discoveryPayload($source, $mediaSourceService);
             $sessionData['status'] = 'completed';
             $sessionData['completed_at'] = now()->toIso8601String();

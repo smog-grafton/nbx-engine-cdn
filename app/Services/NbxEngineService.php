@@ -303,6 +303,54 @@ class NbxEngineService
         return $source;
     }
 
+    public function acceptPushedUpload(
+        MediaSource $source,
+        UploadedFile $file,
+        MediaSourceService $mediaSourceService,
+        array $sessionData,
+    ): MediaSource {
+        $source = $source->fresh() ?? $source;
+        if ((int) $source->id !== (int) ($sessionData['existing_source_id'] ?? 0)) {
+            throw new \RuntimeException('The NBX migration upload is not bound to this source.');
+        }
+
+        $probe = app(VideoProbeService::class)->probe((string) $file->getRealPath());
+        if ($probe === [] || ! ($probe['has_video'] ?? false)) {
+            throw new \RuntimeException('The legacy CDN push did not contain a complete video file.');
+        }
+
+        $stream = fopen($file->getRealPath(), 'rb');
+        if (! is_resource($stream)) {
+            throw new \RuntimeException('The completed legacy CDN push could not be opened by NBX.');
+        }
+
+        try {
+            $source = $mediaSourceService->storeStreamedSource(
+                $source->asset,
+                $stream,
+                (string) $sessionData['filename'],
+                (int) $sessionData['size_bytes'],
+                (string) ($sessionData['mime_type'] ?? 'video/mp4'),
+                null,
+                $source,
+            );
+        } finally {
+            fclose($stream);
+        }
+
+        $metadata = (array) ($source->source_metadata ?? []);
+        $migration = (array) ($metadata['migration'] ?? []);
+        $migration['state'] = 'processing';
+        $migration['push']['completed_at'] = now()->toIso8601String();
+        $migration['push']['probe'] = $probe;
+        $metadata['migration'] = $migration;
+        $metadata['probe'] = $probe;
+        $source->update(['source_metadata' => $metadata]);
+        app(NbxWebhookDispatcher::class)->dispatch($source->fresh() ?? $source, 'job.created');
+
+        return $source->fresh() ?? $source;
+    }
+
     public function performAction(
         MediaSource $source,
         string $operation,
@@ -1235,6 +1283,7 @@ class NbxEngineService
         return [
             'provider' => 'nbx_engine',
             'source_url' => $data['source_url'] ?? null,
+            'migration' => is_array($data['migration'] ?? null) ? $data['migration'] : null,
             'video_ref_type' => $data['video_ref_type'] ?? null,
             'video_ref_id' => isset($data['video_ref_id']) ? (string) $data['video_ref_id'] : null,
             'callback_url' => $data['callback_url'] ?? null,

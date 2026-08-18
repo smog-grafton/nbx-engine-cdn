@@ -4,6 +4,7 @@ namespace App\Jobs;
 
 use App\Models\MediaSource;
 use App\Services\InsufficientDiskSpaceException;
+use App\Services\LegacyCdnPushService;
 use App\Services\LocalDiskSpaceGuard;
 use App\Services\MediaSourceService;
 use App\Services\NbxEngineService;
@@ -92,6 +93,10 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
         try {
             $sourceUrl = SafeRemoteMediaUrl::assertAllowed((string) $source->source_url);
         } catch (\Throwable $urlError) {
+            if ($this->tryLegacyMigrationFallback($source->fresh() ?? $source, $urlError, $mediaSourceService)) {
+                return;
+            }
+
             $source->update([
                 'status' => 'failed',
                 'failure_reason' => $urlError->getMessage(),
@@ -278,6 +283,9 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
                         $fetchProbe,
                     );
                 } catch (\Throwable $downloadError) {
+                    if ($this->tryLegacyMigrationFallback($source->fresh() ?? $source, $downloadError, $mediaSourceService)) {
+                        return;
+                    }
                     if (! $this->shouldUseProxyFallback($downloadError)) {
                         throw $downloadError;
                     }
@@ -401,6 +409,10 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
             $nbx->markNbxStatus($source->fresh() ?? $source, 'faststarting');
             $mediaSourceService->queuePlaybackProcessing($source->fresh());
         } catch (\Throwable $throwable) {
+            if ($this->tryLegacyMigrationFallback($source->fresh() ?? $source, $throwable, $mediaSourceService)) {
+                return;
+            }
+
             Log::error('CDN remote import failed', [
                 'source_id' => $source->id,
                 'asset_id' => $source->media_asset_id,
@@ -651,6 +663,69 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
             || str_contains($message, 'resumable download')
             || str_contains($message, "couldn't connect to server")
             || str_contains($message, 'failed to connect');
+    }
+
+    private function tryLegacyMigrationFallback(
+        MediaSource $source,
+        \Throwable $error,
+        MediaSourceService $mediaSourceService,
+    ): bool {
+        $metadata = (array) ($source->source_metadata ?? []);
+        $migration = (array) ($metadata['migration'] ?? []);
+        if (($migration['kind'] ?? null) !== 'legacy_cdn') {
+            return false;
+        }
+
+        $originalUrl = trim((string) ($migration['original_source_url'] ?? ''));
+        $fallbackUrl = trim((string) ($migration['fallback_source_url'] ?? ''));
+        $currentUrl = trim((string) ($source->source_url ?? ''));
+
+        if ($fallbackUrl !== '' && $currentUrl !== $fallbackUrl && $this->sameUrl($currentUrl, $originalUrl)) {
+            $migration['state'] = 'trying_legacy_public';
+            $migration['original_error'] = $this->safeMigrationError($error->getMessage());
+            $migration['fallback_started_at'] = now()->toIso8601String();
+            $metadata['migration'] = $migration;
+            $source->update([
+                'source_url' => SafeRemoteMediaUrl::assertAllowed($fallbackUrl),
+                'status' => 'pending',
+                'failure_reason' => null,
+                'last_error' => $error->getMessage(),
+                'processing_stage' => 'legacy_cdn_fallback',
+                'source_metadata' => $metadata,
+            ]);
+            $mediaSourceService->queueRemoteImport($source->fresh() ?? $source, true);
+
+            return true;
+        }
+
+        if ($currentUrl === '' || ($fallbackUrl !== '' && ! $this->sameUrl($currentUrl, $fallbackUrl))) {
+            return false;
+        }
+
+        $migration['state'] = 'legacy_cdn_security_challenge';
+        $migration['legacy_public_error'] = $this->safeMigrationError($error->getMessage());
+        $metadata['migration'] = $migration;
+        $source->update([
+            'status' => 'proxying',
+            'failure_reason' => null,
+            'last_error' => $error->getMessage(),
+            'processing_stage' => 'legacy_cdn_push',
+            'source_metadata' => $metadata,
+        ]);
+
+        app(LegacyCdnPushService::class)->request($source->fresh() ?? $source, $error->getMessage());
+
+        return true;
+    }
+
+    private function sameUrl(string $left, string $right): bool
+    {
+        return $left !== '' && $right !== '' && rtrim($left, '/') === rtrim($right, '/');
+    }
+
+    private function safeMigrationError(string $error): string
+    {
+        return substr(preg_replace('/\s+/', ' ', trim($error)) ?: 'Legacy source fetch failed.', 0, 1000);
     }
 
     private function requestExternalFallback(

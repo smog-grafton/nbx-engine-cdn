@@ -64,6 +64,9 @@ return [
 
     'ingest_secret' => (string) env('CDN_INGEST_SECRET', ''),
 
+    'legacy_cdn_api_base_url' => rtrim((string) env('LEGACY_CDN_API_BASE_URL', ''), '/'),
+    'legacy_cdn_api_token' => (string) env('LEGACY_CDN_API_TOKEN', ''),
+
     'portal_fetch_proxy_url' => (string) env('PORTAL_FETCH_PROXY_URL', ''),
     'portal_fetch_proxy_token' => (string) env('PORTAL_FETCH_PROXY_TOKEN', ''),
     'portal_worker_sync_url' => (string) env('PORTAL_WORKER_SYNC_URL', ''),
