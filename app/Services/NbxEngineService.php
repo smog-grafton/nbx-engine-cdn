@@ -7,6 +7,7 @@ use App\Models\MediaSource;
 use App\Services\Storage\AutomaticStorageSelector;
 use App\Services\Storage\StorageTargetRegistry;
 use App\Support\SafeRemoteMediaUrl;
+use App\Support\LegacyCdnUrlResolver;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
@@ -84,6 +85,7 @@ class NbxEngineService
 
     public function createRemoteJob(array $data, MediaSourceService $mediaSourceService): MediaSource
     {
+        $data['source_url'] = app(LegacyCdnUrlResolver::class)->resolve($data['source_url'] ?? null);
         $sourceUrl = SafeRemoteMediaUrl::assertAllowed((string) ($data['source_url'] ?? ''));
         if ($existing = $this->findByIdempotencyKey($data['idempotency_key'] ?? null)) {
             return $existing;

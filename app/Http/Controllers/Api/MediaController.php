@@ -10,6 +10,7 @@ use App\Services\MediaSourceService;
 use App\Services\NbxEngineService;
 use App\Support\MediaUrl;
 use App\Support\SafeRemoteMediaUrl;
+use App\Support\LegacyCdnUrlResolver;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
@@ -46,7 +47,9 @@ class MediaController extends Controller
         ]);
 
         // Allow creating an asset with no source_url (used for pre-creating CDN asset for direct uploads)
-        $sourceUrl = MediaUrl::normalize($validated['source_url'] ?? null);
+        $sourceUrl = app(LegacyCdnUrlResolver::class)->resolve(
+            MediaUrl::normalize($validated['source_url'] ?? null)
+        );
 
         $asset = MediaAsset::create([
             'type' => $validated['asset_type'] ?? 'generic',

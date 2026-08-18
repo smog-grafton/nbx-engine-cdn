@@ -9,6 +9,7 @@ use App\Services\MediaBinaryDetector;
 use App\Services\MediaSourceService;
 use App\Services\NbxEngineService;
 use App\Support\SafeRemoteMediaUrl;
+use App\Support\LegacyCdnUrlResolver;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\UploadedFile;
@@ -81,6 +82,9 @@ class NbxEngineController extends Controller
         }
 
         if (in_array(($validated['input_type'] ?? null), ['remote_fetch', 'object_storage'], true)) {
+            $validated['source_url'] = app(LegacyCdnUrlResolver::class)->resolve(
+                $validated['source_url'] ?? $validated['object_url'] ?? null
+            );
             try {
                 $validated['source_url'] = SafeRemoteMediaUrl::assertAllowed(
                     $validated['source_url'] ?? $validated['object_url'] ?? null

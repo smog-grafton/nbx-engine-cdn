@@ -66,6 +66,10 @@ return [
 
     'legacy_cdn_api_base_url' => rtrim((string) env('LEGACY_CDN_API_BASE_URL', ''), '/'),
     'legacy_cdn_api_token' => (string) env('LEGACY_CDN_API_TOKEN', ''),
+    'legacy_cdn_hosts' => array_values(array_filter(array_map(
+        'trim',
+        explode(',', (string) env('NBX_LEGACY_CDN_HOSTS', 'cdn.naraboxtv.com')),
+    ))),
 
     'portal_fetch_proxy_url' => (string) env('PORTAL_FETCH_PROXY_URL', ''),
     'portal_fetch_proxy_token' => (string) env('PORTAL_FETCH_PROXY_TOKEN', ''),

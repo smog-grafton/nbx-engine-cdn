@@ -13,6 +13,7 @@ use App\Services\RemoteFetchProbe;
 use App\Services\ResumableRemoteFetcher;
 use App\Services\VideoProbeService;
 use App\Support\SafeRemoteMediaUrl;
+use App\Support\LegacyCdnUrlResolver;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -90,8 +91,19 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
             return;
         }
 
+        $originalSourceUrl = (string) $source->source_url;
+        $resolvedSourceUrl = app(LegacyCdnUrlResolver::class)->resolve($originalSourceUrl);
+        if (is_string($resolvedSourceUrl) && $resolvedSourceUrl !== $originalSourceUrl) {
+            $source->forceFill(['source_url' => $resolvedSourceUrl])->save();
+            Log::info('Legacy CDN source normalized for import', [
+                'source_id' => $source->id,
+                'original_url' => $originalSourceUrl,
+                'resolved_url' => $resolvedSourceUrl,
+            ]);
+        }
+
         try {
-            $sourceUrl = SafeRemoteMediaUrl::assertAllowed((string) $source->source_url);
+            $sourceUrl = SafeRemoteMediaUrl::assertAllowed((string) ($resolvedSourceUrl ?: $source->source_url));
         } catch (\Throwable $urlError) {
             if ($this->tryLegacyMigrationFallback($source->fresh() ?? $source, $urlError, $mediaSourceService)) {
                 return;
