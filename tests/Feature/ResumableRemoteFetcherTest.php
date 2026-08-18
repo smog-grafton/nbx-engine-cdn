@@ -34,6 +34,41 @@ class ResumableRemoteFetcherTest extends TestCase
         $this->assertNull(ResumableRemoteFetcher::parseContentRange(null));
     }
 
+    public function test_probe_rejects_an_html_error_page_before_download(): void
+    {
+        Http::fake(fn (Request $request) => Http::response(
+            '<!doctype html><html><body>Origin error</body></html>',
+            200,
+            [
+                'Content-Type' => 'text/html; charset=UTF-8',
+                'Content-Length' => '56',
+            ],
+        ));
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Remote source returned HTML instead of a video file.');
+        $this->expectExceptionMessage('HTTP status: 200');
+        $this->expectExceptionMessage('Content-Type: text/html');
+
+        app(ResumableRemoteFetcher::class)->probe('https://example.com/error');
+    }
+
+    public function test_probe_accepts_binary_media_with_a_generic_content_type(): void
+    {
+        $payload = "\0\0\0\x18ftypisom\0\0\0\0";
+        Http::fake(fn (Request $request) => Http::response($payload, 200, [
+            'Content-Type' => 'application/octet-stream',
+            'Content-Length' => (string) strlen($payload),
+        ]));
+
+        $probe = app(ResumableRemoteFetcher::class)->probe('https://example.com/movie');
+
+        $this->assertSame(200, $probe->httpStatus);
+        $this->assertSame('application/octet-stream', $probe->contentType);
+        $this->assertSame(strlen($payload), $probe->expectedSize);
+        $this->assertFalse($probe->supportsRanges);
+    }
+
     public function test_it_assembles_verified_ranges_and_resumes_from_the_existing_offset(): void
     {
         $payload = str_repeat('a', 1024 * 1024)
@@ -77,9 +112,12 @@ class ResumableRemoteFetcherTest extends TestCase
 
         try {
             $fetcher = app(ResumableRemoteFetcher::class);
-            $fetcher->download($source, $url, $destination, static function (): void {});
+            $probe = $fetcher->download($source, $url, $destination, static function (): void {});
 
             $this->assertSame($payload, file_get_contents($destination));
+            $this->assertSame(206, $probe->httpStatus);
+            $this->assertSame(strlen($payload), $probe->expectedSize);
+            $this->assertTrue($probe->supportsRanges);
             $this->assertDatabaseHas('remote_fetch_sessions', [
                 'media_source_id' => $source->id,
                 'status' => 'completed',

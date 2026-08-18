@@ -7,7 +7,7 @@ Remote imports no longer stream a multi-gigabyte response through Laravel or a p
 - Every response must be `206 Partial Content` and its `Content-Range` must exactly match the requested offset, end, and total size.
 - A `200 OK` response to a range request is rejected and is never appended.
 - If cURL error 18, a timeout, or an unexpected EOF occurs after validated headers, the bytes already received for that range remain on disk. The next request begins at the first missing byte.
-- HTTP/1.1, `Accept-Encoding: identity`, an origin `Referer`, cookies, and a browser-compatible user agent are used for legacy download scripts and Cloudflare origins.
+- The HTTP protocol is negotiated by the client, while `Accept-Encoding: identity`, an origin `Referer`, cookies, and a browser-compatible user agent are used for legacy download scripts and Cloudflare origins.
 - One source host receives one sequential connection per job. Separate queue workers can still fetch separate movies.
 - The completed `.part` is renamed to the final media path only after its exact expected size is present. For Telegram handoffs, NBX also retains Telebot's declared byte count, compares it with the signed URL's `Content-Length`, and records the committed file size and SHA-256.
 - A failed proxy/worker handoff is reclaimed by `cdn:reconcile`; it preserves the existing job id and resumes the local checkpoint.

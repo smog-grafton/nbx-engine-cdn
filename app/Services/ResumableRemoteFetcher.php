@@ -17,6 +17,10 @@ class ResumableRemoteFetcher
 {
     private CookieJar $cookies;
 
+    private ?string $lastRedirectUrl = null;
+
+    private int $lastRedirectCount = 0;
+
     public function __construct()
     {
         $this->cookies = new CookieJar;
@@ -32,12 +36,27 @@ class ResumableRemoteFetcher
             ->withOptions(array_merge($this->requestOptions(), ['stream' => true]))
             ->get($url);
 
+        $contentRange = self::parseContentRange($response->header('Content-Range'));
+        $contentRangeHeader = $this->headerOrNull($response->header('Content-Range'));
+        $contentLength = $this->numericHeader($response->header('Content-Length'));
+        $contentType = $this->normalizedContentType($response->header('Content-Type'));
+        $finalUrl = $this->effectiveUrl($response, $url);
+        $redirectCount = $this->redirectCount($response);
+        $prefix = $this->readResponsePrefix($response);
+
         if (! in_array($response->status(), [200, 206], true)) {
-            $response->throw();
-            throw new \RuntimeException('Remote probe failed with HTTP '.$response->status().'.');
+            $message = $this->remoteResponseError(
+                $response->status(),
+                $finalUrl,
+                $contentType,
+                $contentLength,
+                $prefix,
+            );
+            $this->closeResponseBody($response);
+
+            throw new \RuntimeException($message);
         }
 
-        $contentRange = self::parseContentRange($response->header('Content-Range'));
         $supportsRanges = $response->status() === 206
             && $contentRange !== null
             && $contentRange['start'] === 0
@@ -48,11 +67,33 @@ class ResumableRemoteFetcher
             throw new \RuntimeException('Remote server returned an invalid Content-Range for the range probe.');
         }
 
-        $contentLength = $this->numericHeader($response->header('Content-Length'));
+        if ($this->looksLikeNonMediaResponse($contentType, $prefix)) {
+            $message = $this->remoteResponseError(
+                $response->status(),
+                $finalUrl,
+                $contentType,
+                $contentLength,
+                $prefix,
+            );
+            $this->closeResponseBody($response);
+
+            throw new \RuntimeException($message);
+        }
+
         $expectedSize = $contentRange['total'] ?? ($response->status() === 200 ? $contentLength : null);
-        $contentType = $this->normalizedContentType($response->header('Content-Type'));
-        $finalUrl = $this->effectiveUrl($response, $url);
         $this->closeResponseBody($response);
+
+        Log::info('NBX remote source probe completed', [
+            'original_url' => $this->redactedUrl($url),
+            'final_url' => $this->redactedUrl($finalUrl),
+            'http_status' => $response->status(),
+            'content_type' => $contentType,
+            'content_length' => $contentLength,
+            'content_range' => $contentRangeHeader,
+            'expected_size' => $expectedSize,
+            'supports_ranges' => $supportsRanges,
+            'redirect_count' => $redirectCount,
+        ]);
 
         return new RemoteFetchProbe(
             originalUrl: $url,
@@ -62,6 +103,10 @@ class ResumableRemoteFetcher
             etag: $this->headerOrNull($response->header('ETag')),
             lastModified: $this->headerOrNull($response->header('Last-Modified')),
             supportsRanges: $supportsRanges,
+            httpStatus: $response->status(),
+            responseContentLength: $contentLength,
+            contentRange: $contentRangeHeader,
+            redirectCount: $redirectCount,
         );
     }
 
@@ -82,6 +127,17 @@ class ResumableRemoteFetcher
         }
 
         $this->downloadRanges($session, $probe, $destination, $progress);
+
+        Log::info('NBX remote source download completed', [
+            'original_url' => $this->redactedUrl($probe->originalUrl),
+            'final_url' => $this->redactedUrl($probe->finalUrl),
+            'http_status' => $probe->httpStatus,
+            'content_type' => $probe->contentType,
+            'expected_size' => $probe->expectedSize,
+            'downloaded_bytes' => is_file($destination) ? (int) filesize($destination) : null,
+            'strategy' => $probe->supportsRanges ? 'ranged' : 'whole',
+            'redirect_count' => $probe->redirectCount,
+        ]);
 
         return $probe;
     }
@@ -429,6 +485,17 @@ class ResumableRemoteFetcher
             'completed_at' => now(),
         ]);
         $progress($size, $size);
+
+        Log::info('NBX remote source download completed', [
+            'original_url' => $this->redactedUrl($probe->originalUrl),
+            'final_url' => $this->redactedUrl($probe->finalUrl),
+            'http_status' => $probe->httpStatus,
+            'content_type' => $probe->contentType,
+            'expected_size' => $probe->expectedSize,
+            'downloaded_bytes' => $size,
+            'strategy' => 'whole',
+            'redirect_count' => $probe->redirectCount,
+        ]);
     }
 
     private function prepareSession(MediaSource $source, RemoteFetchProbe $probe, string $destination): RemoteFetchSession
@@ -493,6 +560,9 @@ class ResumableRemoteFetcher
 
     private function request(string $url, int $timeout): PendingRequest
     {
+        $this->lastRedirectUrl = null;
+        $this->lastRedirectCount = 0;
+
         return Http::connectTimeout((int) config('nbx.ssrf.connect_timeout', 30))
             ->timeout(max(1, $timeout))
             ->withHeaders($this->browserHeaders($url));
@@ -503,14 +573,14 @@ class ResumableRemoteFetcher
     {
         return [
             'cookies' => $this->cookies,
-            // Several PHP download scripts behind Cloudflare terminate HTTP/2
-            // streams early but serve the exact same range correctly over 1.1.
-            'version' => 1.1,
             'allow_redirects' => [
                 'max' => max(0, (int) config('nbx.ssrf.max_redirects', 5)),
                 'strict' => true,
-                'on_redirect' => static function ($request, $response, $uri): void {
+                'track_redirects' => true,
+                'on_redirect' => function ($request, $response, $uri): void {
                     SafeRemoteMediaUrl::assertAllowed((string) $uri);
+                    $this->lastRedirectUrl = (string) $uri;
+                    $this->lastRedirectCount++;
                 },
             ],
         ];
@@ -526,7 +596,7 @@ class ResumableRemoteFetcher
 
         return [
             'User-Agent' => (string) config('cdn.remote_fetch_user_agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'),
-            'Accept' => '*/*',
+            'Accept' => 'video/mp4,video/*;q=0.9,application/octet-stream;q=0.8,*/*;q=0.5',
             'Accept-Encoding' => 'identity',
             'Referer' => $scheme.'://'.$host.$port.'/',
         ];
@@ -546,7 +616,96 @@ class ResumableRemoteFetcher
         $stats = $response->handlerStats();
         $url = is_array($stats) ? ($stats['url'] ?? null) : null;
 
+        if (! is_string($url) || $url === '') {
+            $url = $this->lastRedirectUrl;
+        }
+
+        if (! is_string($url) || $url === '') {
+            $history = $response->header('X-Guzzle-Redirect-History');
+            if (is_string($history) && trim($history) !== '') {
+                $historyItems = array_values(array_filter(array_map('trim', explode(',', $history))));
+                $url = $historyItems !== [] ? end($historyItems) : null;
+            }
+        }
+
         return is_string($url) && $url !== '' ? $url : $fallback;
+    }
+
+    private function redirectCount(Response $response): ?int
+    {
+        $stats = $response->handlerStats();
+        $count = is_array($stats) ? ($stats['redirect_count'] ?? null) : null;
+
+        if (! is_numeric($count)) {
+            $count = $this->lastRedirectCount;
+        }
+
+        return is_numeric($count) ? (int) $count : null;
+    }
+
+    private function readResponsePrefix(Response $response, int $limit = 512): string
+    {
+        try {
+            $body = $response->toPsrResponse()->getBody();
+
+            return $body->isReadable() ? $body->read($limit) : '';
+        } catch (\Throwable) {
+            return '';
+        }
+    }
+
+    private function looksLikeNonMediaResponse(?string $contentType, string $prefix): bool
+    {
+        $type = strtolower(trim((string) $contentType));
+        $text = ltrim($prefix, "\xEF\xBB\xBF \t\r\n");
+        $lowerText = strtolower($text);
+        $looksLikeMarkup = str_starts_with($lowerText, '<')
+            || str_starts_with($lowerText, '<?xml')
+            || str_starts_with($lowerText, '<!doctype');
+        $looksLikeJson = str_starts_with($text, '{') || str_starts_with($text, '[');
+        $textualType = str_starts_with($type, 'text/')
+            || in_array($type, ['application/json', 'application/xml', 'application/xhtml+xml', 'application/javascript'], true);
+        $looksLikeText = $text !== '' && ! str_contains($prefix, "\0");
+
+        return $looksLikeMarkup || ($textualType && ($looksLikeJson || $looksLikeText));
+    }
+
+    private function remoteResponseError(
+        int $status,
+        string $finalUrl,
+        ?string $contentType,
+        ?int $contentLength,
+        string $prefix,
+    ): string {
+        $type = strtolower(trim((string) $contentType));
+        $text = ltrim($prefix, "\xEF\xBB\xBF \t\r\n");
+        $isHtml = str_starts_with($text, '<') || str_contains($type, 'html');
+        $description = $isHtml
+            ? 'Remote source returned HTML instead of a video file.'
+            : 'Remote source returned a non-media response.';
+
+        return sprintf(
+            '%s HTTP status: %d. Final URL: %s. Content-Type: %s. Content-Length: %s.',
+            $description,
+            $status,
+            $this->redactedUrl($finalUrl),
+            $contentType ?: 'unknown',
+            $contentLength !== null ? (string) $contentLength : 'unknown',
+        );
+    }
+
+    private function redactedUrl(string $url): string
+    {
+        $parts = parse_url($url);
+        if (! is_array($parts) || ! isset($parts['host'])) {
+            return '[invalid-url]';
+        }
+
+        $scheme = isset($parts['scheme']) ? strtolower((string) $parts['scheme']).'://' : '';
+        $port = isset($parts['port']) ? ':'.(int) $parts['port'] : '';
+        $path = (string) ($parts['path'] ?? '/');
+
+        return $scheme.(string) $parts['host'].$port.$path;
     }
 
     private function closeResponseBody(Response $response): void

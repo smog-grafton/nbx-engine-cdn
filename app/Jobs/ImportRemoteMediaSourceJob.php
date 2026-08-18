@@ -8,6 +8,7 @@ use App\Services\LocalDiskSpaceGuard;
 use App\Services\MediaSourceService;
 use App\Services\NbxEngineService;
 use App\Services\ProcessingLiveness;
+use App\Services\RemoteFetchProbe;
 use App\Services\ResumableRemoteFetcher;
 use App\Services\VideoProbeService;
 use App\Support\SafeRemoteMediaUrl;
@@ -324,6 +325,13 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
                 ));
             }
 
+            // A complete HTTP response is not necessarily a media file. Validate
+            // the committed bytes before changing the source to ready or queuing
+            // Fast Start, so an HTML/WAF/error page cannot become a misleading
+            // downstream ffprobe failure.
+            $probe = app(VideoProbeService::class)->probe($absolutePath);
+            $this->assertValidRemoteMediaPayload($fetchProbe, $absolutePath, $mimeType, $size, $probe);
+
             $source->update(['status' => 'processing', 'last_progress_at' => now()]);
             ProcessingLiveness::touch($source->id);
             $preferredExtension = $this->extensionFromMimeType($mimeType);
@@ -344,7 +352,6 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
             }
 
             app(NbxEngineService::class)->markNbxStatus($source->fresh() ?? $source, 'probing');
-            $probe = app(VideoProbeService::class)->probe($absolutePath);
             $metadata = (array) (($source->fresh() ?? $source)->source_metadata ?? []);
             if ($probe !== []) {
                 $metadata['probe'] = $probe;
@@ -518,6 +525,112 @@ class ImportRemoteMediaSourceJob implements ShouldBeUnique, ShouldQueue
             'video/mp2t' => 'ts',
             default => null,
         };
+    }
+
+    /**
+     * @param  array<string, mixed>  $probe
+     */
+    private function assertValidRemoteMediaPayload(
+        RemoteFetchProbe $fetchProbe,
+        string $absolutePath,
+        string $mimeType,
+        int $size,
+        array $probe,
+    ): void {
+        $prefix = $this->readFilePrefix($absolutePath);
+        $trimmedPrefix = ltrim($prefix, "\xEF\xBB\xBF \t\r\n");
+        // Do not reject a real MP4 solely because an origin supplied a bad
+        // Content-Type. The payload signature is authoritative here.
+        $looksLikeHtml = str_starts_with($trimmedPrefix, '<');
+
+        if ($looksLikeHtml) {
+            throw new \RuntimeException(sprintf(
+                'REMOTE_FETCH_INVALID_PAYLOAD: Remote source returned HTML instead of a video file. HTTP status: %d. Final URL: %s. Content-Type: %s. Downloaded: %s.',
+                $fetchProbe->httpStatus,
+                $this->redactedUrl($fetchProbe->finalUrl),
+                $mimeType !== '' ? $mimeType : ($fetchProbe->contentType ?: 'unknown'),
+                $this->formatBytes($size),
+            ));
+        }
+
+        if ($probe === [] || ! ($probe['has_video'] ?? false)) {
+            Log::warning('NBX remote source payload failed media validation', [
+                'original_url' => $this->redactedUrl($fetchProbe->originalUrl),
+                'final_url' => $this->redactedUrl($fetchProbe->finalUrl),
+                'http_status' => $fetchProbe->httpStatus,
+                'content_type' => $fetchProbe->contentType,
+                'detected_mime_type' => $mimeType,
+                'downloaded_bytes' => $size,
+                'ffprobe_format' => $probe['format_name'] ?? null,
+                'ffprobe_has_video' => $probe['has_video'] ?? false,
+            ]);
+
+            throw new \RuntimeException(sprintf(
+                'REMOTE_FETCH_INVALID_MEDIA: The downloaded payload is not a complete video file. HTTP status: %d. Final URL: %s. Content-Type: %s. Downloaded: %s. FFprobe did not detect a video stream.',
+                $fetchProbe->httpStatus,
+                $this->redactedUrl($fetchProbe->finalUrl),
+                $mimeType !== '' ? $mimeType : ($fetchProbe->contentType ?: 'unknown'),
+                $this->formatBytes($size),
+            ));
+        }
+
+        Log::info('NBX remote source payload validated', [
+            'original_url' => $this->redactedUrl($fetchProbe->originalUrl),
+            'final_url' => $this->redactedUrl($fetchProbe->finalUrl),
+            'http_status' => $fetchProbe->httpStatus,
+            'content_type' => $fetchProbe->contentType,
+            'detected_mime_type' => $mimeType,
+            'downloaded_bytes' => $size,
+            'format' => $probe['format_name'] ?? null,
+            'duration_seconds' => $probe['duration'] ?? $probe['duration_seconds'] ?? null,
+            'has_video' => $probe['has_video'] ?? false,
+            'redirect_count' => $fetchProbe->redirectCount,
+        ]);
+    }
+
+    private function readFilePrefix(string $path, int $limit = 512): string
+    {
+        $handle = @fopen($path, 'rb');
+        if (! is_resource($handle)) {
+            return '';
+        }
+
+        try {
+            return (string) fread($handle, $limit);
+        } finally {
+            fclose($handle);
+        }
+    }
+
+    private function redactedUrl(string $url): string
+    {
+        $parts = parse_url($url);
+        if (! is_array($parts) || ! isset($parts['host'])) {
+            return '[invalid-url]';
+        }
+
+        $scheme = isset($parts['scheme']) ? strtolower((string) $parts['scheme']).'://' : '';
+        $port = isset($parts['port']) ? ':'.(int) $parts['port'] : '';
+        $path = (string) ($parts['path'] ?? '/');
+
+        return $scheme.(string) $parts['host'].$port.$path;
+    }
+
+    private function formatBytes(int $bytes): string
+    {
+        if ($bytes < 1024) {
+            return $bytes.' B';
+        }
+
+        if ($bytes < 1024 * 1024) {
+            return number_format($bytes / 1024, 2).' KB';
+        }
+
+        if ($bytes < 1024 * 1024 * 1024) {
+            return number_format($bytes / (1024 * 1024), 2).' MB';
+        }
+
+        return number_format($bytes / (1024 * 1024 * 1024), 2).' GB';
     }
 
     private function shouldUseProxyFallback(\Throwable $throwable): bool
